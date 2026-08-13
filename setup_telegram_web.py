@@ -227,19 +227,77 @@ async def phone_login(page) -> None:
 
 
 async def qr_login(page, profile_dir: Path) -> None:
+    """
+    Переключает Telegram Web с формы входа по номеру на QR,
+    после чего регулярно сохраняет актуальный QR в PNG.
+
+    Важно: Telegram обновляет QR автоматически, поэтому PNG
+    перезаписывается каждые 2 секунды.
+    """
     print()
     print("Режим QR.")
-    print(
-        "Скрипт будет обновлять screenshot страницы каждые 3 секунды."
+    print("Переключаю Telegram Web на вход по QR-коду...")
+
+    qr_button = await first_visible(
+        [
+            page.get_by_text(
+                re.compile(
+                    r"log in by qr code|войти по qr",
+                    re.I,
+                )
+            ),
+            page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"qr",
+                    re.I,
+                ),
+            ),
+            page.locator(
+                'a:has-text("LOG IN BY QR CODE")'
+            ),
+            page.locator(
+                'button:has-text("LOG IN BY QR CODE")'
+            ),
+        ]
     )
-    print(
-        "Файл: data/telegram_login_qr.png"
+
+    if qr_button is not None:
+        await qr_button.click()
+        await page.wait_for_timeout(1200)
+
+    # Проверяем, что реально появилась QR-форма.
+    qr_marker = await first_visible(
+        [
+            page.locator("canvas"),
+            page.locator("svg"),
+            page.locator(
+                '[class*="qr" i]'
+            ),
+            page.locator(
+                '[data-testid*="qr" i]'
+            ),
+        ]
     )
-    print(
-        "Откройте этот PNG через SFTP/файловый менеджер Beget "
-        "и отсканируйте QR в Telegram → Настройки → Устройства."
-    )
-    print()
+
+    if qr_marker is None:
+        debug = (
+            BASE_DIR
+            / "data"
+            / "telegram_qr_not_found.png"
+        )
+        debug.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        await page.screenshot(
+            path=str(debug),
+            full_page=True,
+        )
+        raise RuntimeError(
+            "Telegram Web не переключился на QR-форму. "
+            f"Сохранён screenshot: {debug}"
+        )
 
     screenshot = (
         BASE_DIR
@@ -251,16 +309,33 @@ async def qr_login(page, profile_dir: Path) -> None:
         exist_ok=True,
     )
 
-    for _ in range(120):
+    print()
+    print(
+        "QR-форма открыта. Файл будет обновляться каждые 2 секунды:"
+    )
+    print(
+        f"{screenshot}"
+    )
+    print()
+    print(
+        "Откройте PNG через SFTP/WinSCP и сразу отсканируйте:"
+    )
+    print(
+        "Telegram → Настройки → Устройства → Подключить устройство."
+    )
+    print()
+
+    for _ in range(180):
         if await authorized(page):
             return
 
+        # Сохраняем только видимую страницу с текущим QR.
         await page.screenshot(
             path=str(screenshot),
             full_page=True,
         )
         await page.wait_for_timeout(
-            3000
+            2000
         )
 
     raise RuntimeError(

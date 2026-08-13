@@ -1,4 +1,4 @@
-# Zen Bot v38 — Beget Ubuntu VPS
+# Zen Bot v39 — Beget Ubuntu VPS
 
 Это серверная версия текущей рабочей схемы.
 
@@ -18,11 +18,11 @@
 8. После удаления через Bot API публикуется новый SHORT Rich Message с той же картинкой.
 9. В Дзене остаётся полная статья; в Telegram остаётся короткая версия.
 
-## Чем v38 отличается от Windows v33
+## Чем v39 отличается от Windows v33
 
 В v33 использовались Telegram Desktop + PyAutoGUI + WinAPI.
 
-В v38 этого нет. Вместо них используется:
+В v39 этого нет. Вместо них используется:
 
 - Ubuntu;
 - headless Chromium;
@@ -61,7 +61,7 @@ cd /opt/zen_bot
 Если загрузили ZIP:
 
 ```bash
-unzip zen_bot_beget_v38.zip
+unzip zen_bot_beget_v39.zip
 cd zen_bot_beget
 ```
 
@@ -318,7 +318,7 @@ Telegram может менять DOM и CSS-классы.
 # Быстрый путь
 
 ```bash
-unzip zen_bot_beget_v38.zip
+unzip zen_bot_beget_v39.zip
 cd zen_bot_beget
 
 chmod +x install_beget.sh run.sh install_systemd.sh
@@ -352,7 +352,7 @@ sudo journalctl -u zenbot -f
 
 # 12. Три автоматические статьи в день
 
-В v38 автоматическая публикация по умолчанию работает три раза в день:
+В v39 автоматическая публикация по умолчанию работает три раза в день:
 
 ```env
 TIMEZONE=Europe/Moscow
@@ -394,7 +394,7 @@ DEFAULT_PUBLISH_TIMES=10:00,15:00,20:00
 
 # 13. Жирный заголовок
 
-В v38 заголовок оформляется жирным на уровне публикации, а не через Markdown.
+В v39 заголовок оформляется жирным на уровне публикации, а не через Markdown.
 
 - LONG-пост через Telegram Web: первая строка caption выделяется и форматируется Ctrl+B.
 - SHORT Rich Message: заголовок оборачивается в HTML-тег `<b>` только в рендеринге Telegram.
@@ -405,7 +405,7 @@ DEFAULT_PUBLISH_TIMES=10:00,15:00,20:00
 
 # 14. Чёткое форматирование списков
 
-В v38 списки нормализуются автоматически.
+В v39 списки нормализуются автоматически.
 
 Если модель вернёт:
 
@@ -422,3 +422,14 @@ DEFAULT_PUBLISH_TIMES=10:00,15:00,20:00
 ```
 
 Каждый пункт списка всегда начинается с новой строки.
+
+---
+
+# 15. Исправление QR-авторизации
+
+В v39 `setup_telegram_web.py --qr` сначала нажимает
+`LOG IN BY QR CODE`, ждёт появления QR-формы и только после этого
+создаёт `data/telegram_login_qr.png`.
+
+PNG обновляется каждые 2 секунды, поэтому открывайте свежую копию
+и сканируйте сразу.

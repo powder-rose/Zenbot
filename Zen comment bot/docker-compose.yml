@@ -1,0 +1,11 @@
+services:
+  dzen-comment-bot:
+    build: .
+    container_name: dzen-comment-bot
+    restart: unless-stopped
+    init: true
+    ipc: host
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

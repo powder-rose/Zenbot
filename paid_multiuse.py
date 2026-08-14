@@ -1,0 +1,1193 @@
+from __future__ import annotations
+
+import html
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestChat,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+
+import tenant_db
+from article_service import DEFAULT_IMAGE_PROMPT_TEMPLATE
+from config import Config
+from tenant_service import TenantArticleService
+from topics_seed import DEFAULT_TOPICS
+from yandex_gpt import ARTICLE_SYSTEM_PROMPT
+
+log = logging.getLogger(__name__)
+router = Router(name="paid-multiuse")
+
+_bot: Bot | None = None
+_cfg: Config | None = None
+_service: TenantArticleService | None = None
+
+
+class PaidStates(StatesGroup):
+    waiting_topics = State()
+    waiting_edit_topic = State()
+    waiting_schedule_time = State()
+    waiting_urgent_topic = State()
+    waiting_prompt_parts = State()
+
+
+PROMPTS = {
+    "article": {
+        "title": "✍️ Промпт текста статьи",
+        "key": "prompt_article_system",
+        "default": ARTICLE_SYSTEM_PROMPT,
+        "filename": "article_prompt.txt",
+    },
+    "image": {
+        "title": "🖼 Промпт изображения",
+        "key": "prompt_image_template",
+        "default": DEFAULT_IMAGE_PROMPT_TEMPLATE,
+        "filename": "image_prompt.txt",
+    },
+}
+
+
+def configure_paid_multiuse(
+    *,
+    bot: Bot,
+    cfg: Config,
+    service: TenantArticleService,
+) -> None:
+    global _bot, _cfg, _service
+    _bot = bot
+    _cfg = cfg
+    _service = service
+
+
+def _deps() -> tuple[Bot, Config, TenantArticleService]:
+    if _bot is None or _cfg is None or _service is None:
+        raise RuntimeError("Paid Multi-Use ещё не инициализирован")
+    return _bot, _cfg, _service
+
+
+def is_superadmin(user_id: int | None) -> bool:
+    if not user_id or _cfg is None:
+        return False
+    return user_id in _cfg.admin_ids
+
+
+async def paid_access(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    if is_superadmin(user_id):
+        return True
+    return await tenant_db.is_subscription_active(user_id)
+
+
+async def require_paid(event: Message | CallbackQuery) -> bool:
+    user = event.from_user
+    await tenant_db.touch_user(user)
+    if await paid_access(user.id if user else None):
+        return True
+
+    if isinstance(event, CallbackQuery):
+        await event.answer(
+            "Нужна активная подписка",
+            show_alert=True,
+        )
+        await show_paywall(event.message, user.id)
+    else:
+        await show_paywall(event, user.id)
+    return False
+
+
+def paywall_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐ Оплатить подписку",
+                    callback_data="billing:buy",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 Моя подписка",
+                    callback_data="billing:status",
+                )
+            ],
+        ]
+    )
+
+
+def cabinet_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📢 Мой канал", callback_data="tenant:channels"),
+                InlineKeyboardButton(text="📝 Темы", callback_data="tenant:topics"),
+            ],
+            [
+                InlineKeyboardButton(text="⏰ Расписание", callback_data="tenant:schedule"),
+                InlineKeyboardButton(text="⚡ Срочная статья", callback_data="tenant:urgent"),
+            ],
+            [
+                InlineKeyboardButton(text="🧠 Промпты", callback_data="tenant:prompts"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="tenant:stats"),
+            ],
+            [
+                InlineKeyboardButton(text="💳 Подписка", callback_data="billing:status"),
+            ],
+        ]
+    )
+
+
+def channels_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Подключить канал", callback_data="tenant:channel:add")],
+            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+        ]
+    )
+
+
+def topics_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить темы", callback_data="tenant:topics:add")],
+            [
+                InlineKeyboardButton(text="📌 Закреплённые", callback_data="tenant:topics:list:pinned"),
+                InlineKeyboardButton(text="📋 Все темы", callback_data="tenant:topics:list:all"),
+            ],
+            [
+                InlineKeyboardButton(text="🟢 Новые", callback_data="tenant:topics:list:unused"),
+                InlineKeyboardButton(text="✅ Использованные", callback_data="tenant:topics:list:used"),
+            ],
+            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+        ]
+    )
+
+
+def topic_actions(topic_id: int, *, pinned: bool = False) -> InlineKeyboardMarkup:
+    pin_text = "📌 Снять закрепление" if pinned else "📌 Закрепить"
+    pin_action = "unpin" if pinned else "pin"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=pin_text,
+                    callback_data=f"tenant:topic:{pin_action}:{topic_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить",
+                    callback_data=f"tenant:topic:edit:{topic_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"tenant:topic:delete:{topic_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def schedule_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить время", callback_data="tenant:schedule:add")],
+            [InlineKeyboardButton(text="▶️/⏸ Автопубликация", callback_data="tenant:schedule:toggle")],
+            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+        ]
+    )
+
+
+def urgent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎲 Случайная тема", callback_data="tenant:urgent:random")],
+            [InlineKeyboardButton(text="✍️ Ввести тему", callback_data="tenant:urgent:manual")],
+            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+        ]
+    )
+
+
+def prompts_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Текст статьи", callback_data="tenant:prompt:view:article")],
+            [InlineKeyboardButton(text="🖼 Изображение", callback_data="tenant:prompt:view:image")],
+            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+        ]
+    )
+
+
+def prompt_actions(kind: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"tenant:prompt:edit:{kind}")],
+            [InlineKeyboardButton(text="♻️ Сбросить", callback_data=f"tenant:prompt:reset:{kind}")],
+            [InlineKeyboardButton(text="⬅️ К промптам", callback_data="tenant:prompts")],
+        ]
+    )
+
+
+def prompt_edit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сохранить", callback_data="tenant:prompt:save")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="tenant:prompt:cancel")],
+        ]
+    )
+
+
+def super_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Клиенты", callback_data="super:users")],
+            [InlineKeyboardButton(text="📊 SaaS статистика", callback_data="super:stats")],
+        ]
+    )
+
+
+async def show_paywall(message: Message, user_id: int | None = None) -> None:
+    _, cfg, _ = _deps()
+    await message.answer(
+        "🤖 <b>Автопубликация статей в ваш Telegram-канал</b>\n\n"
+        "После оплаты вы получаете личную админ-панель: канал, темы, "
+        "расписание, срочные статьи и собственные промпты.\n\n"
+        f"Стоимость: <b>{cfg.subscription_price_stars} ⭐ / 30 дней</b>.",
+        parse_mode="HTML",
+        reply_markup=paywall_keyboard(),
+    )
+
+
+async def show_paid_start(message: Message, state: FSMContext | None = None) -> None:
+    if state is not None:
+        await state.clear()
+    await tenant_db.touch_user(message.from_user)
+    if await tenant_db.is_subscription_active(message.from_user.id):
+        await show_cabinet(message)
+    else:
+        await show_paywall(message, message.from_user.id)
+
+
+async def show_cabinet(message: Message) -> None:
+    user_id = message.from_user.id
+    if not await paid_access(user_id):
+        await show_paywall(message, user_id)
+        return
+    _, cfg, _ = _deps()
+    await tenant_db.ensure_defaults(user_id, cfg.default_publish_times, DEFAULT_TOPICS)
+    channels = await tenant_db.list_channels(user_id)
+    auto = await tenant_db.auto_publish_enabled(user_id)
+    sub = await tenant_db.subscription_info(user_id)
+    expiry = sub["expires_at"][:10] if sub and sub["expires_at"] else "—"
+    await message.answer(
+        "⚙️ <b>Мой кабинет</b>\n\n"
+        f"Подписка до: <code>{html.escape(expiry)}</code>\n"
+        f"Каналов: <b>{len(channels)}</b>\n"
+        f"Автопубликация: {'🟢 включена' if auto else '🔴 выключена'}\n"
+        f"Часовой пояс: <code>{html.escape(cfg.timezone)}</code>",
+        parse_mode="HTML",
+        reply_markup=cabinet_keyboard(),
+    )
+
+
+async def show_superadmin(message: Message) -> None:
+    if not is_superadmin(message.from_user.id):
+        return
+    stats = await tenant_db.platform_stats()
+    await message.answer(
+        "🛠 <b>Paid Multi-Use</b>\n\n"
+        f"Пользователей: {stats['users']}\n"
+        f"Активных подписок: {stats['active_subscriptions']}\n"
+        f"Подключённых каналов: {stats['channels']}\n"
+        f"Платежей: {stats['payments']}\n"
+        f"Получено Stars: {stats['stars']} ⭐\n\n"
+        "Ручная выдача: <code>/grant USER_ID DAYS</code>\n"
+        "Отзыв доступа: <code>/revoke USER_ID</code>",
+        parse_mode="HTML",
+        reply_markup=super_keyboard(),
+    )
+
+
+@router.message(Command("cabinet"))
+async def cmd_cabinet(message: Message, state: FSMContext):
+    await state.clear()
+    await tenant_db.touch_user(message.from_user)
+    await show_cabinet(message)
+
+
+@router.message(Command("buy"))
+async def cmd_buy(message: Message):
+    await tenant_db.touch_user(message.from_user)
+    await create_payment(message)
+
+
+@router.message(Command("subscription"))
+async def cmd_subscription(message: Message):
+    await tenant_db.touch_user(message.from_user)
+    await send_subscription_status(message, message.from_user.id)
+
+
+@router.callback_query(F.data == "tenant:home")
+async def cb_tenant_home(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.clear()
+    await call.answer()
+    await show_cabinet(call.message)
+
+
+# ---------------- PAYMENT ----------------
+
+async def create_payment(message: Message) -> None:
+    bot, cfg, _ = _deps()
+    if await tenant_db.is_subscription_active(message.from_user.id):
+        await message.answer(
+            "Подписка уже активна. Новую можно оформить заранее, но Telegram "
+            "может создать параллельную подписку. Рекомендуется дождаться окончания текущей.",
+            reply_markup=cabinet_keyboard(),
+        )
+        return
+
+    payload = f"zen-sub:{uuid.uuid4().hex}"
+    link = await bot.create_invoice_link(
+        title=cfg.subscription_title[:32],
+        description=cfg.subscription_description[:255],
+        payload=payload,
+        currency="XTR",
+        prices=[
+            LabeledPrice(
+                label="30 дней доступа",
+                amount=cfg.subscription_price_stars,
+            )
+        ],
+        subscription_period=2592000,
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Оплатить {cfg.subscription_price_stars} ⭐", url=link)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="billing:status")],
+        ]
+    )
+    await message.answer(
+        "⭐ <b>Подписка на 30 дней</b>\n\n"
+        "Оплата проходит внутри Telegram в Stars. После успешного платежа "
+        "доступ активируется автоматически.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "billing:buy")
+async def cb_buy(call: CallbackQuery):
+    await tenant_db.touch_user(call.from_user)
+    await call.answer()
+    await create_payment(call.message)
+
+
+async def send_subscription_status(message: Message, user_id: int) -> None:
+    row = await tenant_db.subscription_info(user_id)
+    active = await tenant_db.is_subscription_active(user_id)
+    if not row:
+        await message.answer(
+            "💳 Подписка пока не оформлена.",
+            reply_markup=paywall_keyboard(),
+        )
+        return
+    expiry = row["expires_at"] or "—"
+    await message.answer(
+        "💳 <b>Подписка</b>\n\n"
+        f"Статус: {'🟢 активна' if active else '🔴 неактивна'}\n"
+        f"Действует до: <code>{html.escape(expiry)}</code>\n"
+        f"Источник: <code>{html.escape(row['source'])}</code>\n"
+        f"Автопродление: {'да' if row['is_recurring'] else 'нет'}",
+        parse_mode="HTML",
+        reply_markup=cabinet_keyboard() if active else paywall_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "billing:status")
+async def cb_billing_status(call: CallbackQuery):
+    await tenant_db.touch_user(call.from_user)
+    await call.answer()
+    await send_subscription_status(call.message, call.from_user.id)
+
+
+@router.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await tenant_db.touch_user(query.from_user)
+    if query.currency != "XTR" or not query.invoice_payload.startswith("zen-sub:"):
+        await query.answer(ok=False, error_message="Некорректный платёж")
+        return
+    await query.answer(ok=True)
+
+
+def _payment_expiry(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    return None
+
+
+@router.message(F.successful_payment)
+async def successful_payment(message: Message):
+    _, cfg, _ = _deps()
+    await tenant_db.touch_user(message.from_user)
+    payment = message.successful_payment
+    if payment.currency != "XTR" or not payment.invoice_payload.startswith("zen-sub:"):
+        return
+
+    expires = _payment_expiry(getattr(payment, "subscription_expiration_date", None))
+    if expires is None:
+        expires = datetime.now(timezone.utc) + timedelta(days=30)
+
+    is_recurring = bool(getattr(payment, "is_recurring", False))
+    is_first = bool(getattr(payment, "is_first_recurring", False))
+
+    await tenant_db.record_payment(
+        user_id=message.from_user.id,
+        payload=payment.invoice_payload,
+        currency=payment.currency,
+        total_amount=payment.total_amount,
+        telegram_payment_charge_id=payment.telegram_payment_charge_id,
+        provider_payment_charge_id=getattr(payment, "provider_payment_charge_id", None),
+        expires_at=expires,
+        is_recurring=is_recurring,
+        is_first_recurring=is_first,
+    )
+    await tenant_db.activate_subscription(
+        message.from_user.id,
+        expires_at=expires,
+        source="telegram_stars",
+        stars_amount=payment.total_amount,
+        telegram_payment_charge_id=payment.telegram_payment_charge_id,
+        is_recurring=is_recurring,
+    )
+    await tenant_db.ensure_defaults(
+        message.from_user.id,
+        cfg.default_publish_times,
+        DEFAULT_TOPICS,
+    )
+    await message.answer(
+        "✅ <b>Оплата получена. Доступ активирован.</b>\n\n"
+        "Теперь подключите канал и настройте темы/расписание.",
+        parse_mode="HTML",
+        reply_markup=cabinet_keyboard(),
+    )
+
+
+# ---------------- CHANNELS ----------------
+
+@router.callback_query(F.data == "tenant:channels")
+async def cb_channels(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    await call.answer()
+    rows = await tenant_db.list_channels(call.from_user.id)
+    await call.message.answer(
+        "📢 <b>Мои каналы</b>\n\n"
+        "Для публикации бот должен быть администратором канала с правом публикации сообщений.",
+        parse_mode="HTML",
+        reply_markup=channels_keyboard(),
+    )
+    if not rows:
+        await call.message.answer("Подключённых каналов пока нет.")
+        return
+    for row in rows:
+        username = f" @{row['username']}" if row["username"] else ""
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Отключить", callback_data=f"tenant:channel:remove:{row['id']}")]
+            ]
+        )
+        await call.message.answer(
+            f"✅ {html.escape(row['title'])}{html.escape(username)}\n"
+            f"<code>{row['chat_id']}</code>",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+
+@router.callback_query(F.data == "tenant:channel:add")
+async def cb_channel_add(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    bot, cfg, _ = _deps()
+    count = await tenant_db.channel_count(call.from_user.id)
+    if count >= cfg.tenant_channel_limit:
+        await call.answer("Лимит каналов исчерпан", show_alert=True)
+        return
+    me = await bot.get_me()
+    await call.answer()
+    request = ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(
+                    text="📢 Выбрать канал",
+                    request_chat=KeyboardButtonRequestChat(
+                        request_id=4901,
+                        chat_is_channel=True,
+                        bot_is_member=True,
+                        request_title=True,
+                        request_username=True,
+                    ),
+                )
+            ]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Выберите канал",
+    )
+    await call.message.answer(
+        "Сначала добавьте бота "
+        f"@{me.username} в нужный канал <b>администратором</b> и включите право "
+        "<b>публиковать сообщения</b>.\n\n"
+        "После этого нажмите кнопку ниже и выберите канал.",
+        parse_mode="HTML",
+        reply_markup=request,
+    )
+
+
+@router.message(F.chat_shared)
+async def channel_shared(message: Message):
+    if not await require_paid(message):
+        return
+    bot, cfg, _ = _deps()
+    shared = message.chat_shared
+    if shared.request_id != 4901:
+        return
+    chat_id = int(shared.chat_id)
+
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        if bot_member.status not in {"administrator", "creator"}:
+            raise RuntimeError("бот не администратор")
+        if bot_member.status == "administrator" and not bool(
+            getattr(bot_member, "can_post_messages", False)
+        ):
+            raise RuntimeError("у бота нет права can_post_messages")
+
+        user_member = await bot.get_chat_member(chat_id, message.from_user.id)
+        if user_member.status not in {"administrator", "creator"}:
+            raise RuntimeError("пользователь не администратор этого канала")
+
+        chat = await bot.get_chat(chat_id)
+    except Exception as exc:
+        await message.answer(
+            "❌ Канал не подключён. Сделайте бота администратором канала с правом "
+            f"публикации и повторите выбор.\n\nПричина: {html.escape(str(exc))}",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    if await tenant_db.channel_count(message.from_user.id) >= cfg.tenant_channel_limit:
+        await message.answer(
+            "❌ Достигнут лимит каналов для тарифа.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    result = await tenant_db.connect_channel(
+        message.from_user.id,
+        chat_id=chat_id,
+        title=chat.title or getattr(shared, "title", None) or str(chat_id),
+        username=getattr(chat, "username", None) or getattr(shared, "username", None),
+    )
+    if result == "owned_by_other":
+        await message.answer(
+            "❌ Этот канал уже привязан к другому аккаунту в боте.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    await message.answer(
+        f"✅ Канал <b>{html.escape(chat.title or str(chat_id))}</b> подключён.",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await show_cabinet(message)
+
+
+@router.callback_query(F.data.startswith("tenant:channel:remove:"))
+async def cb_channel_remove(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    channel_id = int(call.data.rsplit(":", 1)[1])
+    ok = await tenant_db.remove_channel(call.from_user.id, channel_id)
+    await call.answer("Отключено" if ok else "Канал не найден")
+    if ok:
+        await call.message.edit_text("🗑 Канал отключён от автопубликации.")
+
+
+# ---------------- TOPICS ----------------
+
+@router.callback_query(F.data == "tenant:topics")
+async def cb_topics(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    await call.answer()
+    pinned_count = await tenant_db.pinned_topic_count(call.from_user.id)
+    await call.message.answer(
+        "📝 <b>Мои темы</b>\n\n"
+        "Добавляйте свои темы — можно сразу несколько, каждая с новой строки. "
+        "Новые темы автоматически закрепляются.\n\n"
+        "📌 В автопубликацию по расписанию попадают <b>только закреплённые темы</b>. "
+        "Они идут по кругу и не повторяются два раза подряд, если закреплено две и более темы.\n\n"
+        f"Сейчас закреплено: <b>{pinned_count}</b>.",
+        parse_mode="HTML",
+        reply_markup=topics_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "tenant:topics:add")
+async def cb_topics_add(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.set_state(PaidStates.waiting_topics)
+    await call.answer()
+    await call.message.answer(
+        "Пришлите темы одним сообщением.\n\n"
+        "Каждая новая строка = отдельная тема. Например:\n\n"
+        "Охрана труда для малого бизнеса\n"
+        "Пожарная безопасность в офисе\n"
+        "Изменения законодательства по ГО и ЧС\n\n"
+        "Можно отправить сразу десятки тем. Все добавленные темы сразу будут 📌 закреплены."
+    )
+
+
+@router.message(PaidStates.waiting_topics)
+async def topics_add(message: Message, state: FSMContext):
+    if not await require_paid(message):
+        return
+    raw_lines = (message.text or "").splitlines()
+    topics = [" ".join(line.split()) for line in raw_lines if " ".join(line.split())]
+    if not topics:
+        await message.answer("❌ Не нашла тем. Пришлите минимум одну тему текстом.")
+        return
+    count = await tenant_db.add_topics(message.from_user.id, topics, pin=True)
+    pinned_count = await tenant_db.pinned_topic_count(message.from_user.id)
+    await state.clear()
+    await message.answer(
+        f"✅ Тем обработано: <b>{len(topics)}</b>\n"
+        f"Новых тем добавлено: <b>{count}</b>\n"
+        f"Закреплено для автопубликации: <b>{pinned_count}</b>\n\n"
+        "Теперь бот будет брать эти темы по кругу в часы из раздела «⏰ Расписание».",
+        parse_mode="HTML",
+        reply_markup=topics_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:topics:list:"))
+async def cb_topics_list(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    mode = call.data.rsplit(":", 1)[1]
+    rows = await tenant_db.list_topics(call.from_user.id, mode=mode, limit=100)
+    await call.answer()
+    if not rows:
+        text = "Закреплённых тем пока нет." if mode == "pinned" else "Список пуст."
+        await call.message.answer(text, reply_markup=topics_keyboard())
+        return
+    title_map = {
+        "pinned": "📌 Закреплённые темы",
+        "all": "📋 Все темы",
+        "unused": "🟢 Новые темы",
+        "used": "✅ Использованные темы",
+    }
+    await call.message.answer(f"{title_map.get(mode, '📋 Темы')}: <b>{len(rows)}</b>", parse_mode="HTML")
+    for row in rows:
+        pinned = bool(row["pinned"])
+        marker = "📌" if pinned else "⚪"
+        used = f"\nПоследнее использование: {html.escape(str(row['used_at']))}" if row["used_at"] else "\nЕщё не использовалась"
+        await call.message.answer(
+            f"{marker} <b>#{row['id']}</b> — {html.escape(row['title'])}{used}",
+            parse_mode="HTML",
+            reply_markup=topic_actions(int(row["id"]), pinned=pinned),
+        )
+
+
+@router.callback_query(F.data.startswith("tenant:topic:pin:"))
+async def cb_topic_pin(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    topic_id = int(call.data.rsplit(":", 1)[1])
+    ok = await tenant_db.set_topic_pinned(call.from_user.id, topic_id, True)
+    await call.answer("Тема закреплена" if ok else "Тема не найдена")
+    if ok:
+        row = await tenant_db.get_topic(call.from_user.id, topic_id)
+        await call.message.edit_text(
+            f"📌 <b>#{topic_id}</b> — {html.escape(str(row['title']))}\n\n"
+            "Тема закреплена и будет использоваться для автопубликации по расписанию.",
+            parse_mode="HTML",
+            reply_markup=topic_actions(topic_id, pinned=True),
+        )
+
+
+@router.callback_query(F.data.startswith("tenant:topic:unpin:"))
+async def cb_topic_unpin(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    topic_id = int(call.data.rsplit(":", 1)[1])
+    ok = await tenant_db.set_topic_pinned(call.from_user.id, topic_id, False)
+    await call.answer("Закрепление снято" if ok else "Тема не найдена")
+    if ok:
+        row = await tenant_db.get_topic(call.from_user.id, topic_id)
+        await call.message.edit_text(
+            f"⚪ <b>#{topic_id}</b> — {html.escape(str(row['title']))}\n\n"
+            "Тема сохранена, но больше не входит в автоматическую очередь.",
+            parse_mode="HTML",
+            reply_markup=topic_actions(topic_id, pinned=False),
+        )
+
+
+@router.callback_query(F.data.startswith("tenant:topic:edit:"))
+async def cb_topic_edit(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    topic_id = int(call.data.rsplit(":", 1)[1])
+    row = await tenant_db.get_topic(call.from_user.id, topic_id)
+    if not row:
+        await call.answer("Тема не найдена", show_alert=True)
+        return
+    await state.update_data(tenant_topic_id=topic_id)
+    await state.set_state(PaidStates.waiting_edit_topic)
+    await call.answer()
+    await call.message.answer(f"Текущая тема:\n{row['title']}\n\nПришлите новое название:")
+
+
+@router.message(PaidStates.waiting_edit_topic)
+async def topic_edit(message: Message, state: FSMContext):
+    if not await require_paid(message):
+        return
+    data = await state.get_data()
+    ok = await tenant_db.update_topic(
+        message.from_user.id,
+        int(data["tenant_topic_id"]),
+        message.text or "",
+    )
+    await state.clear()
+    await message.answer(
+        "✅ Тема изменена." if ok else "❌ Не удалось изменить тему.",
+        reply_markup=topics_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:topic:delete:"))
+async def cb_topic_delete(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    topic_id = int(call.data.rsplit(":", 1)[1])
+    ok = await tenant_db.deactivate_topic(call.from_user.id, topic_id)
+    await call.answer("Удалено" if ok else "Не найдено")
+    if ok:
+        await call.message.edit_text("🗑 Тема удалена из активного списка.")
+
+
+# ---------------- SCHEDULE ----------------
+
+async def send_schedule(message: Message, user_id: int) -> None:
+    _, cfg, _ = _deps()
+    rows = await tenant_db.list_schedule(user_id)
+    auto = await tenant_db.auto_publish_enabled(user_id)
+    pinned_count = await tenant_db.pinned_topic_count(user_id)
+    await message.answer(
+        "⏰ <b>Моё расписание</b>\n\n"
+        f"Статус: {'🟢 включено' if auto else '🔴 выключено'}\n"
+        f"Закреплённых тем: <b>{pinned_count}</b>\n"
+        f"Часовой пояс: <code>{html.escape(cfg.timezone)}</code>\n\n"
+        "Каждый указанный час срабатывает ежедневно. Бот берёт следующую 📌 закреплённую тему по кругу.",
+        parse_mode="HTML",
+        reply_markup=schedule_keyboard(),
+    )
+    for row in rows:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"tenant:schedule:delete:{row['id']}")]
+            ]
+        )
+        await message.answer(f"🕒 {row['publish_time']}", reply_markup=kb)
+
+
+@router.callback_query(F.data == "tenant:schedule")
+async def cb_schedule(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    await call.answer()
+    await send_schedule(call.message, call.from_user.id)
+
+
+@router.callback_query(F.data == "tenant:schedule:add")
+async def cb_schedule_add(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.set_state(PaidStates.waiting_schedule_time)
+    await call.answer()
+    await call.message.answer(
+        "Введите время публикации в формате ЧЧ:ММ. Можно сразу несколько значений — "
+        "через пробел, запятую или с новой строки.\n\n"
+        "Например: <code>09:00, 14:00, 19:00</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(PaidStates.waiting_schedule_time)
+async def schedule_add(message: Message, state: FSMContext):
+    if not await require_paid(message):
+        return
+    raw = (message.text or "").strip()
+    values = [v for v in re.split(r"[,;\s]+", raw) if v]
+    valid = [v for v in values if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", v)]
+    if not valid:
+        await message.answer("❌ Не найдено корректного времени. Например: 09:00, 14:00, 19:00")
+        return
+    added = 0
+    for value in dict.fromkeys(valid):
+        if await tenant_db.add_schedule_time(message.from_user.id, value):
+            added += 1
+    await state.clear()
+    await message.answer(
+        f"✅ Добавлено новых времён: <b>{added}</b>. ",
+        parse_mode="HTML",
+    )
+    await send_schedule(message, message.from_user.id)
+
+
+@router.callback_query(F.data.startswith("tenant:schedule:delete:"))
+async def cb_schedule_delete(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    schedule_id = int(call.data.rsplit(":", 1)[1])
+    await tenant_db.delete_schedule_time(call.from_user.id, schedule_id)
+    await call.answer("Удалено")
+    await call.message.edit_text("🗑 Время удалено.")
+
+
+@router.callback_query(F.data == "tenant:schedule:toggle")
+async def cb_schedule_toggle(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    current = await tenant_db.auto_publish_enabled(call.from_user.id)
+    await tenant_db.set_auto_publish_enabled(call.from_user.id, not current)
+    await call.answer("Изменено")
+    await send_schedule(call.message, call.from_user.id)
+
+
+# ---------------- URGENT ----------------
+
+@router.callback_query(F.data == "tenant:urgent")
+async def cb_urgent(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    await call.answer()
+    await call.message.answer(
+        "⚡ Срочная статья публикуется сразу и не ждёт расписания. "
+        "Тема, введённая вручную, не сохраняется в общий пул.",
+        reply_markup=urgent_keyboard(),
+    )
+
+
+def result_text(result: dict) -> str:
+    status = result.get("status")
+    if status == "ok":
+        return (
+            "✅ Статья опубликована.\n\n"
+            f"Тема: {result.get('topic')}\n"
+            f"Заголовок: {result.get('article_title')}\n"
+            f"Каналов: {result.get('channels_published', 0)}"
+        )
+    mapping = {
+        "no_channel": "⚠️ Сначала подключите канал.",
+        "no_topics": "⚠️ Нет закреплённых тем. Откройте «📝 Темы» и закрепите хотя бы одну тему.",
+        "subscription_inactive": "⛔ Подписка неактивна.",
+    }
+    return mapping.get(status, "❌ Ошибка: " + str(result.get("error", status)))
+
+
+@router.callback_query(F.data == "tenant:urgent:random")
+async def cb_urgent_random(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    _, _, service = _deps()
+    await call.answer()
+    status = await call.message.answer("⚡ Создаю статью…")
+    result = await service.publish_random_topic(call.from_user.id, trigger="urgent_random")
+    await status.edit_text(result_text(result))
+
+
+@router.callback_query(F.data == "tenant:urgent:manual")
+async def cb_urgent_manual(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.set_state(PaidStates.waiting_urgent_topic)
+    await call.answer()
+    await call.message.answer("Введите тему срочной статьи:")
+
+
+@router.message(PaidStates.waiting_urgent_topic)
+async def urgent_manual(message: Message, state: FSMContext):
+    if not await require_paid(message):
+        return
+    _, _, service = _deps()
+    topic = " ".join((message.text or "").split())
+    await state.clear()
+    status = await message.answer(f"⚡ Создаю статью по теме:\n{topic}")
+    result = await service.publish_manual_topic(message.from_user.id, topic)
+    await status.edit_text(result_text(result))
+
+
+# ---------------- PROMPTS ----------------
+
+async def effective_prompt(user_id: int, kind: str) -> tuple[str, bool]:
+    meta = PROMPTS[kind]
+    custom = (await tenant_db.get_setting(user_id, meta["key"], "")).strip()
+    return (custom, True) if custom else (meta["default"], False)
+
+
+@router.callback_query(F.data == "tenant:prompts")
+async def cb_prompts(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.clear()
+    await call.answer()
+    await call.message.answer(
+        "🧠 <b>Мои промпты</b>\n\n"
+        "Промпт текста и изображения индивидуальны для вашего аккаунта. "
+        "Изменение применяется со следующей статьи.\n\n"
+        "Для изображения используйте <code>{topic}</code> — сюда подставляется текущая тема.",
+        parse_mode="HTML",
+        reply_markup=prompts_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:prompt:view:"))
+async def cb_prompt_view(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    kind = call.data.rsplit(":", 1)[1]
+    if kind not in PROMPTS:
+        await call.answer("Неизвестный промпт", show_alert=True)
+        return
+    prompt, custom = await effective_prompt(call.from_user.id, kind)
+    meta = PROMPTS[kind]
+    await call.answer()
+    await call.message.answer(
+        f"{meta['title']}\n\n"
+        f"Версия: {'🟢 пользовательская' if custom else '⚪ стандартная'}\n"
+        f"Длина: {len(prompt)} символов.",
+        reply_markup=prompt_actions(kind),
+    )
+    await call.message.answer_document(
+        BufferedInputFile(prompt.encode("utf-8"), filename=meta["filename"]),
+        caption="Текущий активный промпт",
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:prompt:edit:"))
+async def cb_prompt_edit(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    kind = call.data.rsplit(":", 1)[1]
+    if kind not in PROMPTS:
+        await call.answer("Неизвестный промпт", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(tenant_prompt_kind=kind, tenant_prompt_parts=[])
+    await state.set_state(PaidStates.waiting_prompt_parts)
+    await call.answer()
+    extra = "\n\nДля картинки желательно оставить {topic}." if kind == "image" else ""
+    await call.message.answer(
+        "Отправляйте новый промпт одним или несколькими сообщениями. "
+        "Когда закончите — нажмите «✅ Сохранить»." + extra,
+        reply_markup=prompt_edit_keyboard(),
+    )
+
+
+@router.message(PaidStates.waiting_prompt_parts)
+async def prompt_part(message: Message, state: FSMContext):
+    if not await require_paid(message):
+        return
+    part = message.text or ""
+    if not part.strip():
+        return
+    data = await state.get_data()
+    parts = list(data.get("tenant_prompt_parts", []))
+    parts.append(part)
+    await state.update_data(tenant_prompt_parts=parts)
+    await message.answer(
+        f"✅ Фрагмент добавлен. Всего: {len(parts)}.",
+        reply_markup=prompt_edit_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "tenant:prompt:save")
+async def cb_prompt_save(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    data = await state.get_data()
+    kind = data.get("tenant_prompt_kind")
+    parts = data.get("tenant_prompt_parts", [])
+    if kind not in PROMPTS:
+        await call.answer("Редактор не активен", show_alert=True)
+        return
+    prompt = "\n\n".join(str(x).strip() for x in parts if str(x).strip()).strip()
+    if not prompt:
+        await call.answer("Сначала пришлите текст", show_alert=True)
+        return
+    await tenant_db.set_setting(call.from_user.id, PROMPTS[kind]["key"], prompt)
+    await state.clear()
+    await call.answer("Сохранено")
+    await call.message.answer(
+        f"✅ {PROMPTS[kind]['title']} обновлён.",
+        reply_markup=prompts_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("tenant:prompt:reset:"))
+async def cb_prompt_reset(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    kind = call.data.rsplit(":", 1)[1]
+    if kind not in PROMPTS:
+        return
+    await tenant_db.set_setting(call.from_user.id, PROMPTS[kind]["key"], "")
+    await state.clear()
+    await call.answer("Сброшено")
+    await call.message.answer("♻️ Возвращён стандартный промпт.", reply_markup=prompts_keyboard())
+
+
+@router.callback_query(F.data == "tenant:prompt:cancel")
+async def cb_prompt_cancel(call: CallbackQuery, state: FSMContext):
+    if not await require_paid(call):
+        return
+    await state.clear()
+    await call.answer("Отменено")
+    await call.message.answer("Изменения не сохранены.", reply_markup=prompts_keyboard())
+
+
+# ---------------- STATS ----------------
+
+@router.callback_query(F.data == "tenant:stats")
+async def cb_stats(call: CallbackQuery):
+    if not await require_paid(call):
+        return
+    await call.answer()
+    stats = await tenant_db.stats(call.from_user.id)
+    await call.message.answer(
+        "📊 <b>Моя статистика</b>\n\n"
+        f"Публикаций: {stats['total']}\n"
+        f"Успешно: {stats['published']}\n"
+        f"Активных тем: {stats['topics']}\n"
+        f"Каналов: {stats['channels']}\n"
+        f"Последняя статья: {html.escape(stats['last_title'] or '—')}",
+        parse_mode="HTML",
+        reply_markup=cabinet_keyboard(),
+    )
+
+
+# ---------------- SUPERADMIN ----------------
+
+@router.message(Command("super"))
+async def cmd_super(message: Message):
+    if not is_superadmin(message.from_user.id):
+        return
+    await show_superadmin(message)
+
+
+@router.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if not is_superadmin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: /grant USER_ID [DAYS]")
+        return
+    try:
+        user_id = int(parts[1])
+        days = int(parts[2]) if len(parts) > 2 else 30
+    except ValueError:
+        await message.answer("USER_ID и DAYS должны быть числами")
+        return
+    _, cfg, _ = _deps()
+    expires = await tenant_db.grant_subscription(user_id, days)
+    await tenant_db.ensure_defaults(user_id, cfg.default_publish_times, DEFAULT_TOPICS)
+    await message.answer(
+        f"✅ Пользователю <code>{user_id}</code> выдан доступ до "
+        f"<code>{expires.isoformat(timespec='seconds')}</code>.",
+        parse_mode="HTML",
+    )
+    try:
+        await _bot.send_message(user_id, "✅ Вам активирован доступ к боту. Откройте /cabinet")
+    except Exception:
+        pass
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if not is_superadmin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Использование: /revoke USER_ID")
+        return
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        await message.answer("USER_ID должен быть числом")
+        return
+    await tenant_db.revoke_subscription(user_id)
+    await message.answer(f"⛔ Доступ пользователя {user_id} отозван.")
+
+
+@router.callback_query(F.data == "super:stats")
+async def cb_super_stats(call: CallbackQuery):
+    if not is_superadmin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await call.answer()
+    await show_superadmin(call.message)
+
+
+@router.callback_query(F.data == "super:users")
+async def cb_super_users(call: CallbackQuery):
+    if not is_superadmin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await call.answer()
+    rows = await tenant_db.list_users(30)
+    if not rows:
+        await call.message.answer("Пользователей пока нет.")
+        return
+    lines = ["👥 <b>Последние пользователи</b>"]
+    for row in rows:
+        name = row["username"] or row["first_name"] or "—"
+        active = False
+        if row["status"] == "active" and row["expires_at"]:
+            try:
+                active = datetime.fromisoformat(row["expires_at"]) > datetime.now(timezone.utc)
+            except Exception:
+                active = False
+        lines.append(
+            f"{'🟢' if active else '⚪'} <code>{row['user_id']}</code> "
+            f"{html.escape(str(name))} — до {html.escape(str(row['expires_at'] or '—'))}"
+        )
+    await call.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=super_keyboard())

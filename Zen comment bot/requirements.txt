@@ -1,0 +1,4 @@
+aiogram>=3.18,<4
+openai>=1.68,<3
+playwright>=1.50,<2
+python-dotenv>=1.0,<2

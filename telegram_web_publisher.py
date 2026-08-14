@@ -241,6 +241,18 @@ class TelegramWebPublisher:
         self,
         page: Page,
     ) -> bool:
+        """
+        Проверяем авторизацию только после того, как Telegram Web
+        реально открыт.
+
+        ВАЖНО:
+        generic <canvas> больше НЕ используется как признак login-page,
+        потому что Telegram Web может использовать canvas и внутри
+        уже авторизованного интерфейса.
+        """
+        if "web.telegram.org" not in page.url:
+            return False
+
         authorized_markers = [
             page.locator(
                 '.chatlist, .chatlist-container, .sidebar-left'
@@ -254,6 +266,12 @@ class TelegramWebPublisher:
             page.locator(
                 '.input-search-input'
             ),
+            page.locator(
+                '.input-message-input[contenteditable="true"]'
+            ),
+            page.locator(
+                '.message-input [contenteditable="true"]'
+            ),
         ]
 
         marker = await self._first_visible(
@@ -263,11 +281,12 @@ class TelegramWebPublisher:
         if marker is not None:
             return True
 
-        # На странице логина обычно есть QR / phone-login controls.
+        # Только явные элементы формы логина.
         login_markers = [
             page.get_by_text(
                 re.compile(
-                    r"log in by phone|войти по номеру",
+                    r"log in by phone|войти по номеру|"
+                    r"log in by qr code|войти по qr",
                     re.I,
                 )
             ),
@@ -275,7 +294,7 @@ class TelegramWebPublisher:
                 'input[type="tel"]'
             ),
             page.locator(
-                'canvas'
+                'input[autocomplete="one-time-code"]'
             ),
         ]
 
@@ -283,17 +302,30 @@ class TelegramWebPublisher:
             login_markers
         )
 
-        return login_marker is None and (
-            "web.telegram.org" in page.url
-            and "login" not in page.url.lower()
-        )
+        if login_marker is not None:
+            return False
+
+        # Telegram Web — SPA. Во время переходов sidebar/composer
+        # иногда кратковременно отсутствуют. Если мы остаёмся на
+        # web.telegram.org и явной формы логина нет, считаем сессию
+        # авторизованной.
+        return True
 
     async def _require_authorized(
         self,
         page: Page,
     ) -> None:
-        if await self._is_authorized(page):
-            return
+        # Telegram Web — SPA; после навигации интерфейс может
+        # дорисовываться несколько секунд.
+        for _ in range(12):
+            if await self._is_authorized(
+                page
+            ):
+                return
+
+            await page.wait_for_timeout(
+                500
+            )
 
         await self._debug_capture(
             page,
@@ -301,9 +333,9 @@ class TelegramWebPublisher:
         )
 
         raise RuntimeError(
-            "Telegram Web не авторизован. "
-            "Сначала выполните на VPS: "
-            "source venv/bin/activate && python setup_telegram_web.py"
+            "Telegram Web действительно показывает неавторизованное "
+            "состояние после открытия web.telegram.org. "
+            "Проверьте persistent profile и data/telegram_web_debug."
         )
 
     async def healthcheck(self) -> dict[str, str | bool]:
@@ -333,10 +365,14 @@ class TelegramWebPublisher:
         self,
         page: Page,
     ) -> None:
-        await self._require_authorized(
-            page
-        )
+        """
+        ВАЖНО: сначала открываем Telegram Web, и только потом
+        проверяем авторизацию.
 
+        Раньше проверка выполнялась на about:blank при первом запуске
+        Chromium внутри bot.py. Поэтому healthcheck проходил, а реальная
+        публикация ошибочно получала "Telegram Web не авторизован".
+        """
         channel_url = (
             f"{self.web_url}#@{self.channel}"
         )
@@ -346,7 +382,11 @@ class TelegramWebPublisher:
             wait_until="domcontentloaded",
             timeout=60000,
         )
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(3000)
+
+        await self._require_authorized(
+            page
+        )
 
         # Telegram Web — SPA. Иногда прямой hash-route не успевает.
         composer = await self._get_main_composer(

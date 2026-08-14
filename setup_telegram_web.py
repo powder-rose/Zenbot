@@ -411,10 +411,36 @@ async def qr_login(page, profile_dir: Path) -> None:
                 "Введите пароль 2FA Telegram: "
             )
 
-            # На всякий случай очищаем поле полностью.
-            await password_input.click()
-            await password_input.fill("")
-            await password_input.fill(password)
+            # Telegram Web использует скрытый/stealthy password input,
+            # поверх которого расположен div.input-field-password.
+            # Обычный locator.click() по input может зависнуть, потому что
+            # wrapper перехватывает pointer events. Поэтому кликаем wrapper,
+            # затем вводим пароль с клавиатуры. Если wrapper не найден,
+            # используем focus() без pointer click.
+            password_wrapper = await first_visible(
+                [
+                    page.locator(".input-field-password"),
+                    page.locator('[class*="input-field-password"]'),
+                ]
+            )
+
+            if password_wrapper is not None:
+                try:
+                    await password_wrapper.click(
+                        timeout=5000,
+                        force=True,
+                    )
+                except Exception:
+                    await password_input.focus()
+            else:
+                await password_input.focus()
+
+            # Очищаем текущее значение через клавиатуру — это надёжнее
+            # для Telegram Web, чем fill() по stealthy input.
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.insert_text(password)
+            await page.wait_for_timeout(250)
 
             submit = await first_visible(
                 [

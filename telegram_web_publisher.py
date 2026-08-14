@@ -1060,6 +1060,164 @@ class TelegramWebPublisher:
 
         return visible[0][1]
 
+    async def _media_send_completed(
+        self,
+        page: Page,
+        dialog: Locator,
+        caption: str,
+        *,
+        timeout_ms: int = 7000,
+    ) -> bool:
+        """
+        После Send проверяем фактический результат:
+        - media-preview закрылся, либо
+        - в чате появился исходящий пост по началу caption.
+
+        Это позволяет безопасно использовать keyboard fallback,
+        не отправляя голый текст из обычного composer.
+        """
+        loops = max(
+            1,
+            int(timeout_ms / 350),
+        )
+
+        hint = self._hint_from_caption(
+            caption
+        )
+
+        for _ in range(loops):
+            try:
+                if not await dialog.is_visible():
+                    return True
+            except Exception:
+                # DOM preview уничтожен после отправки.
+                return True
+
+            try:
+                post = await self._find_post_element(
+                    page,
+                    ref=None,
+                    caption_hint=hint,
+                )
+
+                if post is not None:
+                    media = post.locator(
+                        ".attachment img, "
+                        ".attachment video, "
+                        ".media-photo, "
+                        ".media-container img, "
+                        ".media-container video"
+                    )
+
+                    if await media.count() > 0:
+                        return True
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(
+                350
+            )
+
+        return False
+
+    async def _find_media_send_button(
+        self,
+        page: Page,
+        dialog: Locator,
+    ) -> Locator | None:
+        """
+        Telegram Web K меняет DOM media preview между версиями.
+
+        Ищем Send:
+        1. внутри найденного media-preview;
+        2. в видимом popup/media layer;
+        3. глобально, но НИКОГДА не кликаем обычную кнопку записи
+           composer с классом `record`.
+        """
+        candidates = [
+            dialog.locator(
+                "button.btn-send:not(.record)"
+            ),
+            dialog.locator(
+                ".btn-send:not(.record)"
+            ),
+            dialog.locator(
+                'button[aria-label="Send"]'
+            ),
+            dialog.locator(
+                'button[aria-label="Отправить"]'
+            ),
+            dialog.get_by_role(
+                "button",
+                name=re.compile(
+                    r"^send$|^отправить$",
+                    re.I,
+                ),
+            ),
+
+            page.locator(
+                ".popup:not(.hide) button.btn-send:not(.record)"
+            ),
+            page.locator(
+                "[class*='media' i] button.btn-send:not(.record)"
+            ),
+            page.locator(
+                "[role='dialog'] button.btn-send:not(.record)"
+            ),
+            page.locator(
+                "button.btn-send:not(.record)"
+            ),
+            page.get_by_role(
+                "button",
+                name=re.compile(
+                    r"^send$|^отправить$",
+                    re.I,
+                ),
+            ),
+        ]
+
+        send = await self._first_visible(
+            candidates
+        )
+
+        if send is not None:
+            return send
+
+        # Иногда надпись Send находится во внутреннем span/div,
+        # а pointer events принимает родитель.
+        label = await self._first_visible(
+            [
+                dialog.get_by_text(
+                    re.compile(
+                        r"^send$|^отправить$",
+                        re.I,
+                    )
+                ),
+                page.get_by_text(
+                    re.compile(
+                        r"^send$|^отправить$",
+                        re.I,
+                    )
+                ),
+            ]
+        )
+
+        if label is None:
+            return None
+
+        wrapper = label.locator(
+            "xpath=ancestor::*["
+            "self::button or "
+            "contains(@class,'btn-send') or "
+            "contains(@class,'btn-primary')"
+            "][1]"
+        )
+
+        if await wrapper.count():
+            return wrapper
+
+        return None
+
     async def _send_media_popup(
         self,
         page: Page,
@@ -1071,68 +1229,147 @@ class TelegramWebPublisher:
             dialog,
         )
 
-        await editor.click()
+        await editor.click(
+            force=True
+        )
         await editor.fill(
             caption
         )
-        await page.wait_for_timeout(250)
+        await page.wait_for_timeout(
+            300
+        )
 
-        # Заголовок — первая строка caption — оформляем жирным
-        # средствами самого Telegram Web. Markdown-звёздочки в текст
-        # не добавляются и в Дзен не передаются как символы.
+        # Заголовок — первая строка caption — жирный.
+        # В сам текст Markdown-звёздочки не добавляются.
         try:
-            await editor.press("Control+Home")
-            await editor.press("Shift+End")
-            await editor.press("Control+b")
-            await editor.press("End")
-            await page.wait_for_timeout(150)
+            await editor.press(
+                "Control+Home"
+            )
+            await editor.press(
+                "Shift+End"
+            )
+            await editor.press(
+                "Control+b"
+            )
+            await editor.press(
+                "End"
+            )
+            await page.wait_for_timeout(
+                150
+            )
         except Exception:
             log.exception(
-                "Не удалось применить жирное начертание к заголовку "
-                "в Telegram Web; публикация продолжится без Markdown."
+                "Не удалось применить жирное начертание "
+                "к заголовку Telegram Web."
             )
 
-        send = await self._first_visible(
-            [
-                dialog.locator(
-                    'button[aria-label="Send"]'
-                ),
-                dialog.locator(
-                    'button[aria-label="Отправить"]'
-                ),
-                dialog.locator(
-                    'button.btn-send'
-                ),
-                dialog.get_by_role(
-                    "button",
-                    name=re.compile(
-                        r"^send$|^отправить$",
-                        re.I,
-                    ),
-                ),
-                page.locator(
-                    '.popup-send-photo .btn-send'
-                ),
-                page.locator(
-                    '.popup-send-media .btn-send'
-                ),
-            ]
+        send = await self._find_media_send_button(
+            page,
+            dialog,
         )
 
-        if send is None:
-            await self._debug_capture(
+        if send is not None:
+            try:
+                await send.click(
+                    force=True,
+                    timeout=5000,
+                )
+
+                if await self._media_send_completed(
+                    page,
+                    dialog,
+                    caption,
+                    timeout_ms=7000,
+                ):
+                    log.info(
+                        "Telegram Web: media post отправлен "
+                        "через найденную кнопку Send."
+                    )
+                    return
+
+                log.warning(
+                    "Telegram Web: клик по Send выполнен, "
+                    "но media-preview не закрылся. "
+                    "Перехожу к keyboard fallback."
+                )
+
+            except Exception:
+                log.exception(
+                    "Telegram Web: найденная кнопка Send "
+                    "не сработала. Пробую keyboard fallback."
+                )
+        else:
+            log.warning(
+                "Telegram Web: отдельная кнопка Send "
+                "в media-preview не найдена. "
+                "Пробую keyboard fallback."
+            )
+
+        # В Telegram Web обычное поведение media caption:
+        # Enter отправляет, Shift+Enter добавляет перенос.
+        # После нажатия ОБЯЗАТЕЛЬНО проверяем, что preview закрылся.
+        try:
+            await editor.focus()
+            await page.keyboard.press(
+                "Enter"
+            )
+
+            if await self._media_send_completed(
                 page,
-                "send_button_not_found",
+                dialog,
+                caption,
+                timeout_ms=5000,
+            ):
+                log.info(
+                    "Telegram Web: media post отправлен "
+                    "keyboard fallback Enter."
+                )
+                return
+
+            log.warning(
+                "Telegram Web: Enter не отправил media post."
             )
-            raise RuntimeError(
-                "Не найдена кнопка Send в окне фотографии Telegram Web."
+        except Exception:
+            log.exception(
+                "Telegram Web: fallback Enter завершился ошибкой."
             )
 
-        await send.click(
-            force=True,
-            timeout=5000,
+        # Если в настройках Telegram Enter создаёт перенос,
+        # пробуем Ctrl+Enter. Если предыдущий Enter добавил новую строку,
+        # это не критично для caption.
+        try:
+            await editor.focus()
+            await page.keyboard.press(
+                "Control+Enter"
+            )
+
+            if await self._media_send_completed(
+                page,
+                dialog,
+                caption,
+                timeout_ms=5000,
+            ):
+                log.info(
+                    "Telegram Web: media post отправлен "
+                    "keyboard fallback Ctrl+Enter."
+                )
+                return
+
+        except Exception:
+            log.exception(
+                "Telegram Web: fallback Ctrl+Enter завершился ошибкой."
+            )
+
+        await self._debug_capture(
+            page,
+            "media_send_failed",
         )
-        await page.wait_for_timeout(2500)
+
+        raise RuntimeError(
+            "Фотография прикреплена и media-preview открыт, "
+            "но Telegram Web не выполнил отправку ни кнопкой Send, "
+            "ни Enter, ни Ctrl+Enter. Debug сохранён."
+        )
 
     @staticmethod
     def _hint_from_caption(

@@ -228,14 +228,13 @@ async def phone_login(page) -> None:
 
 async def qr_login(page, profile_dir: Path) -> None:
     """
-    QR-вход с поддержкой двухэтапной аутентификации Telegram.
+    QR-вход с поддержкой 2FA.
 
-    Схема:
-    1. Переключаем Telegram Web на QR.
-    2. Сохраняем свежий QR в PNG.
-    3. После сканирования:
-       - если аккаунт без 2FA -> ждём список чатов;
-       - если включён 2FA -> просим пароль в SSH и вводим его в Telegram Web.
+    Отличие v41:
+    - не считаем наличие password-input признаком неверного пароля;
+    - ждём реальный переход в список чатов;
+    - ищем явное сообщение об ошибке;
+    - разрешаем до 3 попыток ввода 2FA без повторного QR.
     """
     print()
     print("Режим QR.")
@@ -256,12 +255,8 @@ async def qr_login(page, profile_dir: Path) -> None:
                     re.I,
                 ),
             ),
-            page.locator(
-                'a:has-text("LOG IN BY QR CODE")'
-            ),
-            page.locator(
-                'button:has-text("LOG IN BY QR CODE")'
-            ),
+            page.locator('a:has-text("LOG IN BY QR CODE")'),
+            page.locator('button:has-text("LOG IN BY QR CODE")'),
         ]
     )
 
@@ -284,7 +279,7 @@ async def qr_login(page, profile_dir: Path) -> None:
         await page.screenshot(path=str(debug), full_page=True)
         raise RuntimeError(
             "Telegram Web не переключился на QR-форму. "
-            f"Сохранён screenshot: {debug}"
+            f"Screenshot: {debug}"
         )
 
     screenshot = BASE_DIR / "data" / "telegram_login_qr.png"
@@ -295,12 +290,80 @@ async def qr_login(page, profile_dir: Path) -> None:
     print(screenshot)
     print()
     print(
-        "Откройте свежий PNG через SFTP/WinSCP и отсканируйте: "
+        "Откройте свежий PNG и отсканируйте: "
         "Telegram → Настройки → Устройства → Подключить устройство."
     )
     print()
 
-    password_was_submitted = False
+    password_attempts = 0
+
+    async def explicit_password_error() -> str | None:
+        """
+        Ищем именно текст ошибки, а не само поле пароля.
+        """
+        error_locators = [
+            page.get_by_text(
+                re.compile(
+                    r"incorrect password|wrong password|invalid password|"
+                    r"неверн.*парол|неправильн.*парол",
+                    re.I,
+                )
+            ),
+            page.locator(
+                '[class*="error" i]'
+            ),
+        ]
+
+        for locator in error_locators:
+            try:
+                count = await locator.count()
+            except Exception:
+                continue
+
+            for i in range(min(count, 10)):
+                item = locator.nth(i)
+                try:
+                    if not await item.is_visible():
+                        continue
+
+                    value = " ".join(
+                        (await item.inner_text()).split()
+                    )
+
+                    if re.search(
+                        r"incorrect password|wrong password|invalid password|"
+                        r"неверн.*парол|неправильн.*парол",
+                        value,
+                        re.I,
+                    ):
+                        return value
+                except Exception:
+                    continue
+
+        return None
+
+    async def wait_after_password_submit(
+        timeout_seconds: int = 25,
+    ) -> tuple[str, str | None]:
+        """
+        Возвращает:
+        ("authorized", None)
+        ("error", "текст ошибки")
+        ("waiting", None)
+        """
+        loops = max(1, int(timeout_seconds / 0.5))
+
+        for _ in range(loops):
+            if await authorized(page):
+                return "authorized", None
+
+            error_text = await explicit_password_error()
+            if error_text:
+                return "error", error_text
+
+            await page.wait_for_timeout(500)
+
+        return "waiting", None
 
     for _ in range(180):
         if await authorized(page):
@@ -308,30 +371,49 @@ async def qr_login(page, profile_dir: Path) -> None:
             print("Telegram Web авторизован.")
             return
 
-        # После успешного QR Telegram может запросить пароль 2FA.
         password_input = await first_visible(
             [
                 page.locator('input[type="password"]'),
                 page.locator('input[name*="password" i]'),
-                page.locator(
-                    'input[placeholder*="password" i]'
-                ),
-                page.locator(
-                    'input[placeholder*="парол" i]'
-                ),
+                page.locator('input[placeholder*="password" i]'),
+                page.locator('input[placeholder*="парол" i]'),
             ]
         )
 
-        if password_input is not None and not password_was_submitted:
+        if password_input is not None:
+            if password_attempts >= 3:
+                error_shot = (
+                    BASE_DIR
+                    / "data"
+                    / "telegram_2fa_error.png"
+                )
+                await page.screenshot(
+                    path=str(error_shot),
+                    full_page=True,
+                )
+                raise RuntimeError(
+                    "Превышено 3 попытки ввода пароля 2FA. "
+                    f"Screenshot: {error_shot}"
+                )
+
+            password_attempts += 1
+
             print()
             print(
                 "QR принят. Telegram запрашивает пароль "
                 "двухэтапной аутентификации."
             )
+            print(
+                f"Попытка {password_attempts}/3."
+            )
+
             password = getpass.getpass(
                 "Введите пароль 2FA Telegram: "
             )
 
+            # На всякий случай очищаем поле полностью.
+            await password_input.click()
+            await password_input.fill("")
             await password_input.fill(password)
 
             submit = await first_visible(
@@ -357,47 +439,57 @@ async def qr_login(page, profile_dir: Path) -> None:
             else:
                 await page.keyboard.press("Enter")
 
-            password_was_submitted = True
-            await page.wait_for_timeout(2200)
+            print(
+                "Пароль отправлен. Жду ответ Telegram..."
+            )
 
-            if await authorized(page):
+            status, error_text = await wait_after_password_submit(
+                timeout_seconds=25
+            )
+
+            if status == "authorized":
                 print()
                 print("Telegram Web авторизован после 2FA.")
                 return
 
-            # Если поле пароля осталось на экране, пароль, вероятно, неверный.
-            still_password = await first_visible(
-                [
-                    page.locator('input[type="password"]'),
-                    page.locator('input[name*="password" i]'),
-                ]
+            if status == "error":
+                print()
+                print(
+                    "Telegram явно сообщил, что пароль не принят:"
+                )
+                print(error_text or "неверный пароль")
+                print(
+                    "Повторный QR не нужен — можно попробовать пароль ещё раз."
+                )
+                await page.wait_for_timeout(500)
+                continue
+
+            # Если явной ошибки нет, не делаем ложный вывод.
+            # Telegram Web мог ещё не завершить переход.
+            print()
+            print(
+                "Явной ошибки пароля нет, но список чатов пока не появился."
             )
+            print(
+                "Продолжаю ждать состояние Telegram Web..."
+            )
+            await page.wait_for_timeout(2000)
+            continue
 
-            if still_password is not None:
-                error_shot = (
-                    BASE_DIR
-                    / "data"
-                    / "telegram_2fa_error.png"
-                )
-                await page.screenshot(
-                    path=str(error_shot),
-                    full_page=True,
-                )
-                raise RuntimeError(
-                    "Telegram не принял пароль 2FA. "
-                    "Проверьте пароль и запустите setup заново. "
-                    f"Screenshot: {error_shot}"
-                )
-
-        # Пока ждём QR или переход на 2FA — обновляем screenshot.
         await page.screenshot(
             path=str(screenshot),
             full_page=True,
         )
         await page.wait_for_timeout(2000)
 
+    final_shot = BASE_DIR / "data" / "telegram_auth_timeout.png"
+    await page.screenshot(
+        path=str(final_shot),
+        full_page=True,
+    )
     raise RuntimeError(
-        "Авторизация Telegram не завершена за 6 минут."
+        "Авторизация Telegram не завершена за 6 минут. "
+        f"Screenshot: {final_shot}"
     )
 
 

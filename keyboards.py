@@ -6,6 +6,7 @@ def admin_menu():
          InlineKeyboardButton(text="⏰ Расписание", callback_data="admin:schedule")],
         [InlineKeyboardButton(text="⚡ Срочная статья", callback_data="admin:urgent"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="🧠 Промпты", callback_data="admin:prompts")],
         [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="admin:restart")],
     ])
 
@@ -40,4 +41,55 @@ def urgent_menu():
         [InlineKeyboardButton(text="🎲 Случайная тема из очереди", callback_data="urgent:random")],
         [InlineKeyboardButton(text="✍️ Ввести тему вручную", callback_data="urgent:manual")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
+    ])
+
+
+def prompts_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✍️ Основной текст статьи",
+            callback_data="prompt:view:article",
+        )],
+        [InlineKeyboardButton(
+            text="📱 Короткая версия Telegram",
+            callback_data="prompt:view:short",
+        )],
+        [InlineKeyboardButton(
+            text="🖼 Промпт изображения",
+            callback_data="prompt:view:image",
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data="admin:home",
+        )],
+    ])
+
+
+def prompt_detail_menu(kind: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✏️ Редактировать",
+            callback_data=f"prompt:edit:{kind}",
+        )],
+        [InlineKeyboardButton(
+            text="♻️ Сбросить к стандартному",
+            callback_data=f"prompt:reset:{kind}",
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ К промптам",
+            callback_data="admin:prompts",
+        )],
+    ])
+
+
+def prompt_edit_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ Сохранить",
+            callback_data="prompt:save",
+        )],
+        [InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="prompt:cancel",
+        )],
     ])

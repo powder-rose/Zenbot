@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import tempfile
 import logging
 import os
 import re
@@ -513,30 +515,28 @@ class TelegramWebPublisher:
         page: Page,
     ) -> Locator | None:
         """
-        Ищем именно окно предпросмотра прикреплённого медиа.
+        Ищем окно/слой предпросмотра медиа.
 
-        Главное правило v45: если preview фотографии не появился,
-        пост НЕ отправляем как обычный текст.
+        В текущем Telegram Web K composer выглядит как:
+          .new-message-wrapper
+          attach-menu-button.attach-file
+          .input-message-input
+          input[type=file]
+
+        Классы самого media-preview меняются, поэтому не полагаемся
+        только на старые popup-send-photo / popup-send-media.
         """
         candidates = [
-            page.locator(
-                ".popup-send-photo"
-            ),
-            page.locator(
-                ".popup-send-media"
-            ),
-            page.locator(
-                ".media-editor"
-            ),
-            page.locator(
-                ".popup .media-editor"
-            ),
-            page.locator(
-                '[role="dialog"]'
-            ),
-            page.locator(
-                ".popup"
-            ),
+            page.locator(".popup-new-media"),
+            page.locator(".popup-send-photo"),
+            page.locator(".popup-send-media"),
+            page.locator(".media-editor"),
+            page.locator('[class*="media-editor" i]'),
+            page.locator('[class*="send-media" i]'),
+            page.locator('[class*="new-media" i]'),
+            page.locator('[role="dialog"]'),
+            page.locator(".popup"),
+            page.locator('[class*="popup" i]'),
         ]
 
         for group in candidates:
@@ -545,25 +545,20 @@ class TelegramWebPublisher:
             except Exception:
                 continue
 
-            for index in range(
-                min(count, 12)
-            ):
+            for index in range(min(count, 20)):
                 item = group.nth(index)
 
                 try:
                     if not await item.is_visible():
                         continue
 
-                    # Media-preview должен содержать хотя бы редактор caption
-                    # и визуальный media-элемент.
                     editable = item.locator(
                         '[contenteditable="true"]'
                     )
-
                     media = item.locator(
                         "img, video, canvas, "
                         ".media-photo, .media-container, "
-                        ".attachment, [class*='media']"
+                        ".attachment, [class*='media' i]"
                     )
 
                     if (
@@ -573,6 +568,53 @@ class TelegramWebPublisher:
                         return item
                 except Exception:
                     continue
+
+        # Fallback для новой верстки:
+        # media-preview может быть не role=dialog и не .popup.
+        # Ищем видимый contenteditable, который НЕ является обычным
+        # Broadcast composer, и поднимаемся к ближайшему контейнеру с media.
+        editors = page.locator(
+            '[contenteditable="true"]'
+        )
+
+        try:
+            count = await editors.count()
+        except Exception:
+            count = 0
+
+        for index in range(min(count, 30)):
+            editor = editors.nth(index)
+
+            try:
+                if not await editor.is_visible():
+                    continue
+
+                classes = (
+                    await editor.get_attribute("class")
+                    or ""
+                )
+
+                # Пропускаем основной и fake composer канала.
+                if "input-message-input" in classes:
+                    wrapper = editor.locator(
+                        "xpath=ancestor::*[contains(@class,'new-message-wrapper')][1]"
+                    )
+                    if await wrapper.count():
+                        continue
+
+                container = editor.locator(
+                    "xpath=ancestor::*["
+                    ".//img or .//video or .//canvas or "
+                    ".//*[contains(@class,'media')]"
+                    "][1]"
+                )
+
+                if await container.count():
+                    candidate = container.first
+                    if await candidate.is_visible():
+                        return candidate
+            except Exception:
+                continue
 
         return None
 
@@ -584,7 +626,7 @@ class TelegramWebPublisher:
     ) -> Locator:
         loops = max(
             1,
-            int(timeout_ms / 300),
+            int(timeout_ms / 250),
         )
 
         for _ in range(loops):
@@ -596,80 +638,272 @@ class TelegramWebPublisher:
                 return dialog
 
             await page.wait_for_timeout(
-                300
+                250
             )
 
-        await self._debug_capture(
-            page,
-            "media_preview_not_opened",
-        )
-
         raise RuntimeError(
-            "Telegram Web не открыл предпросмотр фотографии. "
-            "Публикация остановлена, чтобы не отправить статью "
-            "как обычный текст без изображения."
+            "media-preview не появился"
         )
 
-    async def _set_photo_file_input(
+
+    async def _set_exact_composer_file_input(
         self,
         page: Page,
-        payload: dict,
+        image_bytes: bytes,
     ) -> bool:
         """
-        Fallback для версий Telegram Web, где file input уже присутствует
-        после открытия меню Attach.
-        """
-        inputs = page.locator(
-            'input[type="file"]'
-        )
+        Используем фактический DOM, полученный из debug HTML пользователя:
 
-        try:
-            count = await inputs.count()
-        except Exception:
+        <div class="new-message-wrapper ...">
+          <attach-menu-button class="... attach-file ...">
+          ...
+          <input type="file" multiple style="display:none">
+        </div>
+
+        Передаём реальный временный JPEG-файл, а не buffer-object.
+        Это ближе к обычному выбору файла пользователем.
+        """
+        file_input = page.locator(
+            ".new-message-wrapper input[type='file']"
+        ).first
+
+        if await file_input.count() == 0:
             return False
 
-        image_inputs: list[Locator] = []
-        other_inputs: list[Locator] = []
+        temp_path: str | None = None
 
-        for index in range(count):
-            item = inputs.nth(index)
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".jpg",
+                delete=False,
+            ) as tmp:
+                tmp.write(image_bytes)
+                tmp.flush()
+                temp_path = tmp.name
 
+            await file_input.set_input_files(
+                temp_path,
+                timeout=5000,
+            )
+
+            # Telegram Web подписан на input/change.
+            # Playwright обычно посылает их сам, но повторяем явно,
+            # чтобы новая версия Web K точно увидела изменение FileList.
             try:
-                accept = (
-                    await item.get_attribute(
-                        "accept"
-                    )
-                    or ""
-                ).lower()
+                await file_input.dispatch_event(
+                    "input"
+                )
+                await file_input.dispatch_event(
+                    "change"
+                )
             except Exception:
-                accept = ""
+                pass
 
-            if (
-                "image" in accept
-                or "video" in accept
-            ):
-                image_inputs.append(
-                    item
-                )
-            else:
-                other_inputs.append(
-                    item
-                )
+            return True
 
-        # Сначала используем только input, явно предназначенный для media.
-        for item in (
-            image_inputs
-            + other_inputs
-        ):
-            try:
-                await item.set_input_files(
-                    payload
+        except Exception:
+            log.exception(
+                "Telegram Web: не удалось загрузить фото "
+                "через точный composer input[type=file]"
+            )
+            return False
+
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(
+                        temp_path
+                    )
+                except OSError:
+                    pass
+
+    async def _dispatch_media_paste(
+        self,
+        page: Page,
+        image_bytes: bytes,
+    ) -> bool:
+        """
+        Fallback №2: имитируем вставку изображения в composer.
+
+        Telegram Web K официально поддерживает paste media.
+        Здесь File передаётся через ClipboardEvent/DataTransfer.
+        """
+        composer = page.locator(
+            ".new-message-wrapper "
+            ".input-message-input[contenteditable='true']:not(.input-field-input-fake)"
+        ).first
+
+        if await composer.count() == 0:
+            composer = await self._get_main_composer(
+                page,
+                optional=True,
+            )
+
+        if composer is None or await composer.count() == 0:
+            return False
+
+        b64 = base64.b64encode(
+            image_bytes
+        ).decode("ascii")
+
+        try:
+            await composer.focus()
+
+            result = await composer.evaluate(
+                """(el, payload) => {
+                    try {
+                        const binary = atob(payload.b64);
+                        const bytes = new Uint8Array(binary.length);
+
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
+                        }
+
+                        const file = new File(
+                            [bytes],
+                            "article.jpg",
+                            {type: "image/jpeg"}
+                        );
+
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+
+                        let event;
+
+                        try {
+                            event = new ClipboardEvent("paste", {
+                                bubbles: true,
+                                cancelable: true,
+                                clipboardData: dt
+                            });
+                        } catch (_) {
+                            event = new Event("paste", {
+                                bubbles: true,
+                                cancelable: true
+                            });
+                        }
+
+                        try {
+                            Object.defineProperty(
+                                event,
+                                "clipboardData",
+                                {value: dt}
+                            );
+                        } catch (_) {}
+
+                        el.dispatchEvent(event);
+                        return true;
+                    } catch (e) {
+                        return String(e);
+                    }
+                }""",
+                {
+                    "b64": b64,
+                },
+            )
+
+            if result is True:
+                log.info(
+                    "Telegram Web: отправлен synthetic paste "
+                    "с image/jpeg."
                 )
                 return True
-            except Exception:
-                continue
 
-        return False
+            log.warning(
+                "Telegram Web synthetic paste result=%r",
+                result,
+            )
+            return False
+
+        except Exception:
+            log.exception(
+                "Telegram Web: synthetic paste изображения не удался"
+            )
+            return False
+
+    async def _dispatch_media_drop(
+        self,
+        page: Page,
+        image_bytes: bytes,
+    ) -> bool:
+        """
+        Fallback №3: имитируем drag-and-drop файла на текущий чат.
+        Telegram Web K поддерживает drag-and-drop media.
+        """
+        b64 = base64.b64encode(
+            image_bytes
+        ).decode("ascii")
+
+        target = page.locator(
+            "#column-center, .bubbles, .chat-input"
+        ).last
+
+        if await target.count() == 0:
+            return False
+
+        try:
+            result = await target.evaluate(
+                """(el, payload) => {
+                    try {
+                        const binary = atob(payload.b64);
+                        const bytes = new Uint8Array(binary.length);
+
+                        for (let i = 0; i < binary.length; i++) {
+                            bytes[i] = binary.charCodeAt(i);
+                        }
+
+                        const file = new File(
+                            [bytes],
+                            "article.jpg",
+                            {type: "image/jpeg"}
+                        );
+
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+
+                        for (const type of [
+                            "dragenter",
+                            "dragover",
+                            "drop"
+                        ]) {
+                            const event = new DragEvent(type, {
+                                bubbles: true,
+                                cancelable: true,
+                                dataTransfer: dt
+                            });
+
+                            el.dispatchEvent(event);
+                        }
+
+                        return true;
+                    } catch (e) {
+                        return String(e);
+                    }
+                }""",
+                {
+                    "b64": b64,
+                },
+            )
+
+            if result is True:
+                log.info(
+                    "Telegram Web: отправлен synthetic drag-and-drop "
+                    "с image/jpeg."
+                )
+                return True
+
+            log.warning(
+                "Telegram Web synthetic drop result=%r",
+                result,
+            )
+            return False
+
+        except Exception:
+            log.exception(
+                "Telegram Web: synthetic drag-and-drop изображения "
+                "не удался"
+            )
+            return False
 
     async def _select_photo_input(
         self,
@@ -677,153 +911,94 @@ class TelegramWebPublisher:
         image_bytes: bytes,
     ) -> Locator:
         """
-        Надёжная загрузка фотографии.
+        v46: загрузка построена по фактическому DOM Telegram Web K
+        из присланного debug HTML.
 
-        v45 больше НЕ выбирает случайный скрытый input[type=file] до
-        открытия Attach. Сначала открывается Attach -> Photo/Video,
-        затем файл передаётся именно в этот chooser/input.
+        Порядок:
+        1. точный hidden input внутри .new-message-wrapper;
+        2. synthetic paste изображения;
+        3. synthetic drag-and-drop.
 
-        Возвращает media-preview dialog.
+        После каждого способа ОБЯЗАТЕЛЬНО проверяем media-preview.
+        Если ни один путь не открыл preview, ничего не публикуем.
         """
-        payload = {
-            "name": "article.jpg",
-            "mimeType": "image/jpeg",
-            "buffer": image_bytes,
-        }
+        methods = [
+            (
+                "exact_file_input",
+                self._set_exact_composer_file_input,
+            ),
+            (
+                "paste",
+                self._dispatch_media_paste,
+            ),
+            (
+                "drag_drop",
+                self._dispatch_media_drop,
+            ),
+        ]
 
-        # Сначала открываем Attach.
-        attach = await self._first_visible(
-            [
-                page.locator(
-                    'button[aria-label*="Attach" i]'
-                ),
-                page.locator(
-                    'button[aria-label*="Прикреп" i]'
-                ),
-                page.locator(
-                    ".btn-icon.tgico-attach"
-                ),
-                page.locator(
-                    '[data-tippy-content*="Attach" i]'
-                ),
-                page.locator(
-                    '[class*="attach" i]'
-                ),
-            ]
-        )
+        for method_name, method in methods:
+            log.info(
+                "Telegram Web: пробую прикрепить фото методом %s",
+                method_name,
+            )
 
-        if attach is None:
-            await self._debug_capture(
+            ok = await method(
                 page,
-                "attach_not_found",
-            )
-            raise RuntimeError(
-                "Не найдено управление Attach в Telegram Web."
+                image_bytes,
             )
 
-        try:
-            await attach.click(
-                force=True,
-                timeout=5000,
-            )
-        except Exception:
-            # Иногда pointer-events принимает wrapper.
-            wrapper = attach.locator(
-                "xpath=ancestor::button[1]"
-            )
-
-            if await wrapper.count():
-                await wrapper.click(
-                    force=True,
-                    timeout=5000,
-                )
-            else:
-                raise
-
-        await page.wait_for_timeout(
-            500
-        )
-
-        photo_menu = await self._first_visible(
-            [
-                page.get_by_text(
-                    re.compile(
-                        r"photo|video|фото|видео",
-                        re.I,
-                    )
-                ),
-                page.get_by_role(
-                    "menuitem",
-                    name=re.compile(
-                        r"photo|video|фото|видео",
-                        re.I,
-                    ),
-                ),
-            ]
-        )
-
-        chooser_used = False
-
-        if photo_menu is not None:
-            # Кликаем по action-wrapper меню, а не по внутреннему span.i18n.
-            menu_wrapper = photo_menu.locator(
-                "xpath=ancestor::div["
-                "contains(@class,'btn-menu-item') or "
-                "contains(@class,'menu-item')"
-                "][1]"
-            )
-
-            click_target = (
-                menu_wrapper
-                if await menu_wrapper.count()
-                else photo_menu
-            )
+            if not ok:
+                continue
 
             try:
-                async with page.expect_file_chooser(
-                    timeout=5000
-                ) as chooser_info:
-                    await click_target.click(
-                        force=True,
-                        timeout=5000,
-                    )
-
-                chooser = await chooser_info.value
-                await chooser.set_files(
-                    payload
-                )
-                chooser_used = True
-
-            except PlaywrightTimeoutError:
-                # В некоторых сборках клик не создаёт filechooser event,
-                # а только активирует заранее существующий input.
-                chooser_used = False
-
-        if not chooser_used:
-            if not await self._set_photo_file_input(
-                page,
-                payload,
-            ):
-                await self._debug_capture(
+                dialog = await self._wait_for_media_dialog(
                     page,
-                    "photo_input_failed",
-                )
-                raise RuntimeError(
-                    "Telegram Web не принял файл изображения."
+                    timeout_ms=4500,
                 )
 
-        # Критическая проверка: media-preview обязан появиться.
-        dialog = await self._wait_for_media_dialog(
+                log.info(
+                    "Telegram Web: фотография прикреплена "
+                    "методом %s, media-preview открыт.",
+                    method_name,
+                )
+
+                return dialog
+
+            except RuntimeError:
+                # Не считаем окончательной ошибкой до прохождения
+                # остальных методов.
+                log.warning(
+                    "Telegram Web: метод %s не открыл media-preview.",
+                    method_name,
+                )
+
+                # Убираем возможный file selection перед следующей попыткой.
+                try:
+                    file_input = page.locator(
+                        ".new-message-wrapper input[type='file']"
+                    ).first
+                    if await file_input.count():
+                        await file_input.set_input_files(
+                            []
+                        )
+                except Exception:
+                    pass
+
+                await page.wait_for_timeout(
+                    500
+                )
+
+        await self._debug_capture(
             page,
-            timeout_ms=12000,
+            "all_media_attach_methods_failed",
         )
 
-        log.info(
-            "Telegram Web: фотография прикреплена, "
-            "media-preview открыт."
+        raise RuntimeError(
+            "Telegram Web не прикрепил изображение ни через "
+            "composer file input, ни через paste, ни через drag-and-drop. "
+            "Публикация остановлена; debug сохранён."
         )
-
-        return dialog
 
     async def _get_caption_editor(
         self,

@@ -22,7 +22,11 @@ from telegram_web_publisher import (
     TelegramWebPublisher,
     WebPostRef,
 )
-from yandex_gpt import YandexGPTClient
+from yandex_gpt import (
+    ARTICLE_SYSTEM_PROMPT,
+    SYNCBOT_SYSTEM_PROMPT,
+    YandexGPTClient,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,48 +128,123 @@ def clean_article_text(text: str) -> str:
     return text.strip()
 
 
-def build_image_prompt(topic: str) -> str:
-    style = (
-        "Минималистичная editorial-иллюстрация в корпоративном стиле. "
-        "Покажи человека или предмет, напрямую связанный с темой статьи. "
-        "Главный образ точно передаёт смысл. Нереалистичный, слегка абстрактный стиль: "
-        "чёткие силуэты, простые формы, минимум деталей, допустима геометризация. "
-        "Персонаж: маленькая голова, крупные руки и тело. "
-        "Образ почти на весь кадр, немного воздуха. "
-        "Приглушённые цвета, один акцент — синий или оранжевый. "
-        "Без текста, букв, подписей и логотипов."
+DEFAULT_IMAGE_PROMPT_TEMPLATE = (
+    "Тема: {topic}. "
+    "Минималистичная editorial-иллюстрация в корпоративном стиле. "
+    "Покажи человека или предмет, напрямую связанный с темой статьи. "
+    "Главный образ точно передаёт смысл. "
+    "Нереалистичный, слегка абстрактный стиль: чёткие силуэты, "
+    "простые формы, минимум деталей, допустима геометризация. "
+    "Персонаж: маленькая голова, крупные руки и тело. "
+    "Образ почти на весь кадр, немного воздуха. "
+    "Приглушённые цвета, один акцент — синий или оранжевый. "
+    "Без текста, букв, подписей и логотипов."
+)
+
+ALLOWED_BLOG_URL = "https://boykovgroup.ru/blog"
+
+
+def build_image_prompt(
+    topic: str,
+    template: str | None = None,
+) -> str:
+    """
+    Пользователь может менять шаблон через Telegram-админку.
+
+    Маркер {topic} заменяется текущей темой статьи.
+    Если пользователь удалил {topic}, тема автоматически добавляется в начало.
+
+    YandexART принимает короткий prompt, поэтому финальный текст
+    жёстко ограничивается 480 символами.
+    """
+    template = (
+        (template or "").strip()
+        or DEFAULT_IMAGE_PROMPT_TEMPLATE
     )
 
-    prefix = "Тема: "
-    available = max(
-        35,
-        480 - len(prefix) - len(style) - 2,
-    )
-
-    short_topic = " ".join(
+    clean_topic = " ".join(
         topic.split()
     )
 
-    if len(short_topic) > available:
-        short_topic = (
-            short_topic[:available]
-            .rsplit(" ", 1)[0]
-            .rstrip()
+    if "{topic}" in template:
+        result = template.replace(
+            "{topic}",
+            clean_topic,
+        )
+    else:
+        result = (
+            f"Тема: {clean_topic}. {template}"
         )
 
-    result = (
-        f"{prefix}{short_topic}. {style}"
+    result = " ".join(
+        result.split()
     )
 
     if len(result) > 480:
-        result = (
-            result[:480]
-            .rsplit(" ", 1)[0]
-            .rstrip()
-        )
+        result = result[:480].rstrip()
+        if " " in result:
+            result = result.rsplit(
+                " ",
+                1,
+            )[0].rstrip()
 
     return result
 
+
+def enforce_single_blog_link(text: str) -> str:
+    """
+    В публикации разрешён только один URL:
+    https://boykovgroup.ru/blog
+    """
+    if not text:
+        text = ""
+
+    url_pattern = re.compile(
+        r"https?://[^\s<>()]+",
+        re.I,
+    )
+
+    seen_blog = False
+
+    def repl(match: re.Match) -> str:
+        nonlocal seen_blog
+        raw = match.group(0)
+        trimmed = raw.rstrip(
+            ".,;:!?)]}"
+        )
+        tail = raw[len(trimmed):]
+
+        if trimmed.rstrip("/") == ALLOWED_BLOG_URL.rstrip("/"):
+            if seen_blog:
+                return tail
+            seen_blog = True
+            return ALLOWED_BLOG_URL + tail
+
+        return ""
+
+    text = url_pattern.sub(
+        repl,
+        text,
+    )
+
+    text = re.sub(
+        r"[ \t]{2,}",
+        " ",
+        text,
+    )
+    text = re.sub(
+        r"\n[ \t]*\n(?:[ \t]*\n)+",
+        "\n\n",
+        text,
+    ).strip()
+
+    if not seen_blog:
+        text = (
+            f"{text}\n\n"
+            f"Больше практических материалов: {ALLOWED_BLOG_URL}"
+        ).strip()
+
+    return text
 
 def compose_caption(
     title: str,
@@ -363,11 +442,33 @@ class ArticleService:
             max_results=8,
         )
 
+        article_system_prompt = (
+            await db.get_setting(
+                "prompt_article_system",
+                "",
+            )
+        ).strip() or ARTICLE_SYSTEM_PROMPT
+
+        short_system_prompt = (
+            await db.get_setting(
+                "prompt_short_system",
+                "",
+            )
+        ).strip() or SYNCBOT_SYSTEM_PROMPT
+
+        image_prompt_template = (
+            await db.get_setting(
+                "prompt_image_template",
+                "",
+            )
+        ).strip() or DEFAULT_IMAGE_PROMPT_TEMPLATE
+
         # Long-версия: около 3000 символов с пробелами.
         title, full_body = await self.gpt.generate_article_from_sources(
             topic=topic_title,
             sources=sources,
             max_chars=3200,
+            system_prompt=article_system_prompt,
         )
 
         # Short-версия: остаётся в Telegram после удаления long-post.
@@ -375,6 +476,7 @@ class ArticleService:
             topic=topic_title,
             sources=sources,
             max_chars=820,
+            system_prompt=short_system_prompt,
         )
 
         title = clean_article_text(
@@ -387,16 +489,12 @@ class ArticleService:
             short_body
         )
 
-        dzen_signature = (
-            "Больше полезных статей вы можете найти на "
-            "https://dzen.ru/specons"
+        full_body = enforce_single_blog_link(
+            full_body
         )
-
-        if dzen_signature not in short_body:
-            short_body = (
-                f"{short_body}\n\n"
-                f"{dzen_signature}"
-            ).strip()
+        short_body = enforce_single_blog_link(
+            short_body
+        )
 
         log.info(
             "Тексты готовы: long=%s chars, short=%s chars",
@@ -405,7 +503,8 @@ class ArticleService:
         )
 
         prompt = build_image_prompt(
-            topic_title
+            topic_title,
+            image_prompt_template,
         )
 
         log.info(

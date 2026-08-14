@@ -10,10 +10,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, CallbackQuery, Message
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, Message
 
 import db
-from article_service import ArticleService
+from article_service import (
+    ArticleService,
+    DEFAULT_IMAGE_PROMPT_TEMPLATE,
+)
 from config import load_config
 from image_gen import YandexArtClient
 from keyboards import (
@@ -23,12 +26,19 @@ from keyboards import (
     topic_actions,
     topics_menu,
     urgent_menu,
+    prompts_menu,
+    prompt_detail_menu,
+    prompt_edit_menu,
 )
 from scheduler import AutoPublisher
 from search import YandexSearchClient
 from states import AdminStates
 from topics_seed import DEFAULT_TOPICS
-from yandex_gpt import YandexGPTClient
+from yandex_gpt import (
+    ARTICLE_SYSTEM_PROMPT,
+    SYNCBOT_SYSTEM_PROMPT,
+    YandexGPTClient,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -282,6 +292,345 @@ async def cb_schedule_toggle(call: CallbackQuery):
     await db.set_auto_publish_enabled(not current)
     await call.answer("Настройка изменена")
     await send_schedule(call.message)
+
+
+# ---------------- ПРОМПТЫ
+
+PROMPT_SETTINGS = {
+    "article": {
+        "title": "✍️ Основной текст статьи",
+        "key": "prompt_article_system",
+        "default": ARTICLE_SYSTEM_PROMPT,
+        "filename": "article_prompt.txt",
+    },
+    "short": {
+        "title": "📱 Короткая версия Telegram",
+        "key": "prompt_short_system",
+        "default": SYNCBOT_SYSTEM_PROMPT,
+        "filename": "short_prompt.txt",
+    },
+    "image": {
+        "title": "🖼 Промпт изображения",
+        "key": "prompt_image_template",
+        "default": DEFAULT_IMAGE_PROMPT_TEMPLATE,
+        "filename": "image_prompt.txt",
+    },
+}
+
+
+async def effective_prompt(kind: str) -> tuple[str, bool]:
+    meta = PROMPT_SETTINGS[kind]
+    custom = (
+        await db.get_setting(
+            meta["key"],
+            "",
+        )
+    ).strip()
+
+    if custom:
+        return custom, True
+
+    return meta["default"], False
+
+
+async def send_prompt_card(
+    message: Message,
+    kind: str,
+) -> None:
+    meta = PROMPT_SETTINGS[kind]
+    prompt, is_custom = await effective_prompt(
+        kind
+    )
+
+    status = (
+        "🟢 пользовательский"
+        if is_custom
+        else "⚪ стандартный"
+    )
+
+    await message.answer(
+        f"{meta['title']}\n\n"
+        f"Сейчас используется: {status}\n"
+        f"Длина: {len(prompt)} символов.\n\n"
+        "Текущий промпт отправлен TXT-файлом ниже.",
+        reply_markup=prompt_detail_menu(
+            kind
+        ),
+    )
+
+    await message.answer_document(
+        BufferedInputFile(
+            prompt.encode("utf-8"),
+            filename=meta["filename"],
+        ),
+        caption=(
+            "Текущий активный промпт. "
+            "TXT удобнее, потому что длинный текст "
+            "может превышать лимит одного сообщения Telegram."
+        ),
+    )
+
+
+@dp.callback_query(F.data == "admin:prompts")
+async def cb_prompts(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    await state.clear()
+    await call.answer()
+
+    await call.message.answer(
+        "🧠 <b>Промпты</b>\n\n"
+        "Изменения сохраняются в базе и начинают действовать "
+        "со следующей создаваемой статьи.\n\n"
+        "Для изображения можно использовать маркер "
+        "<code>{topic}</code> — бот подставит текущую тему.",
+        parse_mode="HTML",
+        reply_markup=prompts_menu(),
+    )
+
+
+@dp.callback_query(F.data.startswith("prompt:view:"))
+async def cb_prompt_view(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    kind = call.data.rsplit(
+        ":",
+        1,
+    )[1]
+
+    if kind not in PROMPT_SETTINGS:
+        await call.answer(
+            "Неизвестный промпт",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await call.answer()
+    await send_prompt_card(
+        call.message,
+        kind,
+    )
+
+
+@dp.callback_query(F.data.startswith("prompt:edit:"))
+async def cb_prompt_edit(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    kind = call.data.rsplit(
+        ":",
+        1,
+    )[1]
+
+    if kind not in PROMPT_SETTINGS:
+        await call.answer(
+            "Неизвестный промпт",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await state.update_data(
+        prompt_kind=kind,
+        prompt_parts=[],
+    )
+    await state.set_state(
+        AdminStates.waiting_prompt_parts
+    )
+
+    await call.answer()
+
+    extra = ""
+    if kind == "image":
+        extra = (
+            "\n\nДля изображения желательно оставить "
+            "маркер {topic}. Финальный запрос YandexART "
+            "будет ограничен 480 символами."
+        )
+
+    await call.message.answer(
+        f"{PROMPT_SETTINGS[kind]['title']}\n\n"
+        "Отправь новый промпт текстом.\n"
+        "Если он длиннее лимита Telegram — отправляй "
+        "несколькими сообщениями подряд.\n\n"
+        "Я буду складывать все сообщения в один промпт. "
+        "Когда закончишь — нажми «✅ Сохранить»."
+        f"{extra}",
+        reply_markup=prompt_edit_menu(),
+    )
+
+
+@dp.message(AdminStates.waiting_prompt_parts)
+async def process_prompt_part(
+    message: Message,
+    state: FSMContext,
+):
+    if await deny(message):
+        return
+
+    part = message.text or ""
+
+    if not part.strip():
+        await message.answer(
+            "Пришли текст промпта. "
+            "Затем нажми «✅ Сохранить».",
+            reply_markup=prompt_edit_menu(),
+        )
+        return
+
+    data = await state.get_data()
+    parts = list(
+        data.get(
+            "prompt_parts",
+            [],
+        )
+    )
+    parts.append(
+        part
+    )
+
+    total = sum(
+        len(value)
+        for value in parts
+    ) + max(
+        0,
+        len(parts) - 1
+    ) * 2
+
+    await state.update_data(
+        prompt_parts=parts
+    )
+
+    await message.answer(
+        f"✅ Фрагмент добавлен.\n"
+        f"Фрагментов: {len(parts)}\n"
+        f"Общая длина: {total} символов.",
+        reply_markup=prompt_edit_menu(),
+    )
+
+
+@dp.callback_query(F.data == "prompt:save")
+async def cb_prompt_save(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    data = await state.get_data()
+    kind = data.get(
+        "prompt_kind"
+    )
+    parts = data.get(
+        "prompt_parts",
+        [],
+    )
+
+    if kind not in PROMPT_SETTINGS:
+        await call.answer(
+            "Редактор не активен",
+            show_alert=True,
+        )
+        return
+
+    prompt = "\n\n".join(
+        str(part).strip()
+        for part in parts
+        if str(part).strip()
+    ).strip()
+
+    if not prompt:
+        await call.answer(
+            "Сначала отправь текст промпта",
+            show_alert=True,
+        )
+        return
+
+    await db.set_setting(
+        PROMPT_SETTINGS[kind]["key"],
+        prompt,
+    )
+
+    await state.clear()
+    await call.answer(
+        "Промпт сохранён"
+    )
+
+    await call.message.answer(
+        f"✅ {PROMPT_SETTINGS[kind]['title']} обновлён.\n"
+        f"Длина: {len(prompt)} символов.\n\n"
+        "Новый промпт будет применён к следующей статье.",
+        reply_markup=prompts_menu(),
+    )
+
+
+@dp.callback_query(F.data.startswith("prompt:reset:"))
+async def cb_prompt_reset(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    kind = call.data.rsplit(
+        ":",
+        1,
+    )[1]
+
+    if kind not in PROMPT_SETTINGS:
+        await call.answer(
+            "Неизвестный промпт",
+            show_alert=True,
+        )
+        return
+
+    await db.set_setting(
+        PROMPT_SETTINGS[kind]["key"],
+        "",
+    )
+    await state.clear()
+    await call.answer(
+        "Сброшено"
+    )
+
+    await call.message.answer(
+        f"♻️ {PROMPT_SETTINGS[kind]['title']} "
+        "сброшен к стандартному.",
+        reply_markup=prompts_menu(),
+    )
+
+
+@dp.callback_query(F.data == "prompt:cancel")
+async def cb_prompt_cancel(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    await state.clear()
+    await call.answer(
+        "Изменения отменены"
+    )
+
+    await call.message.answer(
+        "❌ Черновик промпта удалён. "
+        "Сохранённый промпт не менялся.",
+        reply_markup=prompts_menu(),
+    )
+
 
 # ---------------- СРОЧНАЯ СТАТЬЯ
 

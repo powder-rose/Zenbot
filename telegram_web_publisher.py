@@ -508,63 +508,190 @@ class TelegramWebPublisher:
 
         return composer
 
-    async def _select_photo_input(
+    async def _find_media_dialog(
         self,
         page: Page,
-        image_bytes: bytes,
-    ) -> None:
-        payload = {
-            "name": "article.jpg",
-            "mimeType": "image/jpeg",
-            "buffer": image_bytes,
-        }
+    ) -> Locator | None:
+        """
+        Ищем именно окно предпросмотра прикреплённого медиа.
 
-        async def try_inputs() -> bool:
-            inputs = page.locator(
-                'input[type="file"]'
+        Главное правило v45: если preview фотографии не появился,
+        пост НЕ отправляем как обычный текст.
+        """
+        candidates = [
+            page.locator(
+                ".popup-send-photo"
+            ),
+            page.locator(
+                ".popup-send-media"
+            ),
+            page.locator(
+                ".media-editor"
+            ),
+            page.locator(
+                ".popup .media-editor"
+            ),
+            page.locator(
+                '[role="dialog"]'
+            ),
+            page.locator(
+                ".popup"
+            ),
+        ]
+
+        for group in candidates:
+            try:
+                count = await group.count()
+            except Exception:
+                continue
+
+            for index in range(
+                min(count, 12)
+            ):
+                item = group.nth(index)
+
+                try:
+                    if not await item.is_visible():
+                        continue
+
+                    # Media-preview должен содержать хотя бы редактор caption
+                    # и визуальный media-элемент.
+                    editable = item.locator(
+                        '[contenteditable="true"]'
+                    )
+
+                    media = item.locator(
+                        "img, video, canvas, "
+                        ".media-photo, .media-container, "
+                        ".attachment, [class*='media']"
+                    )
+
+                    if (
+                        await editable.count() > 0
+                        and await media.count() > 0
+                    ):
+                        return item
+                except Exception:
+                    continue
+
+        return None
+
+    async def _wait_for_media_dialog(
+        self,
+        page: Page,
+        *,
+        timeout_ms: int = 12000,
+    ) -> Locator:
+        loops = max(
+            1,
+            int(timeout_ms / 300),
+        )
+
+        for _ in range(loops):
+            dialog = await self._find_media_dialog(
+                page
             )
+
+            if dialog is not None:
+                return dialog
+
+            await page.wait_for_timeout(
+                300
+            )
+
+        await self._debug_capture(
+            page,
+            "media_preview_not_opened",
+        )
+
+        raise RuntimeError(
+            "Telegram Web не открыл предпросмотр фотографии. "
+            "Публикация остановлена, чтобы не отправить статью "
+            "как обычный текст без изображения."
+        )
+
+    async def _set_photo_file_input(
+        self,
+        page: Page,
+        payload: dict,
+    ) -> bool:
+        """
+        Fallback для версий Telegram Web, где file input уже присутствует
+        после открытия меню Attach.
+        """
+        inputs = page.locator(
+            'input[type="file"]'
+        )
+
+        try:
             count = await inputs.count()
+        except Exception:
+            return False
 
-            selected: Locator | None = None
+        image_inputs: list[Locator] = []
+        other_inputs: list[Locator] = []
 
-            for index in range(count):
-                item = inputs.nth(index)
+        for index in range(count):
+            item = inputs.nth(index)
+
+            try:
                 accept = (
                     await item.get_attribute(
                         "accept"
                     )
                     or ""
                 ).lower()
+            except Exception:
+                accept = ""
 
-                # Приоритет — input для фото/видео.
-                if (
-                    "image" in accept
-                    or "video" in accept
-                ):
-                    selected = item
-                    break
-
-            if selected is None and count:
-                selected = inputs.nth(
-                    count - 1
+            if (
+                "image" in accept
+                or "video" in accept
+            ):
+                image_inputs.append(
+                    item
+                )
+            else:
+                other_inputs.append(
+                    item
                 )
 
-            if selected is None:
-                return False
-
+        # Сначала используем только input, явно предназначенный для media.
+        for item in (
+            image_inputs
+            + other_inputs
+        ):
             try:
-                await selected.set_input_files(
+                await item.set_input_files(
                     payload
                 )
                 return True
             except Exception:
-                return False
+                continue
 
-        if await try_inputs():
-            return
+        return False
 
-        # Некоторые версии Telegram Web создают file input
-        # только после открытия Attach.
+    async def _select_photo_input(
+        self,
+        page: Page,
+        image_bytes: bytes,
+    ) -> Locator:
+        """
+        Надёжная загрузка фотографии.
+
+        v45 больше НЕ выбирает случайный скрытый input[type=file] до
+        открытия Attach. Сначала открывается Attach -> Photo/Video,
+        затем файл передаётся именно в этот chooser/input.
+
+        Возвращает media-preview dialog.
+        """
+        payload = {
+            "name": "article.jpg",
+            "mimeType": "image/jpeg",
+            "buffer": image_bytes,
+        }
+
+        # Сначала открываем Attach.
         attach = await self._first_visible(
             [
                 page.locator(
@@ -574,10 +701,13 @@ class TelegramWebPublisher:
                     'button[aria-label*="Прикреп" i]'
                 ),
                 page.locator(
-                    '.btn-icon.tgico-attach'
+                    ".btn-icon.tgico-attach"
                 ),
                 page.locator(
                     '[data-tippy-content*="Attach" i]'
+                ),
+                page.locator(
+                    '[class*="attach" i]'
                 ),
             ]
         )
@@ -591,13 +721,29 @@ class TelegramWebPublisher:
                 "Не найдено управление Attach в Telegram Web."
             )
 
-        await attach.click()
-        await page.wait_for_timeout(400)
+        try:
+            await attach.click(
+                force=True,
+                timeout=5000,
+            )
+        except Exception:
+            # Иногда pointer-events принимает wrapper.
+            wrapper = attach.locator(
+                "xpath=ancestor::button[1]"
+            )
 
-        if await try_inputs():
-            return
+            if await wrapper.count():
+                await wrapper.click(
+                    force=True,
+                    timeout=5000,
+                )
+            else:
+                raise
 
-        # Fallback: menu item "Photo or Video".
+        await page.wait_for_timeout(
+            500
+        )
+
         photo_menu = await self._first_visible(
             [
                 page.get_by_text(
@@ -606,50 +752,93 @@ class TelegramWebPublisher:
                         re.I,
                     )
                 ),
+                page.get_by_role(
+                    "menuitem",
+                    name=re.compile(
+                        r"photo|video|фото|видео",
+                        re.I,
+                    ),
+                ),
             ]
         )
 
-        if photo_menu is None:
-            await self._debug_capture(
+        chooser_used = False
+
+        if photo_menu is not None:
+            # Кликаем по action-wrapper меню, а не по внутреннему span.i18n.
+            menu_wrapper = photo_menu.locator(
+                "xpath=ancestor::div["
+                "contains(@class,'btn-menu-item') or "
+                "contains(@class,'menu-item')"
+                "][1]"
+            )
+
+            click_target = (
+                menu_wrapper
+                if await menu_wrapper.count()
+                else photo_menu
+            )
+
+            try:
+                async with page.expect_file_chooser(
+                    timeout=5000
+                ) as chooser_info:
+                    await click_target.click(
+                        force=True,
+                        timeout=5000,
+                    )
+
+                chooser = await chooser_info.value
+                await chooser.set_files(
+                    payload
+                )
+                chooser_used = True
+
+            except PlaywrightTimeoutError:
+                # В некоторых сборках клик не создаёт filechooser event,
+                # а только активирует заранее существующий input.
+                chooser_used = False
+
+        if not chooser_used:
+            if not await self._set_photo_file_input(
                 page,
-                "photo_menu_not_found",
-            )
-            raise RuntimeError(
-                "Не удалось открыть выбор фотографии в Telegram Web."
-            )
-
-        try:
-            async with page.expect_file_chooser(
-                timeout=5000
-            ) as chooser_info:
-                await photo_menu.click()
-
-            chooser = await chooser_info.value
-            await chooser.set_files(
-                payload
-            )
-        except PlaywrightTimeoutError:
-            await page.wait_for_timeout(250)
-
-            if not await try_inputs():
+                payload,
+            ):
                 await self._debug_capture(
                     page,
-                    "file_chooser_failed",
+                    "photo_input_failed",
                 )
                 raise RuntimeError(
-                    "Telegram Web не открыл загрузку изображения."
+                    "Telegram Web не принял файл изображения."
                 )
+
+        # Критическая проверка: media-preview обязан появиться.
+        dialog = await self._wait_for_media_dialog(
+            page,
+            timeout_ms=12000,
+        )
+
+        log.info(
+            "Telegram Web: фотография прикреплена, "
+            "media-preview открыт."
+        )
+
+        return dialog
 
     async def _get_caption_editor(
         self,
         page: Page,
+        dialog: Locator,
     ) -> Locator:
-        # После выбора картинки на странице обычно два contenteditable:
-        # обычный composer и caption в media popup. Берём самый нижний
-        # видимый редактор.
-        candidates = page.locator(
-            'div[contenteditable="true"]'
+        """
+        Caption ищем только внутри media-preview, а не среди всех
+        contenteditable на странице. Это исключает отправку текста
+        в основной composer без фотографии.
+        """
+        candidates = dialog.locator(
+            '[contenteditable="true"]'
         )
+
         count = await candidates.count()
 
         visible: list[
@@ -658,11 +847,13 @@ class TelegramWebPublisher:
 
         for index in range(count):
             item = candidates.nth(index)
+
             try:
                 if not await item.is_visible():
                     continue
 
                 box = await item.bounding_box()
+
                 if not box:
                     continue
 
@@ -684,7 +875,7 @@ class TelegramWebPublisher:
                 "caption_editor_not_found",
             )
             raise RuntimeError(
-                "Не найдено поле caption после выбора изображения."
+                "Media-preview открыт, но поле caption не найдено."
             )
 
         visible.sort(
@@ -697,10 +888,12 @@ class TelegramWebPublisher:
     async def _send_media_popup(
         self,
         page: Page,
+        dialog: Locator,
         caption: str,
     ) -> None:
         editor = await self._get_caption_editor(
-            page
+            page,
+            dialog,
         )
 
         await editor.click()
@@ -726,27 +919,27 @@ class TelegramWebPublisher:
 
         send = await self._first_visible(
             [
-                page.locator(
+                dialog.locator(
                     'button[aria-label="Send"]'
                 ),
-                page.locator(
+                dialog.locator(
                     'button[aria-label="Отправить"]'
+                ),
+                dialog.locator(
+                    'button.btn-send'
+                ),
+                dialog.get_by_role(
+                    "button",
+                    name=re.compile(
+                        r"^send$|^отправить$",
+                        re.I,
+                    ),
                 ),
                 page.locator(
                     '.popup-send-photo .btn-send'
                 ),
                 page.locator(
                     '.popup-send-media .btn-send'
-                ),
-                page.locator(
-                    'button.btn-send'
-                ),
-                page.get_by_role(
-                    "button",
-                    name=re.compile(
-                        r"^send$|^отправить$",
-                        re.I,
-                    ),
                 ),
             ]
         )
@@ -760,8 +953,11 @@ class TelegramWebPublisher:
                 "Не найдена кнопка Send в окне фотографии Telegram Web."
             )
 
-        await send.click()
-        await page.wait_for_timeout(2200)
+        await send.click(
+            force=True,
+            timeout=5000,
+        )
+        await page.wait_for_timeout(2500)
 
     @staticmethod
     def _hint_from_caption(
@@ -960,15 +1156,16 @@ class TelegramWebPublisher:
                 await self._goto_channel(
                     page
                 )
-                await self._select_photo_input(
+                media_dialog = await self._select_photo_input(
                     page,
                     image_bytes,
                 )
                 await page.wait_for_timeout(
-                    800
+                    500
                 )
                 await self._send_media_popup(
                     page,
+                    media_dialog,
                     caption,
                 )
 
@@ -1058,9 +1255,26 @@ class TelegramWebPublisher:
                         "не найден пункт Delete."
                     )
 
-                await delete_item.click()
+                # Telegram Web возвращает текстовый <span class="i18n">Delete</span>,
+                # но pointer events принимает родительский div.btn-menu-item.
+                # Поэтому кликаем по ближайшему action-wrapper, а не по span.
+                menu_wrapper = delete_item.locator(
+                    "xpath=ancestor::div[contains(@class,'btn-menu-item')][1]"
+                )
+
+                if await menu_wrapper.count():
+                    await menu_wrapper.click(
+                        force=True,
+                        timeout=5000,
+                    )
+                else:
+                    await delete_item.click(
+                        force=True,
+                        timeout=5000,
+                    )
+
                 await page.wait_for_timeout(
-                    450
+                    650
                 )
 
                 confirm = await self._first_visible(
@@ -1081,11 +1295,44 @@ class TelegramWebPublisher:
                     ]
                 )
 
-                if confirm is not None:
-                    await confirm.click()
+                if confirm is None:
+                    await self._debug_capture(
+                        page,
+                        "delete_confirm_not_found",
+                    )
+                    raise RuntimeError(
+                        "После выбора Delete не найдено "
+                        "подтверждение удаления."
+                    )
+
+                # Подтверждение в разных версиях Telegram Web может быть
+                # <button>, div.btn-primary, div.danger и т.п.
+                confirm_wrapper = confirm.locator(
+                    "xpath=ancestor-or-self::button[1]"
+                )
+
+                if not await confirm_wrapper.count():
+                    confirm_wrapper = confirm.locator(
+                        "xpath=ancestor::div["
+                        "contains(@class,'btn') or "
+                        "contains(@class,'danger') or "
+                        "contains(@class,'confirm')"
+                        "][1]"
+                    )
+
+                if await confirm_wrapper.count():
+                    await confirm_wrapper.click(
+                        force=True,
+                        timeout=5000,
+                    )
+                else:
+                    await confirm.click(
+                        force=True,
+                        timeout=5000,
+                    )
 
                 await page.wait_for_timeout(
-                    1400
+                    1600
                 )
 
                 log.info(

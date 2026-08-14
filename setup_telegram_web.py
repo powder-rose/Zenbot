@@ -228,11 +228,14 @@ async def phone_login(page) -> None:
 
 async def qr_login(page, profile_dir: Path) -> None:
     """
-    Переключает Telegram Web с формы входа по номеру на QR,
-    после чего регулярно сохраняет актуальный QR в PNG.
+    QR-вход с поддержкой двухэтапной аутентификации Telegram.
 
-    Важно: Telegram обновляет QR автоматически, поэтому PNG
-    перезаписывается каждые 2 секунды.
+    Схема:
+    1. Переключаем Telegram Web на QR.
+    2. Сохраняем свежий QR в PNG.
+    3. После сканирования:
+       - если аккаунт без 2FA -> ждём список чатов;
+       - если включён 2FA -> просим пароль в SSH и вводим его в Telegram Web.
     """
     print()
     print("Режим QR.")
@@ -266,80 +269,135 @@ async def qr_login(page, profile_dir: Path) -> None:
         await qr_button.click()
         await page.wait_for_timeout(1200)
 
-    # Проверяем, что реально появилась QR-форма.
     qr_marker = await first_visible(
         [
             page.locator("canvas"),
             page.locator("svg"),
-            page.locator(
-                '[class*="qr" i]'
-            ),
-            page.locator(
-                '[data-testid*="qr" i]'
-            ),
+            page.locator('[class*="qr" i]'),
+            page.locator('[data-testid*="qr" i]'),
         ]
     )
 
     if qr_marker is None:
-        debug = (
-            BASE_DIR
-            / "data"
-            / "telegram_qr_not_found.png"
-        )
-        debug.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-        await page.screenshot(
-            path=str(debug),
-            full_page=True,
-        )
+        debug = BASE_DIR / "data" / "telegram_qr_not_found.png"
+        debug.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(debug), full_page=True)
         raise RuntimeError(
             "Telegram Web не переключился на QR-форму. "
             f"Сохранён screenshot: {debug}"
         )
 
-    screenshot = (
-        BASE_DIR
-        / "data"
-        / "telegram_login_qr.png"
-    )
-    screenshot.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    screenshot = BASE_DIR / "data" / "telegram_login_qr.png"
+    screenshot.parent.mkdir(parents=True, exist_ok=True)
 
     print()
-    print(
-        "QR-форма открыта. Файл будет обновляться каждые 2 секунды:"
-    )
-    print(
-        f"{screenshot}"
-    )
+    print("QR-форма открыта. Файл обновляется каждые 2 секунды:")
+    print(screenshot)
     print()
     print(
-        "Откройте PNG через SFTP/WinSCP и сразу отсканируйте:"
-    )
-    print(
+        "Откройте свежий PNG через SFTP/WinSCP и отсканируйте: "
         "Telegram → Настройки → Устройства → Подключить устройство."
     )
     print()
 
+    password_was_submitted = False
+
     for _ in range(180):
         if await authorized(page):
+            print()
+            print("Telegram Web авторизован.")
             return
 
-        # Сохраняем только видимую страницу с текущим QR.
+        # После успешного QR Telegram может запросить пароль 2FA.
+        password_input = await first_visible(
+            [
+                page.locator('input[type="password"]'),
+                page.locator('input[name*="password" i]'),
+                page.locator(
+                    'input[placeholder*="password" i]'
+                ),
+                page.locator(
+                    'input[placeholder*="парол" i]'
+                ),
+            ]
+        )
+
+        if password_input is not None and not password_was_submitted:
+            print()
+            print(
+                "QR принят. Telegram запрашивает пароль "
+                "двухэтапной аутентификации."
+            )
+            password = getpass.getpass(
+                "Введите пароль 2FA Telegram: "
+            )
+
+            await password_input.fill(password)
+
+            submit = await first_visible(
+                [
+                    page.get_by_role(
+                        "button",
+                        name=re.compile(
+                            r"next|далее|submit|войти",
+                            re.I,
+                        ),
+                    ),
+                    page.get_by_text(
+                        re.compile(
+                            r"^next$|^далее$",
+                            re.I,
+                        )
+                    ),
+                ]
+            )
+
+            if submit is not None:
+                await submit.click()
+            else:
+                await page.keyboard.press("Enter")
+
+            password_was_submitted = True
+            await page.wait_for_timeout(2200)
+
+            if await authorized(page):
+                print()
+                print("Telegram Web авторизован после 2FA.")
+                return
+
+            # Если поле пароля осталось на экране, пароль, вероятно, неверный.
+            still_password = await first_visible(
+                [
+                    page.locator('input[type="password"]'),
+                    page.locator('input[name*="password" i]'),
+                ]
+            )
+
+            if still_password is not None:
+                error_shot = (
+                    BASE_DIR
+                    / "data"
+                    / "telegram_2fa_error.png"
+                )
+                await page.screenshot(
+                    path=str(error_shot),
+                    full_page=True,
+                )
+                raise RuntimeError(
+                    "Telegram не принял пароль 2FA. "
+                    "Проверьте пароль и запустите setup заново. "
+                    f"Screenshot: {error_shot}"
+                )
+
+        # Пока ждём QR или переход на 2FA — обновляем screenshot.
         await page.screenshot(
             path=str(screenshot),
             full_page=True,
         )
-        await page.wait_for_timeout(
-            2000
-        )
+        await page.wait_for_timeout(2000)
 
     raise RuntimeError(
-        "QR-авторизация не завершена за 6 минут."
+        "Авторизация Telegram не завершена за 6 минут."
     )
 
 

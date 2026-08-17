@@ -1,0 +1,17 @@
+.git
+.gitignore
+
+.env
+.env.*
+
+venv
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.log
+
+data
+
+telegram_login_qr.png
+telegram_setup_error.png

@@ -475,7 +475,8 @@ class YandexGPTClient:
 
     async def generate_article_from_sources(
         self, topic: str, sources: list[dict[str, Any]],
-        subtopic: str | None = None, max_chars: int = 4500
+        subtopic: str | None = None, max_chars: int = 4500,
+        system_prompt: str | None = None,
     ) -> tuple[str, str]:
         blocks = []
         for i, src in enumerate(sources[:8], 1):
@@ -491,5 +492,10 @@ class YandexGPTClient:
             + f"\n\nОриентир верхней границы текста: {max_chars} символов."
         )
         auth = await self.auth_header()
-        raw = await asyncio.to_thread(self._complete_sync, auth, ARTICLE_SYSTEM_PROMPT, user_prompt)
+        raw = await asyncio.to_thread(
+            self._complete_sync,
+            auth,
+            (system_prompt or ARTICLE_SYSTEM_PROMPT),
+            user_prompt,
+        )
         return self._parse(raw)

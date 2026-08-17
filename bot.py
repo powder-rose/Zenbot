@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
     BufferedInputFile,
@@ -42,6 +43,7 @@ from scheduler import AutoPublisher
 from tenant_scheduler import TenantScheduler
 from tenant_service import TenantArticleService
 from dzen_popular_comments import DzenPopularCommentWorker
+from dzen_comment_responder import DzenCommentResponderWorker
 from paid_multiuse import (
     router as paid_router,
     configure_paid_multiuse,
@@ -86,6 +88,11 @@ scheduler: AutoPublisher | None = None
 tenant_service: TenantArticleService | None = None
 tenant_scheduler: TenantScheduler | None = None
 popular_comment_worker: DzenPopularCommentWorker | None = None
+comment_responder_worker: DzenCommentResponderWorker | None = None
+
+
+class DzenResponderStates(StatesGroup):
+    waiting_reply_prompt = State()
 
 def is_admin(user_id: int | None) -> bool:
     return bool(user_id and user_id in cfg.admin_ids)
@@ -944,6 +951,372 @@ async def cb_dzen_preview_cancel(call: CallbackQuery):
         )
 
 
+
+# ---------------- АВТООТВЕТЫ НА КОММЕНТАРИИ ДЗЕНА
+
+def dzen_responder_control_keyboard() -> InlineKeyboardMarkup:
+    if comment_responder_worker is None:
+        auto_on = False
+        dry_run = False
+    else:
+        status = comment_responder_worker.status()
+        auto_on = bool(status.get("enabled"))
+        dry_run = bool(status.get("dry_run"))
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=("🟢 Автоответы: ВКЛ" if auto_on else "🔴 Автоответы: ВЫКЛ"),
+                    callback_data="dzenr:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("🧪 DRY RUN: ВКЛ" if dry_run else "🚀 LIVE: ответы публикуются"),
+                    callback_data="dzenr:drytoggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="▶️ Проверить новые сейчас",
+                    callback_data="dzenr:runnow",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗓 Ответить за последние 7 дней",
+                    callback_data="dzenr:week",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📝 Промпт автоответов",
+                    callback_data="dzenr:prompt",
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
+        ]
+    )
+
+
+def dzen_responder_control_text() -> str:
+    if comment_responder_worker is None:
+        return "💬 <b>Автоответы Дзена</b>\n\nСервис ещё не запущен."
+
+    status = comment_responder_worker.status()
+    enabled = bool(status.get("enabled"))
+    dry_run = bool(status.get("dry_run"))
+    interval_min = max(1, int(status.get("interval_seconds") or 0) // 60)
+    prompt_mode = "изменён вручную" if status.get("prompt_custom") else "стандартный"
+    return (
+        "💬 <b>Dzen Comment Responder внутри Zenbot</b>\n\n"
+        f"Автоответы: {'🟢 ВКЛ' if enabled else '🔴 ВЫКЛ'}\n"
+        f"Режим: {'🧪 DRY RUN — ответы не публикуются' if dry_run else '🚀 LIVE — ответы публикуются'}\n"
+        f"Проверка: каждые <b>{interval_min} мин.</b>\n"
+        f"За обычный цикл: до <b>{status.get('max_per_cycle', 0)}</b> комментариев\n"
+        f"Массовая обработка: все неотвеченные за <b>{status.get('week_days', 7)} дней</b>\n"
+        f"Промпт: <b>{prompt_mode}</b>\n\n"
+        f"Обработано: <b>{status.get('processed_count', 0)}</b>\n"
+        f"Опубликовано ответов: <b>{status.get('replied', 0)}</b>\n"
+        f"Пропущено: <b>{status.get('skipped', 0)}</b>\n"
+        f"Ошибок: <b>{status.get('errors', 0)}</b>\n\n"
+        "Уже обработанные комментарии повторно не отвечаются. "
+        "Кнопка за 7 дней обрабатывает все ещё неотвеченные комментарии, у которых Дзен показывает дату за этот период."
+    )
+
+
+async def show_dzen_responder_control(message: Message, *, edit: bool = False) -> None:
+    text = dzen_responder_control_text()
+    kb = dzen_responder_control_keyboard()
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            pass
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+def _responder_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data="dzenr:promptedit")],
+            [InlineKeyboardButton(text="♻️ Сбросить к стандартному", callback_data="dzenr:promptreset")],
+            [InlineKeyboardButton(text="⬅️ К автоответам", callback_data="admin:dzenresponder")],
+        ]
+    )
+
+
+def _responder_week_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить обработку за 7 дней", callback_data="dzenr:weekconfirm")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:dzenresponder")],
+        ]
+    )
+
+
+async def _show_responder_result(msg: Message, result: dict, *, week: bool = False) -> None:
+    state = str(result.get("status") or "")
+    scope_title = "за последние 7 дней" if week else "новых комментариев"
+    if state == "no_new_comments":
+        extra = ""
+        if week:
+            extra = (
+                f"\n\nПросканировано: {result.get('scanned_total', result.get('found', 0))}"
+                f"\nВ пределах недели: {result.get('weekly_candidates', result.get('found', 0))}"
+                f"\nБез распознанной даты: {result.get('undated', 0)}"
+            )
+        await msg.edit_text(f"✅ Проверка {scope_title} завершена. Необработанных комментариев нет.{extra}")
+        return
+
+    if state == "dry_run":
+        previews = result.get("previews") or []
+        lines = [
+            "🧪 <b>DRY RUN завершён</b>",
+            "Ответы НЕ опубликованы.",
+            "",
+            f"Новых: {result.get('new', 0)}",
+            f"Подготовлено ответов: {result.get('prepared', 0)}",
+            f"Пропущено: {result.get('skipped', 0)}",
+        ]
+        if week:
+            lines.extend([
+                f"За период: {result.get('week_days', 7)} дней",
+                f"Просканировано всего: {result.get('scanned_total', 0)}",
+                f"В пределах недели: {result.get('weekly_candidates', 0)}",
+                f"Без распознанной даты: {result.get('undated', 0)}",
+            ])
+        shown_count = 0
+        for i, item in enumerate(previews[:10], 1):
+            date_part = str(item.get("created_raw") or "").strip()
+            title = str(item.get("author") or "Комментарий")
+            if date_part:
+                title += f" · {date_part}"
+            chunk = [
+                "",
+                f"<b>{i}. {html.escape(title)}</b>",
+                html.escape(str(item.get("comment") or "")[:220]),
+                "→ " + html.escape(str(item.get("reply") or "")[:450]),
+            ]
+            if len("\n".join(lines + chunk)) > 3700:
+                break
+            lines.extend(chunk)
+            shown_count += 1
+        remaining = max(0, len(previews) - shown_count)
+        if remaining:
+            lines.extend(["", f"…ещё подготовлено: {remaining}"])
+        await msg.edit_text("\n".join(lines), parse_mode="HTML")
+        return
+
+    if state == "ok":
+        lines = [
+            "✅ Проверка завершена.",
+            "",
+            f"Новых найдено: {result.get('new', 0)}",
+            f"Ответов опубликовано: {result.get('replied', 0)}",
+            f"Пропущено: {result.get('skipped', 0)}",
+            f"Ошибок: {result.get('errors', 0)}",
+        ]
+        if week:
+            lines.extend([
+                "",
+                f"Период: последние {result.get('week_days', 7)} дней",
+                f"Просканировано всего: {result.get('scanned_total', 0)}",
+                f"Подходят по дате: {result.get('weekly_candidates', 0)}",
+                f"Без распознанной даты и поэтому не тронуты: {result.get('undated', 0)}",
+            ])
+        await msg.edit_text("\n".join(lines))
+        return
+
+    if state == "config_error":
+        await msg.edit_text("❌ " + str(result.get("error") or "Ошибка настройки Responder"))
+        return
+
+    await msg.edit_text(
+        "Responder завершил проверку.\n"
+        f"Статус: {state}\n"
+        f"Ошибка: {result.get('error') or '—'}"
+    )
+
+
+@dp.message(Command("dzenreply"))
+async def cmd_dzen_responder(message: Message, state: FSMContext):
+    if await deny(message):
+        return
+    await state.clear()
+    await show_dzen_responder_control(message)
+
+
+@dp.callback_query(F.data == "admin:dzenresponder")
+async def cb_dzen_responder_panel(call: CallbackQuery, state: FSMContext):
+    if await deny(call):
+        return
+    await state.clear()
+    await call.answer()
+    await show_dzen_responder_control(call.message)
+
+
+@dp.callback_query(F.data == "dzenr:toggle")
+async def cb_dzen_responder_toggle(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    enabled = comment_responder_worker.toggle_enabled()
+    await call.answer("Автоответы включены" if enabled else "Автоответы выключены")
+    await show_dzen_responder_control(call.message, edit=True)
+
+
+@dp.callback_query(F.data == "dzenr:drytoggle")
+async def cb_dzen_responder_dry_toggle(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    dry_run = comment_responder_worker.toggle_dry_run()
+    await call.answer("DRY RUN включён" if dry_run else "LIVE режим включён")
+    await show_dzen_responder_control(call.message, edit=True)
+
+
+@dp.callback_query(F.data == "dzenr:runnow")
+async def cb_dzen_responder_run_now(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    await call.answer("Проверяю комментарии")
+    msg = await call.message.answer("💬 Проверяю новые комментарии Дзена…")
+    try:
+        result = await comment_responder_worker.run_once(force=True)
+    except Exception as exc:
+        log.exception("Ручной запуск Dzen responder завершился ошибкой")
+        await msg.edit_text(f"❌ Ошибка Responder: {exc}")
+        return
+    await _show_responder_result(msg, result, week=False)
+
+
+@dp.callback_query(F.data == "dzenr:week")
+async def cb_dzen_responder_week(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    status = comment_responder_worker.status()
+    dry_run = bool(status.get("dry_run"))
+    await call.answer()
+    await call.message.answer(
+        "🗓 <b>Обработка комментариев за 7 дней</b>\n\n"
+        + (
+            "Сейчас включён 🧪 DRY RUN: бот найдёт все неотвеченные комментарии за неделю и подготовит ответы, но ничего не опубликует."
+            if dry_run else
+            "Сейчас включён 🚀 LIVE: после подтверждения бот опубликует ответы на все найденные неотвеченные комментарии за последние 7 дней."
+        ),
+        parse_mode="HTML",
+        reply_markup=_responder_week_confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "dzenr:weekconfirm")
+async def cb_dzen_responder_week_confirm(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    await call.answer("Запускаю обработку за неделю")
+    msg = await call.message.answer(
+        "🗓 Сканирую комментарии за последние 7 дней. Это может занять несколько минут…"
+    )
+    try:
+        result = await comment_responder_worker.run_week(force=True)
+    except Exception as exc:
+        log.exception("Массовый запуск Dzen responder за неделю завершился ошибкой")
+        await msg.edit_text(f"❌ Ошибка обработки за неделю: {exc}")
+        return
+    await _show_responder_result(msg, result, week=True)
+
+
+@dp.callback_query(F.data == "dzenr:prompt")
+async def cb_dzen_responder_prompt(call: CallbackQuery):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    await call.answer()
+    prompt = comment_responder_worker.get_reply_prompt()
+    status = comment_responder_worker.status()
+    mode = "изменён вручную" if status.get("prompt_custom") else "стандартный"
+    shown = prompt if len(prompt) <= 3000 else prompt[:3000] + "\n…"
+    await call.message.answer(
+        "📝 <b>Промпт автоответов</b>\n"
+        f"Статус: <b>{mode}</b>\n\n"
+        f"<pre>{html.escape(shown)}</pre>",
+        parse_mode="HTML",
+        reply_markup=_responder_prompt_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "dzenr:promptedit")
+async def cb_dzen_responder_prompt_edit(call: CallbackQuery, state: FSMContext):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    await state.set_state(DzenResponderStates.waiting_reply_prompt)
+    await call.answer()
+    await call.message.answer(
+        "✏️ Пришлите новым сообщением полный промпт для автоответов.\n\n"
+        "Он будет сохранён в persistent state и начнёт использоваться со следующего ответа. "
+        "Чтобы отменить редактирование, откройте /admin заново."
+    )
+
+
+@dp.message(DzenResponderStates.waiting_reply_prompt)
+async def process_dzen_responder_prompt(message: Message, state: FSMContext):
+    if await deny(message):
+        return
+    if comment_responder_worker is None:
+        await state.clear()
+        await message.answer("Сервис ещё не запущен.")
+        return
+    prompt = (message.text or "").strip()
+    if len(prompt) < 20:
+        await message.answer("❌ Промпт слишком короткий. Пришлите полный текст промпта.")
+        return
+    if len(prompt) > 4000:
+        await message.answer("❌ Промпт слишком длинный. Максимум — 4000 символов.")
+        return
+    comment_responder_worker.set_reply_prompt(prompt)
+    await state.clear()
+    await message.answer(
+        "✅ Промпт автоответов сохранён. Новые ответы будут генерироваться по нему.",
+        reply_markup=dzen_responder_control_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "dzenr:promptreset")
+async def cb_dzen_responder_prompt_reset(call: CallbackQuery, state: FSMContext):
+    if await deny(call):
+        return
+    if comment_responder_worker is None:
+        await call.answer("Сервис ещё не запущен", show_alert=True)
+        return
+    comment_responder_worker.reset_reply_prompt()
+    await state.clear()
+    await call.answer("Стандартный промпт восстановлен")
+    await call.message.answer(
+        "✅ Промпт автоответов сброшен к стандартному.",
+        reply_markup=dzen_responder_control_keyboard(),
+    )
+
 # ---------------- СТАТИСТИКА
 
 @dp.callback_query(F.data == "admin:stats")
@@ -965,7 +1338,7 @@ async def cb_stats(call: CallbackQuery):
     )
 
 async def main():
-    global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker
+    global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker, comment_responder_worker
 
     await db.init_db(cfg.db_path)
     await tenant_db.init_db(cfg.db_path)
@@ -993,6 +1366,11 @@ async def main():
         cfg=cfg,
     )
 
+    comment_responder_worker = DzenCommentResponderWorker(
+        gpt_client=gpt_client,
+        cfg=cfg,
+    )
+
     tenant_service = TenantArticleService(
         bot=bot,
         cfg=cfg,
@@ -1014,21 +1392,25 @@ async def main():
         BotCommand(command="buy", description="Оплатить подписку"),
         BotCommand(command="subscription", description="Моя подписка"),
         BotCommand(command="dzencomment", description="Управление статьями по комментариям Дзена"),
+        BotCommand(command="dzenreply", description="Автоответы на комментарии Дзена"),
     ])
 
     scheduler_task = asyncio.create_task(scheduler.run())
     tenant_scheduler_task = asyncio.create_task(tenant_scheduler.run())
     popular_comment_task = asyncio.create_task(popular_comment_worker.run())
+    comment_responder_task = asyncio.create_task(comment_responder_worker.run())
     try:
         await dp.start_polling(bot)
     finally:
         scheduler.stop()
         tenant_scheduler.stop()
         popular_comment_worker.stop()
+        comment_responder_worker.stop()
         scheduler_task.cancel()
         tenant_scheduler_task.cancel()
         popular_comment_task.cancel()
-        for task in (scheduler_task, tenant_scheduler_task, popular_comment_task):
+        comment_responder_task.cancel()
+        for task in (scheduler_task, tenant_scheduler_task, popular_comment_task, comment_responder_task):
             try:
                 await task
             except asyncio.CancelledError:

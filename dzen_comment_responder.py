@@ -7,10 +7,11 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import Locator, Page, async_playwright
 
@@ -56,6 +57,7 @@ class ResponderComment:
     author: str
     article_title: str
     href: str
+    created_raw: str
 
 
 class DzenCommentResponderWorker:
@@ -91,6 +93,18 @@ class DzenCommentResponderWorker:
             2,
             min(30, int(os.getenv("DZEN_RESPONDER_SCROLLS", "8"))),
         )
+        self.week_scroll_rounds = max(
+            self.scroll_rounds,
+            min(120, int(os.getenv("DZEN_RESPONDER_WEEK_SCROLLS", "60"))),
+        )
+        self.week_days = max(
+            1,
+            min(30, int(os.getenv("DZEN_RESPONDER_WEEK_DAYS", "7"))),
+        )
+        try:
+            self.tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
+        except Exception:
+            self.tz = timezone.utc
         self.state_path = Path(
             os.getenv(
                 "DZEN_RESPONDER_STATE_FILE",
@@ -128,6 +142,7 @@ class DzenCommentResponderWorker:
         state["dry_run"] = self.dry_run
         state.setdefault("processed", {})
         state.setdefault("stats", {})
+        state.setdefault("reply_prompt", DEFAULT_REPLY_PROMPT)
         self._save_state(state)
 
         self._stop = asyncio.Event()
@@ -154,6 +169,9 @@ class DzenCommentResponderWorker:
             "dry_run": bool(state.get("dry_run", self.dry_run)),
             "interval_seconds": self.interval_seconds,
             "max_per_cycle": self.max_per_cycle,
+            "week_days": self.week_days,
+            "week_scroll_rounds": self.week_scroll_rounds,
+            "prompt_custom": self.get_reply_prompt().strip() != DEFAULT_REPLY_PROMPT.strip(),
             "processed_count": len(processed),
             "replied": int(stats.get("replied", 0) or 0),
             "skipped": int(stats.get("skipped", 0) or 0),
@@ -184,6 +202,28 @@ class DzenCommentResponderWorker:
 
     def toggle_dry_run(self) -> bool:
         return self.set_dry_run(not self.dry_run)
+
+    def get_reply_prompt(self) -> str:
+        state = self._load_state()
+        prompt = str(state.get("reply_prompt") or "").strip()
+        return prompt or DEFAULT_REPLY_PROMPT
+
+    def set_reply_prompt(self, prompt: str) -> str:
+        clean = str(prompt or "").strip()
+        if not clean:
+            raise ValueError("Промпт не может быть пустым")
+        state = self._load_state()
+        state["reply_prompt"] = clean
+        state["reply_prompt_updated_at"] = self._now()
+        self._save_state(state)
+        return clean
+
+    def reset_reply_prompt(self) -> str:
+        state = self._load_state()
+        state["reply_prompt"] = DEFAULT_REPLY_PROMPT
+        state["reply_prompt_updated_at"] = self._now()
+        self._save_state(state)
+        return DEFAULT_REPLY_PROMPT
 
     async def run(self) -> None:
         log.info(
@@ -238,119 +278,255 @@ class DzenCommentResponderWorker:
 
         async with self._run_lock:
             comments = await self._scan_comments()
-            state = self._load_state()
-            processed: dict[str, Any] = state.setdefault("processed", {})
+            return await self._process_comments(
+                comments,
+                limit=self.max_per_cycle,
+                scope="cycle",
+            )
 
-            fresh = [item for item in comments if item.key not in processed]
-            if not fresh:
-                state["last_cycle_at"] = self._now()
-                self._save_state(state)
-                return {
-                    "status": "no_new_comments",
-                    "found": len(comments),
+    async def run_week(self, *, force: bool = False) -> dict[str, Any]:
+        """Ответить на все ещё не обработанные комментарии за последние N дней."""
+        if not self.enabled and not force:
+            return {"status": "disabled"}
+        if not self.comments_url:
+            return {
+                "status": "config_error",
+                "error": "Не задан DZEN_COMMENTS_URL/DZEN_RESPONDER_COMMENTS_URL",
+            }
+
+        async with self._run_lock:
+            comments = await self._scan_comments(scroll_rounds=self.week_scroll_rounds)
+            recent: list[ResponderComment] = []
+            older = 0
+            undated = 0
+            for item in comments:
+                recent_flag = self._is_recent_comment(item.created_raw, days=self.week_days)
+                if recent_flag is True:
+                    recent.append(item)
+                elif recent_flag is False:
+                    older += 1
+                else:
+                    # Без даты безопаснее не публиковать массовый ответ: иначе можно
+                    # случайно ответить на очень старый комментарий.
+                    undated += 1
+
+            result = await self._process_comments(
+                recent,
+                limit=None,
+                scope="week",
+            )
+            result.update(
+                {
+                    "week_days": self.week_days,
+                    "scanned_total": len(comments),
+                    "weekly_candidates": len(recent),
+                    "older": older,
+                    "undated": undated,
                 }
+            )
+            return result
 
-            selected = fresh[: self.max_per_cycle]
-            plans: list[tuple[ResponderComment, str]] = []
-            skipped = 0
-            ai_errors = 0
+    async def _process_comments(
+        self,
+        comments: list[ResponderComment],
+        *,
+        limit: int | None,
+        scope: str,
+    ) -> dict[str, Any]:
+        state = self._load_state()
+        processed: dict[str, Any] = state.setdefault("processed", {})
 
-            for item in selected:
-                if self._is_own_comment(item):
-                    self._mark_processed(
-                        state,
-                        item,
-                        status="skipped_own",
-                        reply="",
-                    )
-                    skipped += 1
-                    continue
-
-                try:
-                    reply = await self._generate_reply(item)
-                except Exception as exc:
-                    ai_errors += 1
-                    log.exception("Dzen responder: ошибка YandexGPT для %s", item.key)
-                    self._bump_stat(state, "errors")
-                    # Не помечаем processed: временная ошибка сможет повториться позже.
-                    continue
-
-                if not reply:
-                    self._mark_processed(
-                        state,
-                        item,
-                        status="skipped_ai",
-                        reply="",
-                    )
-                    skipped += 1
-                    self._bump_stat(state, "skipped")
-                    continue
-
-                plans.append((item, reply))
-
-            if self.dry_run:
-                previews = []
-                for item, reply in plans:
-                    previews.append(
-                        {
-                            "comment_id": item.comment_id,
-                            "author": item.author,
-                            "comment": item.text[:300],
-                            "reply": reply,
-                        }
-                    )
-                self._bump_stat(state, "dry_runs", len(plans))
-                state["last_cycle_at"] = self._now()
-                self._save_state(state)
-                return {
-                    "status": "dry_run",
-                    "found": len(comments),
-                    "new": len(fresh),
-                    "prepared": len(plans),
-                    "skipped": skipped,
-                    "ai_errors": ai_errors,
-                    "previews": previews,
-                }
-
-            posted = 0
-            post_errors = 0
-            if plans:
-                results = await self._post_replies(plans)
-                for item, reply, ok, error, verified in results:
-                    if ok:
-                        posted += 1
-                        self._mark_processed(
-                            state,
-                            item,
-                            status="replied" if verified else "replied_unverified",
-                            reply=reply,
-                        )
-                        self._bump_stat(state, "replied")
-                        state["last_reply_at"] = self._now()
-                    else:
-                        post_errors += 1
-                        self._bump_stat(state, "errors")
-                        log.error(
-                            "Dzen responder: не удалось ответить comment=%s: %s",
-                            item.comment_id or item.key,
-                            error,
-                        )
-                        # Если клик отправки не состоялся, не помечаем processed — будет retry.
-
+        fresh = [item for item in comments if item.key not in processed]
+        if not fresh:
             state["last_cycle_at"] = self._now()
             self._save_state(state)
             return {
-                "status": "ok",
+                "status": "no_new_comments",
                 "found": len(comments),
-                "new": len(fresh),
-                "replied": posted,
-                "skipped": skipped,
-                "errors": ai_errors + post_errors,
+                "new": 0,
+                "scope": scope,
             }
 
-    async def _scan_comments(self) -> list[ResponderComment]:
+        selected = fresh if limit is None else fresh[:limit]
+        plans: list[tuple[ResponderComment, str]] = []
+        skipped = 0
+        ai_errors = 0
+
+        for item in selected:
+            if self._is_own_comment(item):
+                self._mark_processed(
+                    state,
+                    item,
+                    status="skipped_own",
+                    reply="",
+                )
+                skipped += 1
+                continue
+
+            try:
+                reply = await self._generate_reply(item)
+            except Exception:
+                ai_errors += 1
+                log.exception("Dzen responder: ошибка YandexGPT для %s", item.key)
+                self._bump_stat(state, "errors")
+                # Не помечаем processed: временная ошибка сможет повториться позже.
+                continue
+
+            if not reply:
+                self._mark_processed(
+                    state,
+                    item,
+                    status="skipped_ai",
+                    reply="",
+                )
+                skipped += 1
+                self._bump_stat(state, "skipped")
+                continue
+
+            plans.append((item, reply))
+
+        if self.dry_run:
+            previews = []
+            for item, reply in plans:
+                previews.append(
+                    {
+                        "comment_id": item.comment_id,
+                        "author": item.author,
+                        "comment": item.text[:300],
+                        "reply": reply,
+                        "created_raw": item.created_raw,
+                    }
+                )
+            self._bump_stat(state, "dry_runs", len(plans))
+            state["last_cycle_at"] = self._now()
+            self._save_state(state)
+            return {
+                "status": "dry_run",
+                "found": len(comments),
+                "new": len(fresh),
+                "selected": len(selected),
+                "prepared": len(plans),
+                "skipped": skipped,
+                "ai_errors": ai_errors,
+                "previews": previews,
+                "scope": scope,
+            }
+
+        posted = 0
+        post_errors = 0
+        if plans:
+            results = await self._post_replies(plans)
+            for item, reply, ok, error, verified in results:
+                if ok:
+                    posted += 1
+                    self._mark_processed(
+                        state,
+                        item,
+                        status="replied" if verified else "replied_unverified",
+                        reply=reply,
+                    )
+                    self._bump_stat(state, "replied")
+                    state["last_reply_at"] = self._now()
+                else:
+                    post_errors += 1
+                    self._bump_stat(state, "errors")
+                    log.error(
+                        "Dzen responder: не удалось ответить comment=%s: %s",
+                        item.comment_id or item.key,
+                        error,
+                    )
+                    # Если клик отправки не состоялся, не помечаем processed — будет retry.
+
+        state["last_cycle_at"] = self._now()
+        self._save_state(state)
+        return {
+            "status": "ok",
+            "found": len(comments),
+            "new": len(fresh),
+            "selected": len(selected),
+            "replied": posted,
+            "skipped": skipped,
+            "errors": ai_errors + post_errors,
+            "scope": scope,
+        }
+
+    async def _extract_comments_from_page(self, page: Page) -> list[dict[str, Any]]:
+        """Снять текущие видимые карточки комментариев из Author Studio.
+
+        Дзен периодически виртуализирует список: старые DOM-узлы исчезают при прокрутке.
+        Поэтому недельный скан собирает карточки на каждом шаге, а не только в самом низу.
+        """
+        return await page.evaluate(
+            """
+            () => {
+              const anchorSelectors = [
+                'a[aria-label="Комментарий"]',
+                'a[href*="#comment_"]',
+                'a[class*="authorStudioComment"]',
+                'a[class*="author-studio-comment"]'
+              ];
+              const anchors = [...new Set(
+                anchorSelectors.flatMap(s => [...document.querySelectorAll(s)])
+              )];
+
+              // Fallback на случай, если Дзен поменял тег карточки с <a> на контейнер.
+              const cardSelectors = [
+                '[aria-label="Комментарий"]',
+                '[class*="authorStudioComment"]',
+                '[class*="author-studio-comment"]'
+              ];
+              const cards = [...new Set(
+                cardSelectors.flatMap(s => [...document.querySelectorAll(s)])
+              )];
+              for (const card of cards) {
+                const a = card.matches('a') ? card : (card.closest('a') || card.querySelector('a[href]'));
+                if (a && !anchors.includes(a)) anchors.push(a);
+              }
+
+              return anchors.map(a => {
+                const textNode = a.querySelector(
+                  'p[class*="comment__text"], [class*="comment__text"], p[class*="Text"], p'
+                );
+                const authorNode = a.querySelector(
+                  '[class*="authorName"], [class*="author-name"], [class*="comment__author"], h3 span:first-child'
+                );
+                const titled = [...a.querySelectorAll('[title]')]
+                  .map(n => n.getAttribute('title') || '')
+                  .filter(Boolean)
+                  .sort((x,y) => y.length - x.length);
+                const author = (authorNode?.innerText || authorNode?.textContent || '').trim();
+                const timeNode = a.querySelector('time');
+                const timeValue = (
+                  timeNode?.getAttribute('datetime') ||
+                  timeNode?.innerText ||
+                  timeNode?.textContent || ''
+                ).trim();
+                const header = a.querySelector('h3');
+                const headerSpans = [...(header?.querySelectorAll('span') || [])]
+                  .map(n => (n.innerText || n.textContent || '').trim())
+                  .filter(Boolean);
+                const dateText = headerSpans.find(value => value !== author) || '';
+                return {
+                  href: a.href || a.getAttribute('href') || '',
+                  text: (textNode?.innerText || textNode?.textContent || '').trim(),
+                  author,
+                  articleTitle: titled[0] || '',
+                  createdRaw: timeValue || dateText
+                };
+              });
+            }
+            """
+        )
+
+    async def _scan_comments(
+        self,
+        *,
+        scroll_rounds: int | None = None,
+    ) -> list[ResponderComment]:
         profile = Path(self.profile_dir)
         profile.mkdir(parents=True, exist_ok=True)
+
+        raw_by_key: dict[str, dict[str, Any]] = {}
 
         async with DZEN_BROWSER_LOCK:
             async with async_playwright() as pw:
@@ -367,53 +543,82 @@ class DzenCommentResponderWorker:
                         wait_until="domcontentloaded",
                         timeout=90000,
                     )
-                    await page.wait_for_timeout(2500)
                     self._assert_authorized(page)
 
-                    for _ in range(self.scroll_rounds):
-                        before = await page.evaluate("document.body.scrollHeight")
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(800)
-                        after = await page.evaluate("document.body.scrollHeight")
-                        if after == before:
+                    # Студия догружает комментарии после DOMContentLoaded. Ждём карточки,
+                    # но отсутствие selector не считаем исключением — ниже есть fallback/debug.
+                    try:
+                        await page.wait_for_selector(
+                            'a[aria-label="Комментарий"], a[href*="#comment_"], '
+                            '[class*="authorStudioComment"], [class*="author-studio-comment"]',
+                            timeout=15000,
+                        )
+                    except Exception:
+                        await page.wait_for_timeout(2500)
+
+                    rounds = max(1, int(scroll_rounds or self.scroll_rounds))
+                    no_growth_rounds = 0
+
+                    for round_index in range(rounds + 1):
+                        batch = await self._extract_comments_from_page(page)
+                        before_count = len(raw_by_key)
+                        for item in batch:
+                            href = str(item.get("href") or "").strip()
+                            text = " ".join(str(item.get("text") or "").split()).strip()
+                            if not href and not text:
+                                continue
+                            raw_key = href or hashlib.sha256(text.encode("utf-8")).hexdigest()
+                            raw_by_key[raw_key] = item
+
+                        if len(raw_by_key) == before_count:
+                            no_growth_rounds += 1
+                        else:
+                            no_growth_rounds = 0
+
+                        if round_index >= rounds:
                             break
 
-                    raw: list[dict[str, Any]] = await page.evaluate(
-                        """
-                        () => {
-                          const sels = [
-                            'a[aria-label="Комментарий"][href*="#comment_"]',
-                            'a[href*="comments_data"][href*="#comment_"]',
-                            'a[href*="#comment_"]'
-                          ];
-                          const anchors = [...new Set(sels.flatMap(s => [...document.querySelectorAll(s)]))];
-                          return anchors.map(a => {
-                            const textNode = a.querySelector(
-                              'p[class*="comment__text"], [class*="comment__text"], p'
-                            );
-                            const authorNode = a.querySelector(
-                              '[class*="authorName"], [class*="author-name"], [class*="comment__author"]'
-                            );
-                            const titled = [...a.querySelectorAll('[title]')]
-                              .map(n => n.getAttribute('title') || '')
-                              .filter(Boolean)
-                              .sort((x,y) => y.length - x.length);
-                            return {
-                              href: a.href || a.getAttribute('href') || '',
-                              text: (textNode?.innerText || textNode?.textContent || '').trim(),
-                              author: (authorNode?.innerText || authorNode?.textContent || '').trim(),
-                              articleTitle: titled[0] || ''
-                            };
-                          });
-                        }
-                        """
-                    )
+                        # Прокручиваем и window, и возможные внутренние scroll-контейнеры.
+                        await page.evaluate(
+                            """
+                            () => {
+                              const root = document.scrollingElement || document.documentElement;
+                              if (root) root.scrollTop = root.scrollHeight;
+                              for (const el of document.querySelectorAll('main, section, div')) {
+                                try {
+                                  if (el.scrollHeight > el.clientHeight + 300) {
+                                    el.scrollTop = el.scrollHeight;
+                                  }
+                                } catch (_) {}
+                              }
+                            }
+                            """
+                        )
+                        try:
+                            await page.mouse.wheel(0, 2600)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(900)
+
+                        # Не обрываемся после первого неизменившегося scrollHeight:
+                        # виртуальный список может держать постоянную высоту.
+                        if no_growth_rounds >= 4 and raw_by_key:
+                            break
+
+                    if not raw_by_key:
+                        log.warning(
+                            "Dzen responder: скан вернул 0 карточек, url=%s title=%s",
+                            page.url,
+                            await page.title(),
+                        )
+                        await self._save_debug(page, "scan_zero")
                 except Exception:
                     await self._save_debug(page, "scan_error")
                     raise
                 finally:
                     await context.close()
 
+        raw = list(raw_by_key.values())
         result: list[ResponderComment] = []
         seen: set[str] = set()
         for item in raw:
@@ -421,15 +626,19 @@ class DzenCommentResponderWorker:
             text = " ".join(str(item.get("text") or "").split()).strip()
             author = " ".join(str(item.get("author") or "").split()).strip()
             article_title = " ".join(str(item.get("articleTitle") or "").split()).strip()
+            created_raw = " ".join(str(item.get("createdRaw") or "").split()).strip()
             if not href or not text or len(text) < 2:
                 continue
             href = urljoin(self.comments_url, href)
-            # В Author Studio ссылки на ещё не отвеченные комментарии содержат
-            # comments_data=n_reply. Если Dzen явно указал другой статус, не отвечаем
-            # повторно. Если параметра нет совсем, оставляем fallback для совместимости.
+
+            # n_reply = явный признак «без ответа». Значение all/отсутствие параметра
+            # не означает, что конкретный комментарий уже обработан: это может быть
+            # просто режим списка Студии. Поэтому больше не выбрасываем такие карточки.
+            # Защита от наших повторов остаётся через persistent state processed[].
             low_href = href.lower()
-            if "comments_data=" in low_href and "comments_data=n_reply" not in low_href:
+            if re.search(r"comments_data=(?:reply|replied|answered|with_reply|y_reply)(?:[&#]|$)", low_href):
                 continue
+
             m = re.search(r"#comment_([A-Za-z0-9_-]+)", href)
             comment_id = m.group(1) if m else ""
             if comment_id:
@@ -448,9 +657,94 @@ class DzenCommentResponderWorker:
                     author=author[:150],
                     article_title=article_title[:500],
                     href=href,
+                    created_raw=created_raw[:120],
                 )
             )
         return result
+
+
+    def _is_recent_comment(self, raw: str, *, days: int) -> bool | None:
+        parsed = self._parse_comment_datetime(raw)
+        if parsed is None:
+            return None
+        now = datetime.now(self.tz)
+        # Для подписей без времени (например, «11 августа») работаем по календарным дням.
+        delta_days = (now.date() - parsed.astimezone(self.tz).date()).days
+        return 0 <= delta_days < days
+
+    def _parse_comment_datetime(self, raw: str) -> datetime | None:
+        text = " ".join(str(raw or "").strip().lower().replace("ё", "е").split())
+        if not text:
+            return None
+        now = datetime.now(self.tz)
+
+        # ISO datetime, если Дзен отдаёт <time datetime=...>.
+        try:
+            iso = str(raw).strip().replace("Z", "+00:00")
+            value = datetime.fromisoformat(iso)
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=self.tz)
+            return value.astimezone(self.tz)
+        except Exception:
+            pass
+
+        if text.startswith("сегодня"):
+            return now
+        if text.startswith("вчера"):
+            return now - timedelta(days=1)
+
+        m = re.search(r"(\d+)\s*(?:минут|минута|минуты|мин)\s*назад", text)
+        if m:
+            return now - timedelta(minutes=int(m.group(1)))
+        m = re.search(r"(\d+)\s*(?:час|часа|часов|ч)\s*назад", text)
+        if m:
+            return now - timedelta(hours=int(m.group(1)))
+        m = re.search(r"(\d+)\s*(?:день|дня|дней|дн)\s*назад", text)
+        if m:
+            return now - timedelta(days=int(m.group(1)))
+        m = re.search(r"(\d+)\s*(?:неделя|недели|недель|нед)\s*назад", text)
+        if m:
+            return now - timedelta(weeks=int(m.group(1)))
+
+        months = {
+            "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+            "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+            "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+        }
+        m = re.search(
+            r"\b(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?\b",
+            text,
+        )
+        if m:
+            day = int(m.group(1))
+            month = months[m.group(2)]
+            year = int(m.group(3)) if m.group(3) else now.year
+            try:
+                value = datetime(year, month, day, 12, 0, tzinfo=self.tz)
+                # В январе подпись «31 декабря» относится к предыдущему году.
+                if not m.group(3) and value > now + timedelta(days=2):
+                    value = value.replace(year=year - 1)
+                return value
+            except ValueError:
+                return None
+
+        m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", text)
+        if m:
+            day = int(m.group(1))
+            month = int(m.group(2))
+            year_raw = m.group(3)
+            year = now.year if not year_raw else int(year_raw)
+            if year < 100:
+                year += 2000
+            try:
+                value = datetime(year, month, day, 12, 0, tzinfo=self.tz)
+                if not year_raw and value > now + timedelta(days=2):
+                    value = value.replace(year=year - 1)
+                return value
+            except ValueError:
+                return None
+
+        return None
 
     async def _generate_reply(self, item: ResponderComment) -> str:
         prompt = (
@@ -462,7 +756,7 @@ class DzenCommentResponderWorker:
         raw = await asyncio.to_thread(
             self.gpt._complete_sync,
             auth,
-            DEFAULT_REPLY_PROMPT,
+            self.get_reply_prompt(),
             prompt,
         )
         reply = self._clean_reply(str(raw or ""))
@@ -786,6 +1080,7 @@ class DzenCommentResponderWorker:
             "comment": item.text[:1500],
             "article_title": item.article_title,
             "href": item.href,
+            "created_raw": item.created_raw,
             "reply": reply[:1500],
             "at": self._now(),
         }

@@ -8,6 +8,7 @@ def admin_menu():
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
         [InlineKeyboardButton(text="🧠 Промпты", callback_data="admin:prompts")],
         [InlineKeyboardButton(text="🔥 Комментарии Дзена", callback_data="admin:dzencomments")],
+        [InlineKeyboardButton(text="💬 Автоответы Дзена", callback_data="admin:dzenresponder")],
         [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="admin:restart")],
     ])
 

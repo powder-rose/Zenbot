@@ -14,6 +14,8 @@ from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
+from dzen_browser_lock import DZEN_BROWSER_LOCK
+
 log = logging.getLogger(__name__)
 
 _TOPIC_SYSTEM_PROMPT = """
@@ -76,6 +78,10 @@ class DzenPopularCommentSource:
         self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     async def ranked_comments(self) -> list[DzenComment]:
+        async with DZEN_BROWSER_LOCK:
+            return await self._ranked_comments_unlocked()
+
+    async def _ranked_comments_unlocked(self) -> list[DzenComment]:
         candidates: dict[str, DzenComment] = {}
         async with async_playwright() as pw:
             if self.profile_dir:

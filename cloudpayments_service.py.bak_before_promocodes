@@ -1,0 +1,796 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from urllib.parse import parse_qs
+
+import aiosqlite
+import httpx
+from aiohttp import web
+from aiogram import Bot
+
+
+log = logging.getLogger("cloudpayments")
+
+
+ORDERS_URL = "https://api.cloudpayments.ru/orders/create"
+
+
+def _db_path() -> Path:
+    return Path(
+        os.getenv(
+            "DB_PATH",
+            "/app/data/bot.db",
+        )
+    )
+
+
+def _public_id() -> str:
+    return os.getenv(
+        "CLOUDPAYMENTS_PUBLIC_ID",
+        "",
+    ).strip()
+
+
+def _api_secret() -> str:
+    return os.getenv(
+        "CLOUDPAYMENTS_API_SECRET",
+        "",
+    ).strip()
+
+
+def _price_rub() -> int:
+    return max(
+        1,
+        int(
+            os.getenv(
+                "SUBSCRIPTION_PRICE_RUB",
+                "1200",
+            )
+        ),
+    )
+
+
+def _webhook_port() -> int:
+    return max(
+        1,
+        int(
+            os.getenv(
+                "CLOUDPAYMENTS_WEBHOOK_PORT",
+                "8080",
+            )
+        ),
+    )
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+
+    try:
+        result = datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+    if result.tzinfo is None:
+        result = result.replace(
+            tzinfo=timezone.utc
+        )
+
+    return result.astimezone(
+        timezone.utc
+    )
+
+
+async def ensure_schema() -> None:
+    path = _db_path()
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    async with aiosqlite.connect(path) as db:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cloudpayments_orders (
+                invoice_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                amount_kopecks INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'RUB',
+
+                status TEXT NOT NULL DEFAULT 'pending',
+
+                cloudpayments_order_id TEXT,
+                payment_url TEXT,
+
+                transaction_id TEXT UNIQUE,
+
+                created_at TEXT NOT NULL,
+                paid_at TEXT,
+                expires_at TEXT,
+
+                raw_payload TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS
+            idx_cloudpayments_orders_user
+            ON cloudpayments_orders(
+                user_id,
+                created_at
+            );
+            """
+        )
+
+        await db.commit()
+
+
+async def create_cloudpayments_order(
+    user_id: int,
+) -> dict[str, str]:
+    public_id = _public_id()
+    secret = _api_secret()
+
+    if not public_id or not secret:
+        raise RuntimeError(
+            "CloudPayments ещё не настроен"
+        )
+
+    await ensure_schema()
+
+    price = _price_rub()
+
+    invoice_id = (
+        f"zen-{int(user_id)}-"
+        f"{uuid.uuid4().hex}"
+    )
+
+    created_at = _now().isoformat(
+        timespec="seconds"
+    )
+
+    async with aiosqlite.connect(
+        _db_path()
+    ) as db:
+        await db.execute(
+            """
+            INSERT INTO cloudpayments_orders(
+                invoice_id,
+                user_id,
+                amount_kopecks,
+                currency,
+                status,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                invoice_id,
+                int(user_id),
+                price * 100,
+                "RUB",
+                "pending",
+                created_at,
+            ),
+        )
+
+        await db.commit()
+
+    payload = {
+        "Amount": float(
+            Decimal(price).quantize(
+                Decimal("0.00")
+            )
+        ),
+        "Currency": "RUB",
+        "Description": (
+            "Подписка Дзен-бот — 30 дней"
+        ),
+        "RequireConfirmation": False,
+        "SendEmail": False,
+        "InvoiceId": invoice_id,
+        "AccountId": str(user_id),
+        "CultureName": "ru-RU",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=30.0
+        ) as client:
+            response = await client.post(
+                ORDERS_URL,
+                json=payload,
+                auth=(
+                    public_id,
+                    secret,
+                ),
+            )
+
+            response.raise_for_status()
+
+            data = response.json()
+
+    except Exception:
+        async with aiosqlite.connect(
+            _db_path()
+        ) as db:
+            await db.execute(
+                """
+                UPDATE cloudpayments_orders
+                SET status='create_failed'
+                WHERE invoice_id=?
+                """,
+                (invoice_id,),
+            )
+
+            await db.commit()
+
+        raise
+
+    if not data.get("Success"):
+        raise RuntimeError(
+            str(
+                data.get("Message")
+                or "CloudPayments отклонил создание счёта"
+            )
+        )
+
+    model = data.get("Model") or {}
+
+    url = str(
+        model.get("Url") or ""
+    ).strip()
+
+    cp_order_id = str(
+        model.get("Id") or ""
+    ).strip()
+
+    if not url:
+        raise RuntimeError(
+            "CloudPayments не вернул ссылку оплаты"
+        )
+
+    async with aiosqlite.connect(
+        _db_path()
+    ) as db:
+        await db.execute(
+            """
+            UPDATE cloudpayments_orders
+            SET
+                status='created',
+                cloudpayments_order_id=?,
+                payment_url=?
+            WHERE invoice_id=?
+            """,
+            (
+                cp_order_id,
+                url,
+                invoice_id,
+            ),
+        )
+
+        await db.commit()
+
+    log.info(
+        "CloudPayments order created: "
+        "user=%s invoice=%s",
+        user_id,
+        invoice_id,
+    )
+
+    return {
+        "invoice_id": invoice_id,
+        "url": url,
+    }
+
+
+def _amount_kopecks(
+    value: str,
+) -> int:
+    try:
+        amount = Decimal(
+            str(value)
+        ).quantize(
+            Decimal("0.01")
+        )
+    except (
+        InvalidOperation,
+        ValueError,
+    ):
+        raise ValueError(
+            "invalid amount"
+        )
+
+    return int(
+        amount * 100
+    )
+
+
+async def _complete_payment(
+    *,
+    invoice_id: str,
+    account_id: str,
+    transaction_id: str,
+    amount: str,
+    currency: str,
+    raw_payload: str,
+) -> tuple[bool, int, datetime]:
+    await ensure_schema()
+
+    amount_kopecks = _amount_kopecks(
+        amount
+    )
+
+    async with aiosqlite.connect(
+        _db_path()
+    ) as db:
+        db.row_factory = aiosqlite.Row
+
+        await db.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        cur = await db.execute(
+            """
+            SELECT *
+            FROM cloudpayments_orders
+            WHERE invoice_id=?
+            """,
+            (invoice_id,),
+        )
+
+        order = await cur.fetchone()
+
+        if not order:
+            await db.rollback()
+            raise ValueError(
+                "unknown invoice"
+            )
+
+        if (
+            str(account_id)
+            != str(order["user_id"])
+        ):
+            await db.rollback()
+            raise ValueError(
+                "account mismatch"
+            )
+
+        if (
+            str(currency).upper()
+            != str(order["currency"]).upper()
+        ):
+            await db.rollback()
+            raise ValueError(
+                "currency mismatch"
+            )
+
+        if (
+            amount_kopecks
+            != int(order["amount_kopecks"])
+        ):
+            await db.rollback()
+            raise ValueError(
+                "amount mismatch"
+            )
+
+        order_status = str(
+            order["status"] or ""
+        ).strip().lower()
+
+        if order_status not in {
+            "pending",
+            "created",
+            "paid",
+        }:
+            await db.rollback()
+            raise ValueError(
+                "order is not payable"
+            )
+
+        if order["status"] == "paid":
+            expiry = _dt(
+                order["expires_at"]
+            )
+
+            if expiry is None:
+                expiry = _now()
+
+            await db.commit()
+
+            return (
+                False,
+                int(order["user_id"]),
+                expiry,
+            )
+
+        cur = await db.execute(
+            """
+            SELECT invoice_id
+            FROM cloudpayments_orders
+            WHERE transaction_id=?
+            LIMIT 1
+            """,
+            (str(transaction_id),),
+        )
+
+        duplicate = await cur.fetchone()
+
+        if duplicate:
+            await db.rollback()
+            raise ValueError(
+                "duplicate transaction"
+            )
+
+        user_id = int(
+            order["user_id"]
+        )
+
+        now = _now()
+        base = now
+
+        cur = await db.execute(
+            """
+            SELECT expires_at
+            FROM subscriptions
+            WHERE user_id=?
+            """,
+            (user_id,),
+        )
+
+        subscription = await cur.fetchone()
+
+        if subscription:
+            current_expiry = _dt(
+                subscription["expires_at"]
+            )
+
+            if (
+                current_expiry is not None
+                and current_expiry > base
+            ):
+                base = current_expiry
+
+        expiry = (
+            base
+            + timedelta(days=30)
+        )
+
+        now_text = now.isoformat(
+            timespec="seconds"
+        )
+
+        expiry_text = expiry.isoformat(
+            timespec="seconds"
+        )
+
+        await db.execute(
+            """
+            INSERT INTO subscriptions(
+                user_id,
+                status,
+                starts_at,
+                expires_at,
+                source,
+                stars_amount,
+                telegram_payment_charge_id,
+                is_recurring,
+                updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                status='active',
+                expires_at=excluded.expires_at,
+                source='cloudpayments',
+                stars_amount=0,
+                telegram_payment_charge_id=NULL,
+                is_recurring=0,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                "active",
+                now_text,
+                expiry_text,
+                "cloudpayments",
+                0,
+                None,
+                0,
+                now_text,
+            ),
+        )
+
+        await db.execute(
+            """
+            UPDATE cloudpayments_orders
+            SET
+                status='paid',
+                transaction_id=?,
+                paid_at=?,
+                expires_at=?,
+                raw_payload=?
+            WHERE invoice_id=?
+            """,
+            (
+                str(transaction_id),
+                now_text,
+                expiry_text,
+                raw_payload,
+                invoice_id,
+            ),
+        )
+
+        await db.commit()
+
+    return (
+        True,
+        user_id,
+        expiry,
+    )
+
+
+class CloudPaymentsWebhookServer:
+    def __init__(
+        self,
+        *,
+        bot: Bot,
+    ) -> None:
+        self.bot = bot
+
+        self.runner: (
+            web.AppRunner | None
+        ) = None
+
+    async def start(self) -> None:
+        await ensure_schema()
+
+        app = web.Application()
+
+        app.router.add_get(
+            "/cloudpayments/health",
+            self.health,
+        )
+
+        app.router.add_post(
+            "/cloudpayments/pay",
+            self.pay,
+        )
+
+        self.runner = web.AppRunner(
+            app
+        )
+
+        await self.runner.setup()
+
+        site = web.TCPSite(
+            self.runner,
+            "0.0.0.0",
+            _webhook_port(),
+        )
+
+        await site.start()
+
+        log.info(
+            "CloudPayments webhook запущен: "
+            "port=%s configured=%s",
+            _webhook_port(),
+            bool(
+                _public_id()
+                and _api_secret()
+            ),
+        )
+
+    async def stop(self) -> None:
+        if self.runner is not None:
+            await self.runner.cleanup()
+            self.runner = None
+
+    async def health(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        return web.json_response(
+            {
+                "ok": True,
+                "configured": bool(
+                    _public_id()
+                    and _api_secret()
+                ),
+            }
+        )
+
+    async def pay(
+        self,
+        request: web.Request,
+    ) -> web.Response:
+        secret = _api_secret()
+
+        if not secret:
+            return web.json_response(
+                {"code": 13},
+                status=503,
+            )
+
+        raw = await request.read()
+
+        received_hmac = (
+            request.headers.get(
+                "Content-HMAC",
+                "",
+            ).strip()
+        )
+
+        expected_hmac = (
+            base64.b64encode(
+                hmac.new(
+                    secret.encode(
+                        "utf-8"
+                    ),
+                    raw,
+                    hashlib.sha256,
+                ).digest()
+            ).decode("ascii")
+        )
+
+        if (
+            not received_hmac
+            or not hmac.compare_digest(
+                received_hmac,
+                expected_hmac,
+            )
+        ):
+            log.warning(
+                "CloudPayments webhook: "
+                "неверная HMAC подпись"
+            )
+
+            return web.json_response(
+                {"code": 13},
+                status=403,
+            )
+
+        try:
+            raw_text = raw.decode(
+                "utf-8"
+            )
+
+            if (
+                request.content_type
+                == "application/json"
+            ):
+                payload = json.loads(
+                    raw_text
+                )
+            else:
+                parsed = parse_qs(
+                    raw_text,
+                    keep_blank_values=True,
+                )
+
+                payload = {
+                    key: (
+                        values[0]
+                        if values
+                        else ""
+                    )
+                    for key, values
+                    in parsed.items()
+                }
+
+            transaction_id = str(
+                payload.get(
+                    "TransactionId",
+                    "",
+                )
+            ).strip()
+
+            invoice_id = str(
+                payload.get(
+                    "InvoiceId",
+                    "",
+                )
+            ).strip()
+
+            account_id = str(
+                payload.get(
+                    "AccountId",
+                    "",
+                )
+            ).strip()
+
+            amount = str(
+                payload.get(
+                    "Amount",
+                    "",
+                )
+            ).strip()
+
+            currency = str(
+                payload.get(
+                    "Currency",
+                    "",
+                )
+            ).strip()
+
+            if not all(
+                (
+                    transaction_id,
+                    invoice_id,
+                    account_id,
+                    amount,
+                    currency,
+                )
+            ):
+                raise ValueError(
+                    "missing required fields"
+                )
+
+            (
+                activated,
+                user_id,
+                expiry,
+            ) = await _complete_payment(
+                invoice_id=invoice_id,
+                account_id=account_id,
+                transaction_id=transaction_id,
+                amount=amount,
+                currency=currency,
+                raw_payload=raw_text,
+            )
+
+            if activated:
+                log.info(
+                    "CloudPayments paid: "
+                    "user=%s invoice=%s "
+                    "transaction=%s expiry=%s",
+                    user_id,
+                    invoice_id,
+                    transaction_id,
+                    expiry.isoformat(),
+                )
+
+                try:
+                    await self.bot.send_message(
+                        user_id,
+                        "✅ <b>Оплата получена.</b>\n\n"
+                        "Подписка активирована на "
+                        "<b>30 дней</b>.\n"
+                        f"Действует до: "
+                        f"<code>{expiry.isoformat(timespec='seconds')}</code>",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    log.exception(
+                        "Не удалось отправить "
+                        "уведомление об оплате "
+                        "user=%s",
+                        user_id,
+                    )
+
+            return web.json_response(
+                {"code": 0}
+            )
+
+        except Exception as exc:
+            log.exception(
+                "CloudPayments Pay webhook "
+                "rejected: %s",
+                exc,
+            )
+
+            return web.json_response(
+                {"code": 13},
+                status=400,
+            )

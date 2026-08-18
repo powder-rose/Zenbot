@@ -27,14 +27,7 @@ from aiogram.types import (
 )
 
 import tenant_db
-from cloudpayments_service import (
-    apply_user_promo,
-    clear_user_promo,
-    create_cloudpayments_order,
-    create_promo_code,
-    disable_promo_code,
-    list_promo_codes,
-)
+from cloudpayments_service import create_cloudpayments_order
 from tenant_dzen_qr_auth import authorize_tenant_dzen_by_qr
 from article_service import DEFAULT_IMAGE_PROMPT_TEMPLATE
 from config import Config
@@ -52,7 +45,6 @@ _dzen_auth_tasks: set[asyncio.Task[Any]] = set()
 
 
 class PaidStates(StatesGroup):
-    waiting_promo_code = State()
     waiting_topics = State()
     waiting_edit_topic = State()
     waiting_schedule_time = State()
@@ -134,12 +126,6 @@ def paywall_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="💳 Оплатить 1 200 ₽",
                     callback_data="billing:buy",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎟 Применить промокод",
-                    callback_data="billing:promo",
                 )
             ],
             [
@@ -397,25 +383,9 @@ async def cb_tenant_home(call: CallbackQuery, state: FSMContext):
 
 # ---------------- PAYMENT ----------------
 
-async def create_payment(
-    message: Message,
-    user_id: int | None = None,
-) -> None:
-    user_id = int(
-        user_id
-        if user_id is not None
-        else message.from_user.id
-    )
-
-    bot, _, _ = _deps()
-
-    if user_id == bot.id:
-        raise RuntimeError(
-            "CloudPayments payer cannot be bot"
-        )
-
+async def create_payment(message: Message) -> None:
     if await tenant_db.is_subscription_active(
-        user_id
+        message.from_user.id
     ):
         await message.answer(
             "✅ Подписка уже активна.",
@@ -425,13 +395,13 @@ async def create_payment(
 
     try:
         order = await create_cloudpayments_order(
-            user_id
+            message.from_user.id
         )
     except Exception:
         log.exception(
-            "Ошибка создания CloudPayments "
-            "order: user=%s",
-            user_id,
+            "Ошибка создания CloudPayments order: "
+            "user=%s",
+            message.from_user.id,
         )
 
         await message.answer(
@@ -441,43 +411,12 @@ async def create_payment(
         )
         return
 
-    amount_kopecks = int(
-        order["amount_kopecks"]
-    )
-
-    amount_text = (
-        f"{amount_kopecks / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    promo_code = order.get(
-        "promo_code"
-    )
-
-    discount_percent = int(
-        order.get(
-            "discount_percent",
-            0,
-        )
-        or 0
-    )
-
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=(
-                        f"💳 Оплатить "
-                        f"{amount_text} ₽"
-                    ),
+                    text="💳 Оплатить 1 200 ₽",
                     url=order["url"],
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎟 Промокод",
-                    callback_data="billing:promo",
                 )
             ],
             [
@@ -489,21 +428,9 @@ async def create_payment(
         ]
     )
 
-    if promo_code:
-        promo_text = (
-            f"\n🎟 Промокод: "
-            f"<code>{html.escape(str(promo_code))}</code>"
-            f" — скидка <b>{discount_percent}%</b>\n"
-            f"Цена со скидкой: "
-            f"<b>{amount_text} ₽</b>."
-        )
-    else:
-        promo_text = ""
-
     await message.answer(
         "💳 <b>Подписка на 30 дней</b>\n\n"
-        "Базовая стоимость: <b>1 200 ₽</b>."
-        f"{promo_text}\n\n"
+        "Стоимость: <b>1 200 ₽</b>.\n\n"
         "После успешной оплаты доступ "
         "активируется автоматически.",
         parse_mode="HTML",
@@ -515,134 +442,7 @@ async def create_payment(
 async def cb_buy(call: CallbackQuery):
     await tenant_db.touch_user(call.from_user)
     await call.answer()
-    await create_payment(
-        call.message,
-        call.from_user.id,
-    )
-
-
-@router.callback_query(F.data == "billing:promo")
-async def cb_promo(
-    call: CallbackQuery,
-    state: FSMContext,
-):
-    await tenant_db.touch_user(
-        call.from_user
-    )
-
-    await state.set_state(
-        PaidStates.waiting_promo_code
-    )
-
-    await call.answer()
-
-    await call.message.answer(
-        "🎟 <b>Промокод</b>\n\n"
-        "Введите промокод одним сообщением.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(PaidStates.waiting_promo_code)
-async def promo_received(
-    message: Message,
-    state: FSMContext,
-):
-    await tenant_db.touch_user(
-        message.from_user
-    )
-
-    code = (
-        message.text or ""
-    ).strip()
-
-    result = await apply_user_promo(
-        message.from_user.id,
-        code,
-    )
-
-    await state.clear()
-
-    if not result.get("ok"):
-        if (
-            result.get("reason")
-            == "already_used"
-        ):
-            text = (
-                "❌ Этот промокод уже был "
-                "использован вами."
-            )
-        else:
-            text = (
-                "❌ Промокод не найден "
-                "или больше не действует."
-            )
-
-        await message.answer(
-            text,
-            reply_markup=paywall_keyboard(),
-        )
-        return
-
-    final_kopecks = int(
-        result["final_kopecks"]
-    )
-
-    final_text = (
-        f"{final_kopecks / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    await message.answer(
-        "✅ <b>Промокод применён.</b>\n\n"
-        f"Код: <code>{html.escape(result['code'])}</code>\n"
-        f"Скидка: <b>{result['discount_percent']}%</b>\n"
-        f"Новая цена: <b>{final_text} ₽</b>.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=(
-                            f"💳 Оплатить "
-                            f"{final_text} ₽"
-                        ),
-                        callback_data="billing:buy",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🗑 Убрать промокод",
-                        callback_data="billing:promo:clear",
-                    )
-                ],
-            ]
-        ),
-    )
-
-
-@router.callback_query(
-    F.data == "billing:promo:clear"
-)
-async def cb_promo_clear(
-    call: CallbackQuery,
-    state: FSMContext,
-):
-    await clear_user_promo(
-        call.from_user.id
-    )
-
-    await state.clear()
-    await call.answer(
-        "Промокод удалён"
-    )
-
-    await call.message.answer(
-        "🎟 Промокод удалён. "
-        "Стоимость снова 1 200 ₽.",
-        reply_markup=paywall_keyboard(),
-    )
+    await create_payment(call.message)
 
 
 async def send_subscription_status(message: Message, user_id: int) -> None:
@@ -1641,148 +1441,3 @@ async def cb_super_users(call: CallbackQuery):
             f"{html.escape(str(name))} — до {html.escape(str(row['expires_at'] or '—'))}"
         )
     await call.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=super_keyboard())
-
-
-# ---------------- PROMOCODES ----------------
-
-@router.message(Command("promo"))
-async def cmd_promo_create(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    parts = (
-        message.text or ""
-    ).split()
-
-    if len(parts) != 3:
-        await message.answer(
-            "Использование:\n"
-            "<code>/promo КОД СКИДКА</code>\n\n"
-            "Пример:\n"
-            "<code>/promo START20 20</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    code = parts[1]
-
-    try:
-        percent = int(parts[2])
-    except ValueError:
-        await message.answer(
-            "Скидка должна быть числом."
-        )
-        return
-
-    try:
-        promo = await create_promo_code(
-            code,
-            percent,
-        )
-    except ValueError as exc:
-        await message.answer(
-            f"❌ {html.escape(str(exc))}"
-        )
-        return
-
-    final = int(
-        promo["final_kopecks"]
-    )
-
-    final_text = (
-        f"{final / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    await message.answer(
-        "✅ <b>Промокод создан.</b>\n\n"
-        f"Код: <code>{html.escape(promo['code'])}</code>\n"
-        f"Скидка: <b>{promo['discount_percent']}%</b>\n"
-        f"Цена: <b>{final_text} ₽</b>\n\n"
-        "Один пользователь может "
-        "использовать этот код один раз.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("promos"))
-async def cmd_promos(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    rows = await list_promo_codes()
-
-    if not rows:
-        await message.answer(
-            "Промокодов пока нет."
-        )
-        return
-
-    lines = [
-        "🎟 <b>Промокоды</b>",
-        "",
-    ]
-
-    for row in rows:
-        icon = (
-            "🟢"
-            if int(row["active"])
-            else "🔴"
-        )
-
-        lines.append(
-            f"{icon} "
-            f"<code>{html.escape(row['code'])}</code>"
-            f" — {row['discount_percent']}%"
-            f" — использований: {row['uses']}"
-        )
-
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("promooff"))
-async def cmd_promo_off(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    parts = (
-        message.text or ""
-    ).split()
-
-    if len(parts) != 2:
-        await message.answer(
-            "Использование: "
-            "<code>/promooff КОД</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    ok = await disable_promo_code(
-        parts[1]
-    )
-
-    if ok:
-        await message.answer(
-            "✅ Промокод отключён."
-        )
-    else:
-        await message.answer(
-            "❌ Такой промокод не найден."
-        )
-

@@ -428,7 +428,6 @@ class YandexGPTClient:
         topic: str,
         sources: list[dict[str, Any]],
         max_chars: int = 820,
-        system_prompt: str | None = None,
     ) -> tuple[str, str]:
         blocks = []
         for i, src in enumerate(sources[:6], 1):
@@ -450,7 +449,7 @@ class YandexGPTClient:
         raw = await asyncio.to_thread(
             self._complete_sync,
             auth,
-            system_prompt or SYNCBOT_SYSTEM_PROMPT,
+            SYNCBOT_SYSTEM_PROMPT,
             user_prompt,
         )
         title, body = self._parse(raw)

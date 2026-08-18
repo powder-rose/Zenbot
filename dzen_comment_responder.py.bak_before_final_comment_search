@@ -5,8 +5,6 @@ import hashlib
 import json
 import logging
 import os
-
-import tenant_db
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,61 +61,17 @@ class ResponderComment:
 
 
 class DzenCommentResponderWorker:
-    def __init__(
-        self,
-        *,
-        gpt_client: Any,
-        cfg: Any,
-        tenant_user_id: int | None = None,
-        comments_url: str | None = None,
-        profile_dir: str | None = None,
-        state_file: str | None = None,
-        debug_dir: str | None = None,
-    ) -> None:
+    def __init__(self, *, gpt_client: Any, cfg: Any) -> None:
         self.gpt = gpt_client
         self.cfg = cfg
-
-        self.tenant_user_id = (
-            int(tenant_user_id)
-            if tenant_user_id is not None
-            else None
-        )
-
-        # Для tenant-worker тариф ограничен 3 подтверждёнными
-        # ответами за календарные сутки.
-        # Старый общий worker остаётся без этого ограничения.
-        self.daily_reply_limit = (
-            3
-            if self.tenant_user_id is not None
-            else None
-        )
-
         self.comments_url = (
-            str(comments_url or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_COMMENTS_URL",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENTS_URL",
-                "",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_COMMENTS_URL", "").strip()
+            or os.getenv("DZEN_COMMENTS_URL", "").strip()
         )
-
         self.profile_dir = (
-            str(profile_dir or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENT_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_PROFILE_DIR",
-                "data/dzen-profile",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_COMMENT_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_PROFILE_DIR", "data/dzen-profile").strip()
         )
         self.headless = self._env_bool(
             "DZEN_RESPONDER_HEADLESS",
@@ -159,39 +113,14 @@ class DzenCommentResponderWorker:
             self.tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
         except Exception:
             self.tz = timezone.utc
-        state_value = str(state_file or "").strip()
-
-        if (
-            not state_value
-            and self.tenant_user_id is not None
-        ):
-            state_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/state.json"
-            )
-
         self.state_path = Path(
-            state_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_STATE_FILE",
                 "data/dzen_comment_responder_state.json",
             )
         )
-
-        debug_value = str(debug_dir or "").strip()
-
-        if (
-            not debug_value
-            and self.tenant_user_id is not None
-        ):
-            debug_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/debug"
-            )
-
         self.debug_dir = Path(
-            debug_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_DEBUG_DIR",
                 "data/dzen_comment_responder_debug",
             )
@@ -477,61 +406,9 @@ class DzenCommentResponderWorker:
         scope: str,
     ) -> dict[str, Any]:
         state = self._load_state()
-        processed: dict[str, Any] = state.setdefault(
-            "processed",
-            {},
-        )
+        processed: dict[str, Any] = state.setdefault("processed", {})
 
-        daily_remaining: int | None = None
-
-        if (
-            self.tenant_user_id is not None
-            and self.daily_reply_limit is not None
-        ):
-            daily_used = (
-                await tenant_db.successful_dzen_replies_today(
-                    self.tenant_user_id,
-                    getattr(
-                        self.cfg,
-                        "timezone",
-                        "Europe/Moscow",
-                    ),
-                )
-            )
-
-            daily_remaining = max(
-                0,
-                self.daily_reply_limit - daily_used,
-            )
-
-            log.info(
-                "Tenant Dzen daily replies: "
-                "user=%s used=%s limit=%s remaining=%s",
-                self.tenant_user_id,
-                daily_used,
-                self.daily_reply_limit,
-                daily_remaining,
-            )
-
-            if daily_remaining <= 0:
-                state["last_cycle_at"] = self._now()
-                self._save_state(state)
-
-                return {
-                    "status": "daily_reply_limit",
-                    "found": len(comments),
-                    "new": 0,
-                    "replied": 0,
-                    "daily_used": daily_used,
-                    "daily_limit": self.daily_reply_limit,
-                    "scope": scope,
-                }
-
-        fresh = [
-            item
-            for item in comments
-            if item.key not in processed
-        ]
+        fresh = [item for item in comments if item.key not in processed]
         if not fresh:
             state["last_cycle_at"] = self._now()
             self._save_state(state)
@@ -542,23 +419,7 @@ class DzenCommentResponderWorker:
                 "scope": scope,
             }
 
-        effective_limit = limit
-
-        if daily_remaining is not None:
-            if effective_limit is None:
-                effective_limit = daily_remaining
-            else:
-                effective_limit = min(
-                    effective_limit,
-                    daily_remaining,
-                )
-
-        selected = (
-            fresh
-            if effective_limit is None
-            else fresh[:effective_limit]
-        )
-
+        selected = fresh if limit is None else fresh[:limit]
         total = len(selected)
         self._set_runtime(stage="generating", done=0, total=total, detail="Генерирую ответы через YandexGPT")
         log.info(
@@ -1281,28 +1142,6 @@ class DzenCommentResponderWorker:
                                 timeout=60,
                             )
 
-                            # Дневной лимит tenant списываем
-                            # только после реально подтверждённого
-                            # ответа в DOM Дзена.
-                            if (
-                                self.tenant_user_id is not None
-                                and verified
-                            ):
-                                recorded = (
-                                    await tenant_db.record_tenant_dzen_reply(
-                                        self.tenant_user_id,
-                                        comment_ref,
-                                    )
-                                )
-
-                                log.info(
-                                    "Tenant Dzen reply recorded: "
-                                    "user=%s comment=%s recorded=%s",
-                                    self.tenant_user_id,
-                                    comment_ref,
-                                    recorded,
-                                )
-
                             results.append(
                                 (
                                     item,
@@ -1624,243 +1463,39 @@ class DzenCommentResponderWorker:
         page: Page,
         item: ResponderComment,
     ) -> Locator | None:
+        cards = page.locator(
+            'div[class*="editor--comment__block"]'
+        )
 
-        def normalize(value: str) -> str:
-            return " ".join(
-                str(value or "")
-                .replace("\u00a0", " ")
-                .replace("\u200b", "")
-                .replace("\u2060", "")
-                .replace("\ufeff", "")
-                .split()
-            ).strip()
+        sample = " ".join(item.text.split()).strip()
+        author = " ".join(item.author.split()).strip()
 
-        target_text = normalize(item.text)
-        target_author = normalize(item.author).casefold()
+        sample_probe = sample[:90].lower()
+        author_probe = author.lower()
 
-        async def search_loaded() -> Locator | None:
-            cards = page.locator(
-                'div[class*="editor--comment__block"]'
-            )
-
-            count = await cards.count()
-
-            for index in range(count):
-                card = cards.nth(index)
-
-                try:
-                    if not await card.is_visible():
-                        continue
-
-                    text_element = card.locator(
-                        'p[aria-label="Текст комментария"]'
-                    ).first
-
-                    if not await text_element.count():
-                        continue
-
-                    actual_text = normalize(
-                        await text_element.inner_text()
-                    )
-
-                    # Сравниваем именно текст комментария.
-                    if actual_text != target_text:
-                        continue
-
-                    # Определяем автора этой конкретной карточки.
-                    raw = await card.inner_text()
-
-                    lines = [
-                        normalize(x)
-                        for x in raw.splitlines()
-                        if normalize(x)
-                    ]
-
-                    subscriber_index = -1
-
-                    for i, line in enumerate(lines):
-                        if line.casefold() in (
-                            "подписчик",
-                            "автор",
-                        ):
-                            subscriber_index = i
-                            break
-
-                    actual_author = ""
-
-                    if subscriber_index > 0:
-                        actual_author = lines[
-                            subscriber_index - 1
-                        ].casefold()
-
-                    if (
-                        target_author
-                        and actual_author
-                        and actual_author != target_author
-                    ):
-                        continue
-
-                    log.info(
-                        "Dzen responder: точная карточка найдена "
-                        "author=%s text=%s",
-                        item.author,
-                        target_text[:90],
-                    )
-
-                    return card
-
-                except Exception:
-                    continue
-
-            return None
-
-        # Сначала ищем среди уже загруженных карточек.
-        found = await search_loaded()
-
-        if found is not None:
-            return found
-
-        empty_scrolls = 0
-
-        # Затем последовательно раскрываем ветки
-        # «Показать N ответов» и прокручиваем страницу.
-        for attempt in range(120):
-
-            found = await search_loaded()
-
-            if found is not None:
-                return found
-
-            buttons = page.locator("button")
-            button_count = await buttons.count()
-
-            clicked = False
-
-            for index in range(button_count):
-                try:
-                    button = buttons.nth(index)
-
-                    if not await button.is_visible():
-                        continue
-
-                    label = normalize(
-                        await button.inner_text()
-                    )
-
-                    low = label.casefold()
-
-                    if not low.startswith("показать"):
-                        continue
-
-                    if "ответ" not in low:
-                        continue
-
-                    await button.click(
-                        timeout=3500,
-                    )
-
-                    log.debug(
-                        "Dzen responder: раскрываю ветку %s",
-                        label,
-                    )
-
-                    clicked = True
-                    empty_scrolls = 0
-
-                    await page.wait_for_timeout(180)
-
-                    found = await search_loaded()
-
-                    if found is not None:
-                        log.info(
-                            "Dzen responder: карточка найдена "
-                            "после раскрытия ветки author=%s",
-                            item.author,
-                        )
-                        return found
-
-                    # DOM после клика изменился,
-                    # поэтому перечитываем список кнопок.
-                    break
-
-                except Exception:
-                    continue
-
-            if clicked:
-                continue
-
-            # На текущем экране раскрывать больше нечего.
-            # Прокручиваем вниз, чтобы появились следующие ветки.
-            empty_scrolls += 1
+        for index in range(await cards.count()):
+            card = cards.nth(index)
 
             try:
-                await page.evaluate(
-                    """
-                    () => {
-                      const root =
-                        document.scrollingElement ||
-                        document.documentElement;
+                if not await card.is_visible():
+                    continue
 
-                      if (root) {
-                        root.scrollTop = Math.min(
-                          root.scrollTop + 2400,
-                          root.scrollHeight
-                        );
-                      }
+                value = " ".join(
+                    (await card.inner_text()).split()
+                ).strip()
 
-                      const containers =
-                        document.querySelectorAll(
-                          '[class*="comments-page__"]'
-                        );
+                low = value.lower()
 
-                      for (const el of containers) {
-                        try {
-                          if (
-                            el.scrollHeight >
-                            el.clientHeight + 100
-                          ) {
-                            el.scrollTop = Math.min(
-                              el.scrollTop + 2400,
-                              el.scrollHeight
-                            );
-                          }
-                        } catch (_) {}
-                      }
-                    }
-                    """
-                )
+                if sample_probe and sample_probe not in low:
+                    continue
 
-                await page.mouse.wheel(
-                    0,
-                    2200,
-                )
+                if author_probe and author_probe not in low:
+                    continue
+
+                return card
 
             except Exception:
-                pass
-
-            await page.wait_for_timeout(250)
-
-            found = await search_loaded()
-
-            if found is not None:
-                log.info(
-                    "Dzen responder: карточка найдена "
-                    "после прокрутки author=%s",
-                    item.author,
-                )
-                return found
-
-            # Диагностика показала, что 12 прокруток
-            # достаточно для загрузки глубоких карточек.
-            if empty_scrolls >= 20:
-                break
-
-        log.warning(
-            "Dzen responder: точная карточка окончательно "
-            "не найдена author=%s text=%s",
-            item.author,
-            target_text[:120],
-        )
+                continue
 
         return None
 

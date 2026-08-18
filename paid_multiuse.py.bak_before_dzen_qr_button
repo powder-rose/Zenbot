@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import html
 import logging
 import uuid
@@ -27,15 +25,6 @@ from aiogram.types import (
 )
 
 import tenant_db
-from cloudpayments_service import (
-    apply_user_promo,
-    clear_user_promo,
-    create_cloudpayments_order,
-    create_promo_code,
-    disable_promo_code,
-    list_promo_codes,
-)
-from tenant_dzen_qr_auth import authorize_tenant_dzen_by_qr
 from article_service import DEFAULT_IMAGE_PROMPT_TEMPLATE
 from config import Config
 from tenant_service import TenantArticleService
@@ -48,18 +37,15 @@ router = Router(name="paid-multiuse")
 _bot: Bot | None = None
 _cfg: Config | None = None
 _service: TenantArticleService | None = None
-_dzen_auth_tasks: set[asyncio.Task[Any]] = set()
 
 
 class PaidStates(StatesGroup):
-    waiting_promo_code = State()
     waiting_topics = State()
     waiting_edit_topic = State()
     waiting_schedule_time = State()
     waiting_urgent_topic = State()
     waiting_prompt_parts = State()
     waiting_dzen_comments_url = State()
-    waiting_dzen_login = State()
 
 
 PROMPTS = {
@@ -132,14 +118,8 @@ def paywall_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="💳 Оплатить 1 200 ₽",
+                    text="⭐ Оплатить подписку",
                     callback_data="billing:buy",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎟 Применить промокод",
-                    callback_data="billing:promo",
                 )
             ],
             [
@@ -184,12 +164,6 @@ def dzen_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🔗 Указать страницу комментариев",
                     callback_data="tenant:dzen:url",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔐 Авторизовать Дзен",
-                    callback_data="tenant:dzen:auth",
                 )
             ],
             [
@@ -311,7 +285,7 @@ async def show_paywall(message: Message, user_id: int | None = None) -> None:
         "🤖 <b>Автопубликация статей в ваш Telegram-канал</b>\n\n"
         "После оплаты вы получаете личную админ-панель: канал, темы, "
         "расписание, срочные статьи и собственные промпты.\n\n"
-        "Стоимость: <b>1 200 ₽ / 30 дней</b>.",
+        f"Стоимость: <b>{cfg.subscription_price_stars} ⭐ / 30 дней</b>.",
         parse_mode="HTML",
         reply_markup=paywall_keyboard(),
     )
@@ -397,115 +371,40 @@ async def cb_tenant_home(call: CallbackQuery, state: FSMContext):
 
 # ---------------- PAYMENT ----------------
 
-async def create_payment(
-    message: Message,
-    user_id: int | None = None,
-) -> None:
-    user_id = int(
-        user_id
-        if user_id is not None
-        else message.from_user.id
-    )
-
-    bot, _, _ = _deps()
-
-    if user_id == bot.id:
-        raise RuntimeError(
-            "CloudPayments payer cannot be bot"
-        )
-
-    if await tenant_db.is_subscription_active(
-        user_id
-    ):
+async def create_payment(message: Message) -> None:
+    bot, cfg, _ = _deps()
+    if await tenant_db.is_subscription_active(message.from_user.id):
         await message.answer(
-            "✅ Подписка уже активна.",
+            "Подписка уже активна. Новую можно оформить заранее, но Telegram "
+            "может создать параллельную подписку. Рекомендуется дождаться окончания текущей.",
             reply_markup=cabinet_keyboard(),
         )
         return
 
-    try:
-        order = await create_cloudpayments_order(
-            user_id
-        )
-    except Exception:
-        log.exception(
-            "Ошибка создания CloudPayments "
-            "order: user=%s",
-            user_id,
-        )
-
-        await message.answer(
-            "❌ Сейчас не удалось создать "
-            "ссылку на оплату. "
-            "Попробуйте немного позже."
-        )
-        return
-
-    amount_kopecks = int(
-        order["amount_kopecks"]
+    payload = f"zen-sub:{uuid.uuid4().hex}"
+    link = await bot.create_invoice_link(
+        title=cfg.subscription_title[:32],
+        description=cfg.subscription_description[:255],
+        payload=payload,
+        currency="XTR",
+        prices=[
+            LabeledPrice(
+                label="30 дней доступа",
+                amount=cfg.subscription_price_stars,
+            )
+        ],
+        subscription_period=2592000,
     )
-
-    amount_text = (
-        f"{amount_kopecks / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    promo_code = order.get(
-        "promo_code"
-    )
-
-    discount_percent = int(
-        order.get(
-            "discount_percent",
-            0,
-        )
-        or 0
-    )
-
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"💳 Оплатить "
-                        f"{amount_text} ₽"
-                    ),
-                    url=order["url"],
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎟 Промокод",
-                    callback_data="billing:promo",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="billing:status",
-                )
-            ],
+            [InlineKeyboardButton(text=f"Оплатить {cfg.subscription_price_stars} ⭐", url=link)],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="billing:status")],
         ]
     )
-
-    if promo_code:
-        promo_text = (
-            f"\n🎟 Промокод: "
-            f"<code>{html.escape(str(promo_code))}</code>"
-            f" — скидка <b>{discount_percent}%</b>\n"
-            f"Цена со скидкой: "
-            f"<b>{amount_text} ₽</b>."
-        )
-    else:
-        promo_text = ""
-
     await message.answer(
-        "💳 <b>Подписка на 30 дней</b>\n\n"
-        "Базовая стоимость: <b>1 200 ₽</b>."
-        f"{promo_text}\n\n"
-        "После успешной оплаты доступ "
-        "активируется автоматически.",
+        "⭐ <b>Подписка на 30 дней</b>\n\n"
+        "Оплата проходит внутри Telegram в Stars. После успешного платежа "
+        "доступ активируется автоматически.",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -515,134 +414,7 @@ async def create_payment(
 async def cb_buy(call: CallbackQuery):
     await tenant_db.touch_user(call.from_user)
     await call.answer()
-    await create_payment(
-        call.message,
-        call.from_user.id,
-    )
-
-
-@router.callback_query(F.data == "billing:promo")
-async def cb_promo(
-    call: CallbackQuery,
-    state: FSMContext,
-):
-    await tenant_db.touch_user(
-        call.from_user
-    )
-
-    await state.set_state(
-        PaidStates.waiting_promo_code
-    )
-
-    await call.answer()
-
-    await call.message.answer(
-        "🎟 <b>Промокод</b>\n\n"
-        "Введите промокод одним сообщением.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(PaidStates.waiting_promo_code)
-async def promo_received(
-    message: Message,
-    state: FSMContext,
-):
-    await tenant_db.touch_user(
-        message.from_user
-    )
-
-    code = (
-        message.text or ""
-    ).strip()
-
-    result = await apply_user_promo(
-        message.from_user.id,
-        code,
-    )
-
-    await state.clear()
-
-    if not result.get("ok"):
-        if (
-            result.get("reason")
-            == "already_used"
-        ):
-            text = (
-                "❌ Этот промокод уже был "
-                "использован вами."
-            )
-        else:
-            text = (
-                "❌ Промокод не найден "
-                "или больше не действует."
-            )
-
-        await message.answer(
-            text,
-            reply_markup=paywall_keyboard(),
-        )
-        return
-
-    final_kopecks = int(
-        result["final_kopecks"]
-    )
-
-    final_text = (
-        f"{final_kopecks / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    await message.answer(
-        "✅ <b>Промокод применён.</b>\n\n"
-        f"Код: <code>{html.escape(result['code'])}</code>\n"
-        f"Скидка: <b>{result['discount_percent']}%</b>\n"
-        f"Новая цена: <b>{final_text} ₽</b>.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=(
-                            f"💳 Оплатить "
-                            f"{final_text} ₽"
-                        ),
-                        callback_data="billing:buy",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🗑 Убрать промокод",
-                        callback_data="billing:promo:clear",
-                    )
-                ],
-            ]
-        ),
-    )
-
-
-@router.callback_query(
-    F.data == "billing:promo:clear"
-)
-async def cb_promo_clear(
-    call: CallbackQuery,
-    state: FSMContext,
-):
-    await clear_user_promo(
-        call.from_user.id
-    )
-
-    await state.clear()
-    await call.answer(
-        "Промокод удалён"
-    )
-
-    await call.message.answer(
-        "🎟 Промокод удалён. "
-        "Стоимость снова 1 200 ₽.",
-        reply_markup=paywall_keyboard(),
-    )
+    await create_payment(call.message)
 
 
 async def send_subscription_status(message: Message, user_id: int) -> None:
@@ -815,140 +587,6 @@ async def cb_tenant_dzen(
     await show_tenant_dzen(
         call.message,
         call.from_user.id,
-    )
-
-
-@router.callback_query(F.data == "tenant:dzen:auth")
-async def cb_tenant_dzen_auth(
-    call: CallbackQuery,
-    state: FSMContext,
-):
-    if not await require_paid(call):
-        return
-
-    row = await tenant_db.tenant_dzen_account(
-        call.from_user.id
-    )
-
-    if not row:
-        await call.answer(
-            "Сначала укажите страницу комментариев",
-            show_alert=True,
-        )
-        return
-
-    comments_url = str(
-        row["comments_url"] or ""
-    ).strip()
-
-    if not comments_url:
-        await call.answer(
-            "Сначала укажите страницу комментариев",
-            show_alert=True,
-        )
-        return
-
-    await state.set_state(
-        PaidStates.waiting_dzen_login
-    )
-
-    await call.answer()
-
-    await call.message.answer(
-        "🔐 <b>Авторизация Дзена</b>\n\n"
-        "Пришлите только логин Яндекса, "
-        "к которому привязан ваш Дзен.\n\n"
-        "Например:\n"
-        "<code>example@yandex.ru</code>\n\n"
-        "⚠️ Пароль, код из SMS или код 2FA "
-        "сюда отправлять не нужно.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(PaidStates.waiting_dzen_login)
-async def tenant_dzen_login_received(
-    message: Message,
-    state: FSMContext,
-):
-    if not await require_paid(message):
-        return
-
-    login = (message.text or "").strip()
-
-    if (
-        len(login) < 3
-        or len(login) > 254
-        or any(ch.isspace() for ch in login)
-    ):
-        await message.answer(
-            "❌ Некорректный логин Яндекса.\n"
-            "Пришлите логин или email без пробелов."
-        )
-        return
-
-    row = await tenant_db.tenant_dzen_account(
-        message.from_user.id
-    )
-
-    if not row:
-        await state.clear()
-
-        await message.answer(
-            "❌ Сначала укажите страницу комментариев Дзена.",
-            reply_markup=dzen_keyboard(),
-        )
-        return
-
-    comments_url = str(
-        row["comments_url"] or ""
-    ).strip()
-
-    profile_dir = str(
-        row["profile_dir"] or ""
-    ).strip()
-
-    if not comments_url or not profile_dir:
-        await state.clear()
-
-        await message.answer(
-            "❌ Настройки Дзена неполные. "
-            "Сначала заново укажите страницу комментариев.",
-            reply_markup=dzen_keyboard(),
-        )
-        return
-
-    # Пока идёт авторизация, worker клиента
-    # не должен использовать этот профиль.
-    await tenant_db.set_tenant_dzen_enabled(
-        message.from_user.id,
-        False,
-    )
-
-    await state.clear()
-
-    bot, _, _ = _deps()
-
-    await message.answer(
-        "🔄 Готовлю QR-код для входа в Яндекс…\n\n"
-        "Пароль вводить в Telegram не потребуется."
-    )
-
-    task = asyncio.create_task(
-        authorize_tenant_dzen_by_qr(
-            bot=bot,
-            user_id=message.from_user.id,
-            yandex_login=login,
-            comments_url=comments_url,
-            profile_dir=profile_dir,
-            timeout_seconds=180,
-        )
-    )
-
-    _dzen_auth_tasks.add(task)
-
-    task.add_done_callback(
-        _dzen_auth_tasks.discard
     )
 
 
@@ -1641,148 +1279,3 @@ async def cb_super_users(call: CallbackQuery):
             f"{html.escape(str(name))} — до {html.escape(str(row['expires_at'] or '—'))}"
         )
     await call.message.answer("\n".join(lines), parse_mode="HTML", reply_markup=super_keyboard())
-
-
-# ---------------- PROMOCODES ----------------
-
-@router.message(Command("promo"))
-async def cmd_promo_create(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    parts = (
-        message.text or ""
-    ).split()
-
-    if len(parts) != 3:
-        await message.answer(
-            "Использование:\n"
-            "<code>/promo КОД СКИДКА</code>\n\n"
-            "Пример:\n"
-            "<code>/promo START20 20</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    code = parts[1]
-
-    try:
-        percent = int(parts[2])
-    except ValueError:
-        await message.answer(
-            "Скидка должна быть числом."
-        )
-        return
-
-    try:
-        promo = await create_promo_code(
-            code,
-            percent,
-        )
-    except ValueError as exc:
-        await message.answer(
-            f"❌ {html.escape(str(exc))}"
-        )
-        return
-
-    final = int(
-        promo["final_kopecks"]
-    )
-
-    final_text = (
-        f"{final / 100:,.2f}"
-        .replace(",", " ")
-        .replace(".00", "")
-    )
-
-    await message.answer(
-        "✅ <b>Промокод создан.</b>\n\n"
-        f"Код: <code>{html.escape(promo['code'])}</code>\n"
-        f"Скидка: <b>{promo['discount_percent']}%</b>\n"
-        f"Цена: <b>{final_text} ₽</b>\n\n"
-        "Один пользователь может "
-        "использовать этот код один раз.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("promos"))
-async def cmd_promos(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    rows = await list_promo_codes()
-
-    if not rows:
-        await message.answer(
-            "Промокодов пока нет."
-        )
-        return
-
-    lines = [
-        "🎟 <b>Промокоды</b>",
-        "",
-    ]
-
-    for row in rows:
-        icon = (
-            "🟢"
-            if int(row["active"])
-            else "🔴"
-        )
-
-        lines.append(
-            f"{icon} "
-            f"<code>{html.escape(row['code'])}</code>"
-            f" — {row['discount_percent']}%"
-            f" — использований: {row['uses']}"
-        )
-
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("promooff"))
-async def cmd_promo_off(
-    message: Message,
-):
-    if not is_superadmin(
-        message.from_user.id
-    ):
-        return
-
-    parts = (
-        message.text or ""
-    ).split()
-
-    if len(parts) != 2:
-        await message.answer(
-            "Использование: "
-            "<code>/promooff КОД</code>",
-            parse_mode="HTML",
-        )
-        return
-
-    ok = await disable_promo_code(
-        parts[1]
-    )
-
-    if ok:
-        await message.answer(
-            "✅ Промокод отключён."
-        )
-    else:
-        await message.answer(
-            "❌ Такой промокод не найден."
-        )
-

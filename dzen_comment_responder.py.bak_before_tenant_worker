@@ -5,8 +5,6 @@ import hashlib
 import json
 import logging
 import os
-
-import tenant_db
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,61 +61,17 @@ class ResponderComment:
 
 
 class DzenCommentResponderWorker:
-    def __init__(
-        self,
-        *,
-        gpt_client: Any,
-        cfg: Any,
-        tenant_user_id: int | None = None,
-        comments_url: str | None = None,
-        profile_dir: str | None = None,
-        state_file: str | None = None,
-        debug_dir: str | None = None,
-    ) -> None:
+    def __init__(self, *, gpt_client: Any, cfg: Any) -> None:
         self.gpt = gpt_client
         self.cfg = cfg
-
-        self.tenant_user_id = (
-            int(tenant_user_id)
-            if tenant_user_id is not None
-            else None
-        )
-
-        # Для tenant-worker тариф ограничен 3 подтверждёнными
-        # ответами за календарные сутки.
-        # Старый общий worker остаётся без этого ограничения.
-        self.daily_reply_limit = (
-            3
-            if self.tenant_user_id is not None
-            else None
-        )
-
         self.comments_url = (
-            str(comments_url or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_COMMENTS_URL",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENTS_URL",
-                "",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_COMMENTS_URL", "").strip()
+            or os.getenv("DZEN_COMMENTS_URL", "").strip()
         )
-
         self.profile_dir = (
-            str(profile_dir or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENT_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_PROFILE_DIR",
-                "data/dzen-profile",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_COMMENT_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_PROFILE_DIR", "data/dzen-profile").strip()
         )
         self.headless = self._env_bool(
             "DZEN_RESPONDER_HEADLESS",
@@ -159,39 +113,14 @@ class DzenCommentResponderWorker:
             self.tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
         except Exception:
             self.tz = timezone.utc
-        state_value = str(state_file or "").strip()
-
-        if (
-            not state_value
-            and self.tenant_user_id is not None
-        ):
-            state_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/state.json"
-            )
-
         self.state_path = Path(
-            state_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_STATE_FILE",
                 "data/dzen_comment_responder_state.json",
             )
         )
-
-        debug_value = str(debug_dir or "").strip()
-
-        if (
-            not debug_value
-            and self.tenant_user_id is not None
-        ):
-            debug_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/debug"
-            )
-
         self.debug_dir = Path(
-            debug_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_DEBUG_DIR",
                 "data/dzen_comment_responder_debug",
             )
@@ -477,61 +406,9 @@ class DzenCommentResponderWorker:
         scope: str,
     ) -> dict[str, Any]:
         state = self._load_state()
-        processed: dict[str, Any] = state.setdefault(
-            "processed",
-            {},
-        )
+        processed: dict[str, Any] = state.setdefault("processed", {})
 
-        daily_remaining: int | None = None
-
-        if (
-            self.tenant_user_id is not None
-            and self.daily_reply_limit is not None
-        ):
-            daily_used = (
-                await tenant_db.successful_dzen_replies_today(
-                    self.tenant_user_id,
-                    getattr(
-                        self.cfg,
-                        "timezone",
-                        "Europe/Moscow",
-                    ),
-                )
-            )
-
-            daily_remaining = max(
-                0,
-                self.daily_reply_limit - daily_used,
-            )
-
-            log.info(
-                "Tenant Dzen daily replies: "
-                "user=%s used=%s limit=%s remaining=%s",
-                self.tenant_user_id,
-                daily_used,
-                self.daily_reply_limit,
-                daily_remaining,
-            )
-
-            if daily_remaining <= 0:
-                state["last_cycle_at"] = self._now()
-                self._save_state(state)
-
-                return {
-                    "status": "daily_reply_limit",
-                    "found": len(comments),
-                    "new": 0,
-                    "replied": 0,
-                    "daily_used": daily_used,
-                    "daily_limit": self.daily_reply_limit,
-                    "scope": scope,
-                }
-
-        fresh = [
-            item
-            for item in comments
-            if item.key not in processed
-        ]
+        fresh = [item for item in comments if item.key not in processed]
         if not fresh:
             state["last_cycle_at"] = self._now()
             self._save_state(state)
@@ -542,23 +419,7 @@ class DzenCommentResponderWorker:
                 "scope": scope,
             }
 
-        effective_limit = limit
-
-        if daily_remaining is not None:
-            if effective_limit is None:
-                effective_limit = daily_remaining
-            else:
-                effective_limit = min(
-                    effective_limit,
-                    daily_remaining,
-                )
-
-        selected = (
-            fresh
-            if effective_limit is None
-            else fresh[:effective_limit]
-        )
-
+        selected = fresh if limit is None else fresh[:limit]
         total = len(selected)
         self._set_runtime(stage="generating", done=0, total=total, detail="Генерирую ответы через YandexGPT")
         log.info(
@@ -1280,28 +1141,6 @@ class DzenCommentResponderWorker:
                                 ),
                                 timeout=60,
                             )
-
-                            # Дневной лимит tenant списываем
-                            # только после реально подтверждённого
-                            # ответа в DOM Дзена.
-                            if (
-                                self.tenant_user_id is not None
-                                and verified
-                            ):
-                                recorded = (
-                                    await tenant_db.record_tenant_dzen_reply(
-                                        self.tenant_user_id,
-                                        comment_ref,
-                                    )
-                                )
-
-                                log.info(
-                                    "Tenant Dzen reply recorded: "
-                                    "user=%s comment=%s recorded=%s",
-                                    self.tenant_user_id,
-                                    comment_ref,
-                                    recorded,
-                                )
 
                             results.append(
                                 (

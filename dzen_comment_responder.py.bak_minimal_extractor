@@ -5,8 +5,6 @@ import hashlib
 import json
 import logging
 import os
-
-import tenant_db
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -63,61 +61,17 @@ class ResponderComment:
 
 
 class DzenCommentResponderWorker:
-    def __init__(
-        self,
-        *,
-        gpt_client: Any,
-        cfg: Any,
-        tenant_user_id: int | None = None,
-        comments_url: str | None = None,
-        profile_dir: str | None = None,
-        state_file: str | None = None,
-        debug_dir: str | None = None,
-    ) -> None:
+    def __init__(self, *, gpt_client: Any, cfg: Any) -> None:
         self.gpt = gpt_client
         self.cfg = cfg
-
-        self.tenant_user_id = (
-            int(tenant_user_id)
-            if tenant_user_id is not None
-            else None
-        )
-
-        # Для tenant-worker тариф ограничен 3 подтверждёнными
-        # ответами за календарные сутки.
-        # Старый общий worker остаётся без этого ограничения.
-        self.daily_reply_limit = (
-            3
-            if self.tenant_user_id is not None
-            else None
-        )
-
         self.comments_url = (
-            str(comments_url or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_COMMENTS_URL",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENTS_URL",
-                "",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_COMMENTS_URL", "").strip()
+            or os.getenv("DZEN_COMMENTS_URL", "").strip()
         )
-
         self.profile_dir = (
-            str(profile_dir or "").strip()
-            or os.getenv(
-                "DZEN_RESPONDER_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_COMMENT_PROFILE_DIR",
-                "",
-            ).strip()
-            or os.getenv(
-                "DZEN_PROFILE_DIR",
-                "data/dzen-profile",
-            ).strip()
+            os.getenv("DZEN_RESPONDER_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_COMMENT_PROFILE_DIR", "").strip()
+            or os.getenv("DZEN_PROFILE_DIR", "data/dzen-profile").strip()
         )
         self.headless = self._env_bool(
             "DZEN_RESPONDER_HEADLESS",
@@ -159,39 +113,14 @@ class DzenCommentResponderWorker:
             self.tz = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
         except Exception:
             self.tz = timezone.utc
-        state_value = str(state_file or "").strip()
-
-        if (
-            not state_value
-            and self.tenant_user_id is not None
-        ):
-            state_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/state.json"
-            )
-
         self.state_path = Path(
-            state_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_STATE_FILE",
                 "data/dzen_comment_responder_state.json",
             )
         )
-
-        debug_value = str(debug_dir or "").strip()
-
-        if (
-            not debug_value
-            and self.tenant_user_id is not None
-        ):
-            debug_value = (
-                f"/app/data/tenant_dzen/"
-                f"u{self.tenant_user_id}/debug"
-            )
-
         self.debug_dir = Path(
-            debug_value
-            or os.getenv(
+            os.getenv(
                 "DZEN_RESPONDER_DEBUG_DIR",
                 "data/dzen_comment_responder_debug",
             )
@@ -477,61 +406,9 @@ class DzenCommentResponderWorker:
         scope: str,
     ) -> dict[str, Any]:
         state = self._load_state()
-        processed: dict[str, Any] = state.setdefault(
-            "processed",
-            {},
-        )
+        processed: dict[str, Any] = state.setdefault("processed", {})
 
-        daily_remaining: int | None = None
-
-        if (
-            self.tenant_user_id is not None
-            and self.daily_reply_limit is not None
-        ):
-            daily_used = (
-                await tenant_db.successful_dzen_replies_today(
-                    self.tenant_user_id,
-                    getattr(
-                        self.cfg,
-                        "timezone",
-                        "Europe/Moscow",
-                    ),
-                )
-            )
-
-            daily_remaining = max(
-                0,
-                self.daily_reply_limit - daily_used,
-            )
-
-            log.info(
-                "Tenant Dzen daily replies: "
-                "user=%s used=%s limit=%s remaining=%s",
-                self.tenant_user_id,
-                daily_used,
-                self.daily_reply_limit,
-                daily_remaining,
-            )
-
-            if daily_remaining <= 0:
-                state["last_cycle_at"] = self._now()
-                self._save_state(state)
-
-                return {
-                    "status": "daily_reply_limit",
-                    "found": len(comments),
-                    "new": 0,
-                    "replied": 0,
-                    "daily_used": daily_used,
-                    "daily_limit": self.daily_reply_limit,
-                    "scope": scope,
-                }
-
-        fresh = [
-            item
-            for item in comments
-            if item.key not in processed
-        ]
+        fresh = [item for item in comments if item.key not in processed]
         if not fresh:
             state["last_cycle_at"] = self._now()
             self._save_state(state)
@@ -542,23 +419,7 @@ class DzenCommentResponderWorker:
                 "scope": scope,
             }
 
-        effective_limit = limit
-
-        if daily_remaining is not None:
-            if effective_limit is None:
-                effective_limit = daily_remaining
-            else:
-                effective_limit = min(
-                    effective_limit,
-                    daily_remaining,
-                )
-
-        selected = (
-            fresh
-            if effective_limit is None
-            else fresh[:effective_limit]
-        )
-
+        selected = fresh if limit is None else fresh[:limit]
         total = len(selected)
         self._set_runtime(stage="generating", done=0, total=total, detail="Генерирую ответы через YandexGPT")
         log.info(
@@ -648,25 +509,29 @@ class DzenCommentResponderWorker:
 
         posted = 0
         post_errors = 0
-
         if plans:
-            self._set_runtime(
-                stage="posting",
-                done=0,
-                total=len(plans),
-                detail="Публикую ответы в Дзене",
-            )
-
-            results = await self._post_replies(
-                plans,
-                state=state,
-            )
-
-            for item, reply, ok, error, verified in results:
+            self._set_runtime(stage="posting", done=0, total=len(plans), detail="Публикую ответы в Дзене")
+            results = await self._post_replies(plans)
+            for idx, (item, reply, ok, error, verified) in enumerate(results, 1):
+                self._set_runtime(done=idx, total=len(plans))
                 if ok:
                     posted += 1
+                    self._mark_processed(
+                        state,
+                        item,
+                        status="replied" if verified else "replied_unverified",
+                        reply=reply,
+                    )
+                    self._bump_stat(state, "replied")
+                    state["last_reply_at"] = self._now()
                 else:
                     post_errors += 1
+                    self._bump_stat(state, "errors")
+                    log.error(
+                        "Dzen responder: не удалось ответить comment=%s: %s",
+                        item.comment_id or item.key,
+                        error,
+                    )
 
         state["last_cycle_at"] = self._now()
         self._save_state(state)
@@ -771,12 +636,12 @@ class DzenCommentResponderWorker:
 
         raw_by_key: dict[str, dict[str, Any]] = {}
 
-        log.debug("Dzen responder DEBUG: жду DZEN_BROWSER_LOCK")
+        log.info("Dzen responder DEBUG: жду DZEN_BROWSER_LOCK")
         async with DZEN_BROWSER_LOCK:
-            log.debug("Dzen responder DEBUG: DZEN_BROWSER_LOCK получен")
+            log.info("Dzen responder DEBUG: DZEN_BROWSER_LOCK получен")
             async with async_playwright() as pw:
-                log.debug("Dzen responder DEBUG: Playwright запущен")
-                log.debug("Dzen responder DEBUG: запускаю Chromium persistent context")
+                log.info("Dzen responder DEBUG: Playwright запущен")
+                log.info("Dzen responder DEBUG: запускаю Chromium persistent context")
                 context = await pw.chromium.launch_persistent_context(
                     user_data_dir=str(profile),
                     headless=self.headless,
@@ -784,157 +649,92 @@ class DzenCommentResponderWorker:
                     locale="ru-RU",
                 )
                 try:
-                    log.debug("Dzen responder DEBUG: Chromium запущен")
+                    log.info("Dzen responder DEBUG: Chromium запущен")
                     page = context.pages[0] if context.pages else await context.new_page()
-                    log.debug("Dzen responder DEBUG: начинаю page.goto")
+                    log.info("Dzen responder DEBUG: начинаю page.goto")
                     await page.goto(
                         self.comments_url,
                         wait_until="domcontentloaded",
                         timeout=90000,
                     )
-                    log.debug(
+                    log.info(
                         "Dzen responder DEBUG: page.goto завершён url=%s",
                         page.url,
                     )
                     self._assert_authorized(page)
-                    log.debug("Dzen responder DEBUG: авторизация проверена")
+                    log.info("Dzen responder DEBUG: авторизация проверена")
 
                     # Студия догружает комментарии после DOMContentLoaded. Ждём карточки,
                     # но отсутствие selector не считаем исключением — ниже есть fallback/debug.
                     try:
-                        log.debug("Dzen responder DEBUG: жду reply-button")
+                        log.info("Dzen responder DEBUG: жду reply-button")
                         await page.wait_for_selector(
                             'button[data-testid="reply-button"], '
                             'a[aria-label="Комментарий"], a[href*="#comment_"]',
                             timeout=15000,
                         )
-                        log.debug("Dzen responder DEBUG: reply-button найден")
+                        log.info("Dzen responder DEBUG: reply-button найден")
                     except Exception as exc:
                         log.warning(
-                            "Dzen responder: ошибка ожидания reply-button: %s",
+                            "Dzen responder DEBUG: wait selector timeout/error: %s",
                             exc,
                         )
                         await page.wait_for_timeout(2500)
 
-                    rounds = max(
-                        1,
-                        int(scroll_rounds or self.scroll_rounds),
-                    )
+                    rounds = max(1, int(scroll_rounds or self.scroll_rounds))
                     no_growth_rounds = 0
 
                     for round_index in range(rounds + 1):
-                        log.info(
-                            "Dzen responder: extract start round=%s/%s",
-                            round_index + 1,
-                            rounds + 1,
-                        )
-
-                        batch = await asyncio.wait_for(
-                            self._extract_comments_from_page(page),
-                            timeout=10,
-                        )
-
-                        log.info(
-                            "Dzen responder: extract done round=%s visible=%s",
-                            round_index + 1,
-                            len(batch),
-                        )
-
+                        batch = await self._extract_comments_from_page(page)
                         before_count = len(raw_by_key)
-
                         for item in batch:
-                            text_value = " ".join(
-                                str(item.get("text") or "").split()
-                            ).strip()
-
-                            if not text_value:
+                            href = str(item.get("href") or "").strip()
+                            text = " ".join(str(item.get("text") or "").split()).strip()
+                            if not href and not text:
                                 continue
-
                             identity = "\n".join([
                                 str(item.get("commentId") or ""),
                                 str(item.get("author") or ""),
                                 str(item.get("createdRaw") or ""),
-                                text_value,
+                                text,
                             ])
-
-                            raw_key = hashlib.sha256(
-                                identity.encode("utf-8")
-                            ).hexdigest()
-
+                            raw_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
                             raw_by_key[raw_key] = item
 
-                        after_count = len(raw_by_key)
-
-                        log.info(
-                            "Dzen responder: scan progress "
-                            "round=%s/%s visible=%s unique=%s new=%s",
-                            round_index + 1,
-                            rounds + 1,
-                            len(batch),
-                            after_count,
-                            after_count - before_count,
-                        )
-
-                        if after_count == before_count:
+                        if len(raw_by_key) == before_count:
                             no_growth_rounds += 1
                         else:
                             no_growth_rounds = 0
 
-                        if raw_by_key and no_growth_rounds >= 3:
-                            log.info(
-                                "Dzen responder: список стабилен, "
-                                "останавливаю скан unique=%s",
-                                len(raw_by_key),
-                            )
-                            break
-
                         if round_index >= rounds:
                             break
 
-                        # Скроллим только страницу и контейнеры
-                        # интерфейса комментариев, а не тысячи DIV.
+                        # Прокручиваем и window, и возможные внутренние scroll-контейнеры.
                         await page.evaluate(
                             """
                             () => {
-                              const root =
-                                document.scrollingElement ||
-                                document.documentElement;
-
-                              if (root) {
-                                root.scrollTop = Math.min(
-                                  root.scrollTop + 3000,
-                                  root.scrollHeight
-                                );
-                              }
-
-                              const candidates =
-                                document.querySelectorAll(
-                                  '[class*="comments-page__"]'
-                                );
-
-                              for (const el of candidates) {
+                              const root = document.scrollingElement || document.documentElement;
+                              if (root) root.scrollTop = root.scrollHeight;
+                              for (const el of document.querySelectorAll('main, section, div')) {
                                 try {
-                                  if (
-                                    el.scrollHeight >
-                                    el.clientHeight + 150
-                                  ) {
-                                    el.scrollTop = Math.min(
-                                      el.scrollTop + 3000,
-                                      el.scrollHeight
-                                    );
+                                  if (el.scrollHeight > el.clientHeight + 300) {
+                                    el.scrollTop = el.scrollHeight;
                                   }
                                 } catch (_) {}
                               }
                             }
                             """
                         )
-
                         try:
-                            await page.mouse.wheel(0, 2500)
+                            await page.mouse.wheel(0, 2600)
                         except Exception:
                             pass
+                        await page.wait_for_timeout(900)
 
-                        await page.wait_for_timeout(350)
+                        # Не обрываемся после первого неизменившегося scrollHeight:
+                        # виртуальный список может держать постоянную высоту.
+                        if no_growth_rounds >= 4 and raw_by_key:
+                            break
 
                     if not raw_by_key:
                         log.warning(
@@ -1098,80 +898,17 @@ class DzenCommentResponderWorker:
             f"КОММЕНТАРИЙ:\n{item.text}"
         )
         auth = await self.gpt.auth_header()
-        reply_prompt = (
-            self.get_reply_prompt()
-            + "\n\nВАЖНО: не добавляй в ответ никакие ссылки, URL, "
-              "адрес сайта, призывы перейти на сайт или в блог. "
-              "Ссылка на блог будет добавлена программой автоматически."
-        )
-
         raw = await asyncio.to_thread(
             self.gpt._complete_sync,
             auth,
-            reply_prompt,
+            self.get_reply_prompt(),
             prompt,
             self.reply_timeout_seconds,
         )
-
         reply = self._clean_reply(str(raw or ""))
         if not reply:
             return ""
-
-        # На всякий случай удаляем URL, если модель всё же его добавила.
-        reply = re.sub(
-            r"https?://\S+",
-            "",
-            reply,
-            flags=re.I,
-        )
-        reply = re.sub(
-            r"[ \t]{2,}",
-            " ",
-            reply,
-        ).strip()
-
-        blog_url = "https://boykovgroup.ru/blog"
-        suffix = f"\n\nБольше материалов: {blog_url}"
-
-        # Ссылка добавляется ПОСЛЕ обрезки основного текста,
-        # поэтому адрес никогда не превратится в "htt...".
-        try:
-            max_chars = int(
-                getattr(
-                    self,
-                    "max_reply_chars",
-                    1000,
-                )
-            )
-        except Exception:
-            max_chars = 1000
-
-        max_chars = max(
-            max_chars,
-            len(suffix) + 150,
-        )
-
-        body_limit = max_chars - len(suffix)
-
-        if len(reply) > body_limit:
-            shortened = reply[:body_limit].rstrip()
-
-            # Стараемся закончить на завершённом предложении.
-            last_sentence = max(
-                shortened.rfind("."),
-                shortened.rfind("!"),
-                shortened.rfind("?"),
-            )
-
-            if last_sentence >= int(body_limit * 0.55):
-                shortened = shortened[:last_sentence + 1]
-            else:
-                shortened = shortened.rsplit(" ", 1)[0]
-                shortened = shortened.rstrip(" ,;:-")
-
-            reply = shortened
-
-        return (reply + suffix).strip()
+        return self._truncate_reply(reply)
 
     def _clean_reply(self, text: str) -> str:
         text = text.strip()
@@ -1213,22 +950,10 @@ class DzenCommentResponderWorker:
     async def _post_replies(
         self,
         plans: list[tuple[ResponderComment, str]],
-        *,
-        state: dict[str, Any],
     ) -> list[tuple[ResponderComment, str, bool, str, bool]]:
         profile = Path(self.profile_dir)
         profile.mkdir(parents=True, exist_ok=True)
-
-        results: list[
-            tuple[ResponderComment, str, bool, str, bool]
-        ] = []
-
-        total = len(plans)
-
-        log.info(
-            "Dzen responder: публикация start total=%s",
-            total,
-        )
+        results: list[tuple[ResponderComment, str, bool, str, bool]] = []
 
         async with DZEN_BROWSER_LOCK:
             async with async_playwright() as pw:
@@ -1238,630 +963,107 @@ class DzenCommentResponderWorker:
                     viewport={"width": 1440, "height": 1000},
                     locale="ru-RU",
                 )
-
                 try:
-                    page = (
-                        context.pages[0]
-                        if context.pages
-                        else await context.new_page()
-                    )
-
-                    for idx, (item, reply) in enumerate(plans, 1):
-                        comment_ref = (
-                            item.comment_id
-                            or item.key
-                        )
-
-                        self._set_runtime(
-                            stage="posting",
-                            done=idx - 1,
-                            total=total,
-                            detail=(
-                                f"Публикую ответы в Дзене… "
-                                f"{idx - 1}/{total}"
-                            ),
-                        )
-
-                        log.info(
-                            "Dzen responder: публикация "
-                            "start %s/%s comment=%s author=%s",
-                            idx,
-                            total,
-                            comment_ref,
-                            item.author,
-                        )
-
+                    page = context.pages[0] if context.pages else await context.new_page()
+                    for item, reply in plans:
                         try:
-                            verified = await asyncio.wait_for(
-                                self._post_one(
-                                    page,
-                                    item,
-                                    reply,
-                                ),
-                                timeout=60,
-                            )
-
-                            # Дневной лимит tenant списываем
-                            # только после реально подтверждённого
-                            # ответа в DOM Дзена.
-                            if (
-                                self.tenant_user_id is not None
-                                and verified
-                            ):
-                                recorded = (
-                                    await tenant_db.record_tenant_dzen_reply(
-                                        self.tenant_user_id,
-                                        comment_ref,
-                                    )
-                                )
-
-                                log.info(
-                                    "Tenant Dzen reply recorded: "
-                                    "user=%s comment=%s recorded=%s",
-                                    self.tenant_user_id,
-                                    comment_ref,
-                                    recorded,
-                                )
-
-                            results.append(
-                                (
-                                    item,
-                                    reply,
-                                    True,
-                                    "",
-                                    verified,
-                                )
-                            )
-
-                            self._mark_processed(
-                                state,
-                                item,
-                                status=(
-                                    "replied"
-                                    if verified
-                                    else "replied_unverified"
-                                ),
-                                reply=reply,
-                            )
-
-                            self._bump_stat(
-                                state,
-                                "replied",
-                            )
-
-                            state["last_reply_at"] = self._now()
-
-                            # КРИТИЧНО:
-                            # сохраняем сразу после каждого ответа.
-                            # При аварийном рестарте этот комментарий
-                            # уже не попадёт в очередь повторно.
-                            self._save_state(state)
-
-                            self._set_runtime(
-                                stage="posting",
-                                done=idx,
-                                total=total,
-                                detail=(
-                                    f"Публикую ответы в Дзене… "
-                                    f"{idx}/{total}"
-                                ),
-                            )
-
-                            log.info(
-                                "Dzen responder: публикация "
-                                "done %s/%s comment=%s "
-                                "verified=%s",
-                                idx,
-                                total,
-                                comment_ref,
-                                verified,
-                            )
-
-                        except asyncio.TimeoutError:
-                            error = (
-                                "Таймаут публикации ответа "
-                                "после 60 секунд"
-                            )
-
-                            self._bump_stat(
-                                state,
-                                "errors",
-                            )
-                            self._save_state(state)
-
-                            log.error(
-                                "Dzen responder: публикация "
-                                "timeout %s/%s comment=%s",
-                                idx,
-                                total,
-                                comment_ref,
-                            )
-
-                            try:
-                                await self._save_debug(
-                                    page,
-                                    f"reply_timeout_"
-                                    f"{item.comment_id or 'unknown'}",
-                                )
-                            except Exception:
-                                pass
-
-                            results.append(
-                                (
-                                    item,
-                                    reply,
-                                    False,
-                                    error,
-                                    False,
-                                )
-                            )
-
-                            # Ошибка одного комментария
-                            # не должна останавливать очередь.
-                            continue
-
+                            verified = await self._post_one(page, item, reply)
+                            results.append((item, reply, True, "", verified))
                         except Exception as exc:
-                            error = str(exc)
-
-                            self._bump_stat(
-                                state,
-                                "errors",
+                            await self._save_debug(
+                                page,
+                                f"reply_error_{item.comment_id or 'unknown'}",
                             )
-                            self._save_state(state)
-
-                            log.error(
-                                "Dzen responder: публикация "
-                                "error %s/%s comment=%s: %s",
-                                idx,
-                                total,
-                                comment_ref,
-                                error,
-                            )
-
-                            try:
-                                await self._save_debug(
-                                    page,
-                                    f"reply_error_"
-                                    f"{item.comment_id or 'unknown'}",
-                                )
-                            except Exception:
-                                pass
-
-                            results.append(
-                                (
-                                    item,
-                                    reply,
-                                    False,
-                                    error,
-                                    False,
-                                )
-                            )
-
-                            # Переходим к следующему,
-                            # а не останавливаем всю пачку.
-                            continue
-
+                            results.append((item, reply, False, str(exc), False))
                 finally:
                     await context.close()
-
-        log.info(
-            "Dzen responder: публикация завершена "
-            "total=%s success=%s errors=%s",
-            total,
-            sum(1 for r in results if r[2]),
-            sum(1 for r in results if not r[2]),
-        )
-
         return results
 
-    async def _post_one(
-        self,
-        page: Page,
-        item: ResponderComment,
-        reply: str,
-    ) -> bool:
-        await page.goto(
-            item.href,
-            wait_until="domcontentloaded",
-            timeout=90000,
-        )
+    async def _post_one(self, page: Page, item: ResponderComment, reply: str) -> bool:
+        await page.goto(item.href, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_timeout(2500)
         self._assert_authorized(page)
 
-        # Ищем строго карточку нужного комментария.
-        target = await self._find_comment_element(
-            page,
-            item,
-        )
-        if target is None:
-            raise RuntimeError(
-                "Не найдена карточка нужного комментария"
-            )
-
-        try:
-            await target.scroll_into_view_if_needed()
-        except Exception:
-            pass
-
-        # Только локальная кнопка внутри найденной карточки.
-        reply_button = await self._find_reply_button(
-            page,
-            target,
-        )
-        if reply_button is None:
-            raise RuntimeError(
-                "Не найдена локальная кнопка «Ответить»"
-            )
-
-        await reply_button.click(
-            timeout=7000,
-        )
-        await page.wait_for_timeout(500)
-
-        composer = await self._find_composer(
-            page,
-            target,
-        )
-        if composer is None:
-            raise RuntimeError(
-                "После «Ответить» не найдено поле Ваш ответ..."
-            )
-
-        await self._fill_composer(
-            page,
-            composer,
-            reply,
-        )
-
-        await page.wait_for_timeout(300)
-
-        # В текущем DOM Дзена настоящая кнопка отправки:
-        # button[data-testid="send-button"]
-        send_button = await self._find_send_button(
-            page,
-            composer,
-        )
-        if send_button is None:
-            raise RuntimeError(
-                "Не найдена кнопка data-testid=send-button"
-            )
-
-        if not await send_button.is_enabled():
-            raise RuntimeError(
-                "Кнопка отправки ответа неактивна"
-            )
-
-        log.info(
-            "Dzen responder: нажимаю send-button "
-            "comment=%s author=%s",
-            item.comment_id or item.key,
-            item.author,
-        )
-
-        await send_button.click(
-            timeout=7000,
-        )
-
-        # Теперь НЕ считаем сам клик успешной публикацией.
-        # Обязательно ждём появления нашего текста
-        # среди реальных p «Текст комментария».
-        needle = " ".join(reply.split()).strip()
-
-        if len(needle) < 12:
-            raise RuntimeError(
-                "Ответ слишком короткий для проверки публикации"
-            )
-
-        probe = needle[:70].lower()
-
-        # Родительская ветка комментария.
-        thread = target.locator(
-            "xpath=ancestor::div"
-            "[contains(@class,'comments-page__commentNode')][1]"
-        )
-
-        show_replies_clicked = False
-
-        for attempt in range(24):
+        target = await self._find_comment_element(page, item)
+        if target is not None:
             try:
-                texts = thread.locator(
-                    'p[aria-label="Текст комментария"]'
-                )
-
-                count = await texts.count()
-
-                for index in range(count):
-                    value = " ".join(
-                        (
-                            await texts.nth(index).inner_text()
-                        ).split()
-                    ).strip().lower()
-
-                    if probe in value:
-                        log.info(
-                            "Dzen responder: ответ подтверждён "
-                            "в DOM comment=%s",
-                            item.comment_id or item.key,
-                        )
-                        return True
-
+                await target.scroll_into_view_if_needed()
             except Exception:
                 pass
 
-            # Если Дзен свернул ответы — раскрываем ветку
-            # и проверяем повторно.
-            if attempt >= 3 and not show_replies_clicked:
-                try:
-                    buttons = thread.get_by_role(
-                        "button",
-                        name=re.compile(
-                            r"^Показать\s+\d+\s+ответ",
-                            re.I,
-                        ),
-                    )
+        reply_button = await self._find_reply_button(page, target)
+        if reply_button is None:
+            raise RuntimeError("Не найдена кнопка «Ответить» у комментария")
+        await reply_button.click(timeout=7000, force=True)
+        await page.wait_for_timeout(600)
 
-                    for i in range(await buttons.count()):
-                        btn = buttons.nth(i)
-                        if await btn.is_visible():
-                            await btn.click(timeout=5000)
-                            show_replies_clicked = True
-                            await page.wait_for_timeout(500)
-                            break
-                except Exception:
-                    pass
+        composer = await self._find_composer(page, target)
+        if composer is None:
+            raise RuntimeError("После «Ответить» не найдено поле ввода ответа")
 
-            await page.wait_for_timeout(500)
+        await self._fill_composer(page, composer, reply)
+        await page.wait_for_timeout(250)
 
-        # Критично: если текста нет в DOM,
-        # НЕ помечаем комментарий как replied.
-        raise RuntimeError(
-            "После нажатия send-button ответ "
-            "не появился в ветке комментария"
-        )
+        send_button = await self._find_send_button(page, composer)
+        if send_button is not None:
+            await send_button.click(timeout=7000, force=True)
+        else:
+            # Dzen в некоторых вариантах формы отправляет ответ Ctrl+Enter.
+            await composer.focus()
+            await page.keyboard.press("Control+Enter")
+
+        await page.wait_for_timeout(1600)
+
+        # Если текст уже виден — подтверждаем. Если нет, сам успешный клик отправки
+        # всё равно считаем отправкой и помечаем unverified, чтобы не задвоить ответ.
+        needle = " ".join(reply.split())[:80]
+        if len(needle) >= 12:
+            try:
+                visible = page.get_by_text(re.compile(re.escape(needle[:50]), re.I)).last
+                if await visible.count() and await visible.is_visible():
+                    return True
+            except Exception:
+                pass
+        return False
 
     async def _find_comment_element(
         self,
         page: Page,
         item: ResponderComment,
     ) -> Locator | None:
-
-        def normalize(value: str) -> str:
-            return " ".join(
-                str(value or "")
-                .replace("\u00a0", " ")
-                .replace("\u200b", "")
-                .replace("\u2060", "")
-                .replace("\ufeff", "")
-                .split()
-            ).strip()
-
-        target_text = normalize(item.text)
-        target_author = normalize(item.author).casefold()
-
-        async def search_loaded() -> Locator | None:
-            cards = page.locator(
-                'div[class*="editor--comment__block"]'
+        selectors: list[str] = []
+        if item.comment_id:
+            cid = item.comment_id.replace('"', '\\"')
+            selectors.extend(
+                [
+                    f'#comment_{cid}',
+                    f'[id="comment_{cid}"]',
+                    f'[data-comment-id="{cid}"]',
+                    f'[data-id="{cid}"]',
+                    f'[id*="comment_{cid}"]',
+                ]
             )
-
-            count = await cards.count()
-
-            for index in range(count):
-                card = cards.nth(index)
-
-                try:
-                    if not await card.is_visible():
-                        continue
-
-                    text_element = card.locator(
-                        'p[aria-label="Текст комментария"]'
-                    ).first
-
-                    if not await text_element.count():
-                        continue
-
-                    actual_text = normalize(
-                        await text_element.inner_text()
-                    )
-
-                    # Сравниваем именно текст комментария.
-                    if actual_text != target_text:
-                        continue
-
-                    # Определяем автора этой конкретной карточки.
-                    raw = await card.inner_text()
-
-                    lines = [
-                        normalize(x)
-                        for x in raw.splitlines()
-                        if normalize(x)
-                    ]
-
-                    subscriber_index = -1
-
-                    for i, line in enumerate(lines):
-                        if line.casefold() in (
-                            "подписчик",
-                            "автор",
-                        ):
-                            subscriber_index = i
-                            break
-
-                    actual_author = ""
-
-                    if subscriber_index > 0:
-                        actual_author = lines[
-                            subscriber_index - 1
-                        ].casefold()
-
-                    if (
-                        target_author
-                        and actual_author
-                        and actual_author != target_author
-                    ):
-                        continue
-
-                    log.info(
-                        "Dzen responder: точная карточка найдена "
-                        "author=%s text=%s",
-                        item.author,
-                        target_text[:90],
-                    )
-
-                    return card
-
-                except Exception:
-                    continue
-
-            return None
-
-        # Сначала ищем среди уже загруженных карточек.
-        found = await search_loaded()
-
-        if found is not None:
-            return found
-
-        empty_scrolls = 0
-
-        # Затем последовательно раскрываем ветки
-        # «Показать N ответов» и прокручиваем страницу.
-        for attempt in range(120):
-
-            found = await search_loaded()
-
-            if found is not None:
-                return found
-
-            buttons = page.locator("button")
-            button_count = await buttons.count()
-
-            clicked = False
-
-            for index in range(button_count):
-                try:
-                    button = buttons.nth(index)
-
-                    if not await button.is_visible():
-                        continue
-
-                    label = normalize(
-                        await button.inner_text()
-                    )
-
-                    low = label.casefold()
-
-                    if not low.startswith("показать"):
-                        continue
-
-                    if "ответ" not in low:
-                        continue
-
-                    await button.click(
-                        timeout=3500,
-                    )
-
-                    log.debug(
-                        "Dzen responder: раскрываю ветку %s",
-                        label,
-                    )
-
-                    clicked = True
-                    empty_scrolls = 0
-
-                    await page.wait_for_timeout(180)
-
-                    found = await search_loaded()
-
-                    if found is not None:
-                        log.info(
-                            "Dzen responder: карточка найдена "
-                            "после раскрытия ветки author=%s",
-                            item.author,
-                        )
-                        return found
-
-                    # DOM после клика изменился,
-                    # поэтому перечитываем список кнопок.
-                    break
-
-                except Exception:
-                    continue
-
-            if clicked:
+        for selector in selectors:
+            try:
+                loc = page.locator(selector).last
+                if await loc.count() and await loc.is_visible():
+                    return loc
+            except Exception:
                 continue
 
-            # На текущем экране раскрывать больше нечего.
-            # Прокручиваем вниз, чтобы появились следующие ветки.
-            empty_scrolls += 1
-
+        sample = " ".join(item.text.split())[:100]
+        if sample:
             try:
-                await page.evaluate(
-                    """
-                    () => {
-                      const root =
-                        document.scrollingElement ||
-                        document.documentElement;
-
-                      if (root) {
-                        root.scrollTop = Math.min(
-                          root.scrollTop + 2400,
-                          root.scrollHeight
-                        );
-                      }
-
-                      const containers =
-                        document.querySelectorAll(
-                          '[class*="comments-page__"]'
-                        );
-
-                      for (const el of containers) {
-                        try {
-                          if (
-                            el.scrollHeight >
-                            el.clientHeight + 100
-                          ) {
-                            el.scrollTop = Math.min(
-                              el.scrollTop + 2400,
-                              el.scrollHeight
-                            );
-                          }
-                        } catch (_) {}
-                      }
-                    }
-                    """
-                )
-
-                await page.mouse.wheel(
-                    0,
-                    2200,
-                )
-
+                text_loc = page.get_by_text(re.compile(re.escape(sample[:60]), re.I)).first
+                if await text_loc.count():
+                    wrapper = text_loc.locator(
+                        "xpath=ancestor::*[contains(@class,'comment') or @data-comment-id][1]"
+                    )
+                    if await wrapper.count():
+                        return wrapper
+                    return text_loc
             except Exception:
                 pass
-
-            await page.wait_for_timeout(250)
-
-            found = await search_loaded()
-
-            if found is not None:
-                log.info(
-                    "Dzen responder: карточка найдена "
-                    "после прокрутки author=%s",
-                    item.author,
-                )
-                return found
-
-            # Диагностика показала, что 12 прокруток
-            # достаточно для загрузки глубоких карточек.
-            if empty_scrolls >= 20:
-                break
-
-        log.warning(
-            "Dzen responder: точная карточка окончательно "
-            "не найдена author=%s text=%s",
-            item.author,
-            target_text[:120],
-        )
-
         return None
 
     async def _find_reply_button(
@@ -1869,22 +1071,18 @@ class DzenCommentResponderWorker:
         page: Page,
         target: Locator | None,
     ) -> Locator | None:
-        if target is None:
-            return None
-
-        candidate = target.locator(
-            'button[data-testid="reply-button"]'
-        ).first
-
-        try:
-            if (
-                await candidate.count()
-                and await candidate.is_visible()
-            ):
-                return candidate
-        except Exception:
-            pass
-
+        scopes = [target, page] if target is not None else [page]
+        for scope in scopes:
+            if scope is None:
+                continue
+            candidates = [
+                scope.get_by_role("button", name=re.compile(r"^ответить$|^reply$", re.I)),
+                scope.get_by_text(re.compile(r"^ответить$|^reply$", re.I)),
+                scope.locator('[aria-label*="ответ" i], [title*="ответ" i]'),
+            ]
+            found = await self._first_visible(candidates, prefer_last=False)
+            if found is not None:
+                return found
         return None
 
     async def _find_composer(
@@ -1892,89 +1090,53 @@ class DzenCommentResponderWorker:
         page: Page,
         target: Locator | None,
     ) -> Locator | None:
-        if target is None:
-            return None
+        candidates = [
+            page.get_by_placeholder(re.compile(r"ответ|комментар|reply|comment", re.I)),
+            page.locator('textarea:visible'),
+            page.locator('[contenteditable="true"]:visible'),
+        ]
+        return await self._first_visible(candidates, prefer_last=True)
 
-        candidate = target.locator(
-            'textarea[data-testid="comment-textarea"]'
-        ).last
-
+    async def _fill_composer(self, page: Page, composer: Locator, reply: str) -> None:
+        tag = ""
         try:
-            if (
-                await candidate.count()
-                and await candidate.is_visible()
-            ):
-                return candidate
+            tag = (await composer.evaluate("el => el.tagName.toLowerCase()")) or ""
         except Exception:
             pass
-
-        return None
-
-    async def _fill_composer(
-        self,
-        page: Page,
-        composer: Locator,
-        reply: str,
-    ) -> None:
-        # Дзен сам подставляет в textarea:
-        # "Имя пользователя, "
-        # Сохраняем этот префикс, чтобы ответ оставался
-        # именно ответом адресату.
-        prefix = ""
-
-        try:
-            prefix = await composer.input_value()
-        except Exception:
-            prefix = ""
-
-        prefix = str(prefix or "")
-
-        if prefix:
-            prefix_clean = " ".join(
-                prefix.split()
-            ).strip().lower()
-
-            reply_clean = reply.lstrip().lower()
-
-            if (
-                prefix_clean
-                and reply_clean.startswith(prefix_clean)
-            ):
-                value = reply
-            else:
-                value = prefix + reply
-        else:
-            value = reply
-
-        await composer.fill(value)
+        if tag in {"textarea", "input"}:
+            await composer.fill(reply)
+            return
+        await composer.click(timeout=5000, force=True)
+        await page.keyboard.press("Control+A")
+        await page.keyboard.press("Backspace")
+        await page.keyboard.insert_text(reply)
 
     async def _find_send_button(
         self,
         page: Page,
         composer: Locator,
     ) -> Locator | None:
-        container = composer.locator(
-            'xpath=ancestor::*'
-            '[@data-testid="comment-form-container"][1]'
-        )
-
+        form = composer.locator("xpath=ancestor::form[1]")
+        scopes: list[Any] = []
         try:
-            if not await container.count():
-                return None
-
-            candidate = container.locator(
-                'button[data-testid="send-button"]'
-            ).first
-
-            if (
-                await candidate.count()
-                and await candidate.is_visible()
-            ):
-                return candidate
-
+            if await form.count():
+                scopes.append(form)
         except Exception:
             pass
+        scopes.append(page)
 
+        for scope in scopes:
+            candidates = [
+                scope.get_by_role(
+                    "button",
+                    name=re.compile(r"отправить|опубликовать|send|submit", re.I),
+                ),
+                scope.locator('button[type="submit"]'),
+                scope.locator('[aria-label*="отправ" i], [title*="отправ" i]'),
+            ]
+            found = await self._first_visible(candidates, prefer_last=True)
+            if found is not None:
+                return found
         return None
 
     @staticmethod

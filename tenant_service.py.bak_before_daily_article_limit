@@ -140,35 +140,6 @@ class TenantArticleService:
                 await tenant_db.release_topic(user_id, topic_id)
             return {"status": "subscription_inactive", "topic": topic_title}
 
-        # Тариф: максимум один успешно опубликованный
-        # пакет статьи за календарные сутки.
-        #
-        # Один пакет = длинная версия + короткая версия + изображение.
-        used_today = await tenant_db.successful_publications_today(
-            user_id,
-            self.cfg.timezone,
-        )
-
-        if used_today >= 1:
-            if topic_id is not None:
-                await tenant_db.release_topic(
-                    user_id,
-                    topic_id,
-                )
-
-            log.info(
-                "Tenant daily article limit: user=%s used=%s",
-                user_id,
-                used_today,
-            )
-
-            return {
-                "status": "daily_article_limit",
-                "topic": topic_title,
-                "used": used_today,
-                "limit": 1,
-            }
-
         channels = await tenant_db.list_channels(user_id)
         if not channels:
             if topic_id is not None:

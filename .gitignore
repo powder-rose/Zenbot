@@ -8,3 +8,5 @@ __pycache__/
 .venv/
 *.zip
 .env.save
+.env.*
+!.env.example

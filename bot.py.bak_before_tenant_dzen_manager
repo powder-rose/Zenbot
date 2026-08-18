@@ -27,7 +27,6 @@ from article_service import (
     DEFAULT_IMAGE_PROMPT_TEMPLATE,
 )
 from config import load_config
-from cloudpayments_service import CloudPaymentsWebhookServer
 from image_gen import YandexArtClient
 from keyboards import (
     admin_menu,
@@ -45,7 +44,6 @@ from tenant_scheduler import TenantScheduler
 from tenant_service import TenantArticleService
 from dzen_popular_comments import DzenPopularCommentWorker
 from dzen_comment_responder import DzenCommentResponderWorker
-from tenant_dzen_manager import TenantDzenManager
 from paid_multiuse import (
     router as paid_router,
     configure_paid_multiuse,
@@ -91,7 +89,6 @@ tenant_service: TenantArticleService | None = None
 tenant_scheduler: TenantScheduler | None = None
 popular_comment_worker: DzenPopularCommentWorker | None = None
 comment_responder_worker: DzenCommentResponderWorker | None = None
-tenant_dzen_manager: TenantDzenManager | None = None
 
 
 class DzenResponderStates(StatesGroup):
@@ -1384,7 +1381,7 @@ async def cb_stats(call: CallbackQuery):
     )
 
 async def main():
-    global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker, comment_responder_worker, tenant_dzen_manager
+    global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker, comment_responder_worker
 
     await db.init_db(cfg.db_path)
     await tenant_db.init_db(cfg.db_path)
@@ -1396,12 +1393,6 @@ async def main():
     )
 
     bot = Bot(token=cfg.bot_token)
-
-    cloudpayments_webhook = CloudPaymentsWebhookServer(
-        bot=bot,
-    )
-    await cloudpayments_webhook.start()
-
 
     service = ArticleService(
         bot=bot,
@@ -1419,11 +1410,6 @@ async def main():
     )
 
     comment_responder_worker = DzenCommentResponderWorker(
-        gpt_client=gpt_client,
-        cfg=cfg,
-    )
-
-    tenant_dzen_manager = TenantDzenManager(
         gpt_client=gpt_client,
         cfg=cfg,
     )
@@ -1456,7 +1442,6 @@ async def main():
     tenant_scheduler_task = asyncio.create_task(tenant_scheduler.run())
     popular_comment_task = asyncio.create_task(popular_comment_worker.run())
     comment_responder_task = asyncio.create_task(comment_responder_worker.run())
-    tenant_dzen_manager_task = asyncio.create_task(tenant_dzen_manager.run())
     try:
         await dp.start_polling(bot)
     finally:
@@ -1464,13 +1449,11 @@ async def main():
         tenant_scheduler.stop()
         popular_comment_worker.stop()
         comment_responder_worker.stop()
-        tenant_dzen_manager.stop()
         scheduler_task.cancel()
         tenant_scheduler_task.cancel()
         popular_comment_task.cancel()
         comment_responder_task.cancel()
-        tenant_dzen_manager_task.cancel()
-        for task in (scheduler_task, tenant_scheduler_task, popular_comment_task, comment_responder_task, tenant_dzen_manager_task):
+        for task in (scheduler_task, tenant_scheduler_task, popular_comment_task, comment_responder_task):
             try:
                 await task
             except asyncio.CancelledError:
@@ -1481,8 +1464,6 @@ async def main():
                 await service.close()
             except Exception:
                 log.exception("Ошибка закрытия Telegram Web publisher")
-
-        await cloudpayments_webhook.stop()
 
         await bot.session.close()
 

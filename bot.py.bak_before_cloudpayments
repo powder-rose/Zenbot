@@ -27,7 +27,6 @@ from article_service import (
     DEFAULT_IMAGE_PROMPT_TEMPLATE,
 )
 from config import load_config
-from cloudpayments_service import CloudPaymentsWebhookServer
 from image_gen import YandexArtClient
 from keyboards import (
     admin_menu,
@@ -1397,12 +1396,6 @@ async def main():
 
     bot = Bot(token=cfg.bot_token)
 
-    cloudpayments_webhook = CloudPaymentsWebhookServer(
-        bot=bot,
-    )
-    await cloudpayments_webhook.start()
-
-
     service = ArticleService(
         bot=bot,
         cfg=cfg,
@@ -1481,8 +1474,6 @@ async def main():
                 await service.close()
             except Exception:
                 log.exception("Ошибка закрытия Telegram Web publisher")
-
-        await cloudpayments_webhook.stop()
 
         await bot.session.close()
 

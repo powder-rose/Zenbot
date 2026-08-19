@@ -360,29 +360,6 @@ def super_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def super_promos_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Создать промокод",
-                    callback_data="super:promo:add",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить",
-                    callback_data="super:promos",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="admin:home",
-                )
-            ],
-        ]
-    )
 
 
 def super_promos_keyboard() -> InlineKeyboardMarkup:

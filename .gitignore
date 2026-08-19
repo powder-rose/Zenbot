@@ -23,3 +23,9 @@ __pycache__/
 .ruff_cache/
 .DS_Store
 Thumbs.db
+
+# Local secrets / debug artifacts
+.env.save
+.env.*
+!.env.example
+dzen_scan_debug*.zip

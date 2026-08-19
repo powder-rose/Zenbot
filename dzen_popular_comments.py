@@ -669,76 +669,544 @@ class DzenPopularCommentWorker:
             return None
         return dict(preview)
 
-    async def publish_preview(self, preview_id: str) -> dict[str, Any]:
-        async with self._run_lock:
-            preview = self.get_preview(preview_id)
-            if not preview:
-                return {"status": "preview_not_found"}
 
-            result = await self.article_service.publish_prepared_manual(
-                topic_title=str(preview.get("topic") or ""),
-                title=str(preview.get("article_title") or ""),
-                full_body=str(preview.get("full_body") or ""),
-                short_body=str(preview.get("short_body") or ""),
-                image_path=str(preview.get("image_path") or ""),
-                trigger_type="dzen_comment_approved",
+    def get_preview_resolution(
+        self,
+        preview_id: str,
+    ) -> dict[str, Any] | None:
+        if not preview_id:
+            return None
+
+        state = self._load_state()
+
+        item = (
+            state.get(
+                "resolved_previews",
+                {},
             )
-            status = str(result.get("status") or "")
+            or {}
+        ).get(preview_id)
+
+        if not isinstance(
+            item,
+            dict,
+        ):
+            return None
+
+        return dict(item)
+
+
+    def _remember_preview_resolution(
+        self,
+        state: dict[str, Any],
+        *,
+        preview_id: str,
+        status: str,
+        actor_user_id: int | None,
+        actor_name: str | None,
+    ) -> None:
+
+        resolved = state.setdefault(
+            "resolved_previews",
+            {},
+        )
+
+        resolved[preview_id] = {
+            "status": status,
+            "actor_user_id": (
+                int(actor_user_id)
+                if actor_user_id
+                else None
+            ),
+            "actor_name": (
+                str(actor_name or "").strip()
+                or "суперадмин"
+            ),
+            "at": self._now(),
+        }
+
+        # Не даём служебной истории
+        # бесконечно разрастаться.
+        keys = list(
+            resolved.keys()
+        )
+
+        if len(keys) > 300:
+            for old_key in keys[:-300]:
+                resolved.pop(
+                    old_key,
+                    None,
+                )
+
+
+    async def _sync_preview_admin_cards(
+        self,
+        preview: dict[str, Any],
+        *,
+        resolution: str,
+        actor_name: str | None = None,
+    ) -> None:
+        """
+        Обновляет одну и ту же карточку
+        у ВСЕХ суперадминов.
+        """
+
+        refs = preview.get(
+            "admin_messages",
+            [],
+        )
+
+        if not isinstance(
+            refs,
+            list,
+        ):
+            refs = []
+
+        title = str(
+            preview.get(
+                "article_title"
+            )
+            or ""
+        )
+
+        short_body = str(
+            preview.get(
+                "short_body"
+            )
+            or ""
+        )
+
+        actor = (
+            str(actor_name or "").strip()
+            or "суперадмин"
+        )
+
+        if resolution == "published":
+            status_text = (
+                "✅ ОПУБЛИКОВАНО\n"
+                f"Решение принял: {actor}"
+            )
+
+        elif resolution == "rejected":
+            status_text = (
+                "❌ ОТМЕНЕНО\n"
+                f"Решение принял: {actor}"
+            )
+
+        else:
+            status_text = (
+                "ℹ️ Статья уже обработана."
+            )
+
+        text = (
+            "📱 SHORT ДЛЯ TELEGRAM\n\n"
+            f"{title}\n\n"
+            f"{short_body}\n\n"
+            "──────────────\n"
+            f"{status_text}"
+        )
+
+        for ref in refs:
+            if not isinstance(
+                ref,
+                dict,
+            ):
+                continue
+
+            try:
+                chat_id = int(
+                    ref["chat_id"]
+                )
+
+                message_id = int(
+                    ref["message_id"]
+                )
+
+            except Exception:
+                continue
+
+            try:
+                await (
+                    self.article_service
+                    .bot
+                    .edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_markup=None,
+                    )
+                )
+
+            except Exception as exc:
+                # Например, сообщение было
+                # вручную удалено администратором.
+                log.warning(
+                    "Не удалось синхронизировать "
+                    "preview=%s chat=%s msg=%s: %s",
+                    preview.get(
+                        "preview_id"
+                    ),
+                    chat_id,
+                    message_id,
+                    exc,
+                )
+
+
+
+    async def publish_preview(
+        self,
+        preview_id: str,
+        *,
+        actor_user_id: int | None = None,
+        actor_name: str | None = None,
+    ) -> dict[str, Any]:
+
+        async with self._run_lock:
+
+            state = self._load_state()
+
+            pending = state.setdefault(
+                "pending_previews",
+                {},
+            )
+
+            preview = pending.get(
+                preview_id
+            )
+
+            if not isinstance(
+                preview,
+                dict,
+            ):
+                resolved = (
+                    self.get_preview_resolution(
+                        preview_id
+                    )
+                )
+
+                return {
+                    "status": "already_processed",
+                    "preview_id": preview_id,
+                    "resolution": (
+                        resolved.get(
+                            "status"
+                        )
+                        if resolved
+                        else None
+                    ),
+                    "actor_name": (
+                        resolved.get(
+                            "actor_name"
+                        )
+                        if resolved
+                        else None
+                    ),
+                }
+
+            # Копия нужна, потому что ниже
+            # preview будет удалён из pending.
+            preview = dict(
+                preview
+            )
+
+            result = (
+                await self.article_service
+                .publish_prepared_manual(
+                    topic_title=str(
+                        preview.get(
+                            "topic"
+                        )
+                        or ""
+                    ),
+                    title=str(
+                        preview.get(
+                            "article_title"
+                        )
+                        or ""
+                    ),
+                    full_body=str(
+                        preview.get(
+                            "full_body"
+                        )
+                        or ""
+                    ),
+                    short_body=str(
+                        preview.get(
+                            "short_body"
+                        )
+                        or ""
+                    ),
+                    image_path=str(
+                        preview.get(
+                            "image_path"
+                        )
+                        or ""
+                    ),
+                    trigger_type=(
+                        "dzen_comment_approved"
+                    ),
+                )
+            )
+
+            status = str(
+                result.get(
+                    "status"
+                )
+                or ""
+            )
+
             if status == "ok":
+
                 state = self._load_state()
-                pending = state.setdefault("pending_previews", {})
-                pending.pop(preview_id, None)
-                used = state.setdefault("used", {})
-                key = str(preview.get("comment_key") or "")
+
+                pending = state.setdefault(
+                    "pending_previews",
+                    {},
+                )
+
+                pending.pop(
+                    preview_id,
+                    None,
+                )
+
+                used = state.setdefault(
+                    "used",
+                    {},
+                )
+
+                key = str(
+                    preview.get(
+                        "comment_key"
+                    )
+                    or ""
+                )
+
                 if key:
                     used[key] = {
                         "status": "published",
-                        "likes": int(preview.get("likes") or 0),
-                        "text": str(preview.get("comment") or "")[:1500],
-                        "topic": str(preview.get("topic") or ""),
-                        "source_url": str(preview.get("source_url") or ""),
-                        "article_title": str(preview.get("article_title") or ""),
+                        "likes": int(
+                            preview.get(
+                                "likes"
+                            )
+                            or 0
+                        ),
+                        "text": str(
+                            preview.get(
+                                "comment"
+                            )
+                            or ""
+                        )[:1500],
+                        "topic": str(
+                            preview.get(
+                                "topic"
+                            )
+                            or ""
+                        ),
+                        "source_url": str(
+                            preview.get(
+                                "source_url"
+                            )
+                            or ""
+                        ),
+                        "article_title": str(
+                            preview.get(
+                                "article_title"
+                            )
+                            or ""
+                        ),
                         "at": self._now(),
                     }
-                    state["last_published_key"] = key
-                    state["last_published_at"] = self._now()
-                self._save_state(state)
+
+                    state[
+                        "last_published_key"
+                    ] = key
+
+                    state[
+                        "last_published_at"
+                    ] = self._now()
+
+                self._remember_preview_resolution(
+                    state,
+                    preview_id=preview_id,
+                    status="published",
+                    actor_user_id=(
+                        actor_user_id
+                    ),
+                    actor_name=actor_name,
+                )
+
+                self._save_state(
+                    state
+                )
+
+                # После успешной публикации
+                # убираем кнопки сразу У ВСЕХ.
+                await (
+                    self._sync_preview_admin_cards(
+                        preview,
+                        resolution="published",
+                        actor_name=actor_name,
+                    )
+                )
 
             return {
-                "status": status or "publish_error",
+                "status": (
+                    status
+                    or "publish_error"
+                ),
                 "preview_id": preview_id,
-                "topic": preview.get("topic"),
-                "article_title": preview.get("article_title"),
+                "topic": preview.get(
+                    "topic"
+                ),
+                "article_title": (
+                    preview.get(
+                        "article_title"
+                    )
+                ),
                 "publish_result": result,
             }
 
-    def cancel_preview(self, preview_id: str) -> bool:
-        state = self._load_state()
-        pending = state.setdefault("pending_previews", {})
-        preview = pending.pop(preview_id, None)
-        if not isinstance(preview, dict):
-            return False
 
-        key = str(preview.get("comment_key") or "")
-        used = state.setdefault("used", {})
-        if key:
-            used[key] = {
-                "status": "rejected",
-                "likes": int(preview.get("likes") or 0),
-                "text": str(preview.get("comment") or "")[:1500],
-                "topic": str(preview.get("topic") or ""),
-                "source_url": str(preview.get("source_url") or ""),
-                "at": self._now(),
+    async def cancel_preview(
+        self,
+        preview_id: str,
+        *,
+        actor_user_id: int | None = None,
+        actor_name: str | None = None,
+    ) -> dict[str, Any]:
+
+        async with self._run_lock:
+
+            state = self._load_state()
+
+            pending = state.setdefault(
+                "pending_previews",
+                {},
+            )
+
+            preview = pending.pop(
+                preview_id,
+                None,
+            )
+
+            if not isinstance(
+                preview,
+                dict,
+            ):
+                resolved = (
+                    self.get_preview_resolution(
+                        preview_id
+                    )
+                )
+
+                return {
+                    "status": "already_processed",
+                    "preview_id": preview_id,
+                    "resolution": (
+                        resolved.get(
+                            "status"
+                        )
+                        if resolved
+                        else None
+                    ),
+                    "actor_name": (
+                        resolved.get(
+                            "actor_name"
+                        )
+                        if resolved
+                        else None
+                    ),
+                }
+
+            key = str(
+                preview.get(
+                    "comment_key"
+                )
+                or ""
+            )
+
+            used = state.setdefault(
+                "used",
+                {},
+            )
+
+            if key:
+                used[key] = {
+                    "status": "rejected",
+                    "likes": int(
+                        preview.get(
+                            "likes"
+                        )
+                        or 0
+                    ),
+                    "text": str(
+                        preview.get(
+                            "comment"
+                        )
+                        or ""
+                    )[:1500],
+                    "topic": str(
+                        preview.get(
+                            "topic"
+                        )
+                        or ""
+                    ),
+                    "source_url": str(
+                        preview.get(
+                            "source_url"
+                        )
+                        or ""
+                    ),
+                    "at": self._now(),
+                }
+
+            self._remember_preview_resolution(
+                state,
+                preview_id=preview_id,
+                status="rejected",
+                actor_user_id=actor_user_id,
+                actor_name=actor_name,
+            )
+
+            self._save_state(
+                state
+            )
+
+            await (
+                self._sync_preview_admin_cards(
+                    dict(preview),
+                    resolution="rejected",
+                    actor_name=actor_name,
+                )
+            )
+
+            image_path = str(
+                preview.get(
+                    "image_path"
+                )
+                or ""
+            )
+
+            if image_path:
+                try:
+                    Path(
+                        image_path
+                    ).unlink(
+                        missing_ok=True
+                    )
+
+                except Exception:
+                    log.exception(
+                        "Не удалось удалить "
+                        "изображение отменённого "
+                        "preview"
+                    )
+
+            return {
+                "status": "cancelled",
+                "preview_id": preview_id,
             }
-        self._save_state(state)
 
-        image_path = str(preview.get("image_path") or "")
-        if image_path:
-            try:
-                Path(image_path).unlink(missing_ok=True)
-            except Exception:
-                log.exception("Не удалось удалить изображение отменённого preview")
-        return True
 
     async def send_preview_to_admins(
         self,
@@ -746,65 +1214,241 @@ class DzenPopularCommentWorker:
         *,
         chat_ids: list[int] | None = None,
     ) -> None:
-        from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
-        preview_id = str(preview.get("preview_id") or "")
+        from aiogram.types import (
+            BufferedInputFile,
+            InlineKeyboardButton,
+            InlineKeyboardMarkup,
+        )
+
+        preview_id = str(
+            preview.get(
+                "preview_id"
+            )
+            or ""
+        )
+
         if not preview_id:
             return
 
         if chat_ids is None:
-            chat_ids = [int(x) for x in self.cfg.admin_ids]
+            chat_ids = [
+                int(x)
+                for x in self.cfg.admin_ids
+            ]
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
                         text="✅ Опубликовать",
-                        callback_data=f"dzenpc:publish:{preview_id}",
+                        callback_data=(
+                            "dzenpc:publish:"
+                            f"{preview_id}"
+                        ),
                     ),
                     InlineKeyboardButton(
                         text="❌ Отменить",
-                        callback_data=f"dzenpc:cancel:{preview_id}",
+                        callback_data=(
+                            "dzenpc:cancel:"
+                            f"{preview_id}"
+                        ),
                     ),
                 ]
             ]
         )
 
-        comment = str(preview.get("comment") or "")
-        topic = str(preview.get("topic") or "")
-        title = str(preview.get("article_title") or "")
-        full_body = str(preview.get("full_body") or "")
-        short_body = str(preview.get("short_body") or "")
-        image_path = str(preview.get("image_path") or "")
-        likes = int(preview.get("likes") or 0)
-
-        for chat_id in chat_ids:
-            await self.article_service.bot.send_message(
-                chat_id,
-                "🔥 ПРЕДПРОСМОТР ПО ПОПУЛЯРНОМУ КОММЕНТАРИЮ\n\n"
-                f"❤️ Лайков: {likes}\n"
-                f"💬 Комментарий:\n{comment}\n\n"
-                f"📝 Тема:\n{topic}",
+        comment = str(
+            preview.get(
+                "comment"
             )
-            if image_path:
+            or ""
+        )
+
+        topic = str(
+            preview.get(
+                "topic"
+            )
+            or ""
+        )
+
+        title = str(
+            preview.get(
+                "article_title"
+            )
+            or ""
+        )
+
+        full_body = str(
+            preview.get(
+                "full_body"
+            )
+            or ""
+        )
+
+        short_body = str(
+            preview.get(
+                "short_body"
+            )
+            or ""
+        )
+
+        image_path = str(
+            preview.get(
+                "image_path"
+            )
+            or ""
+        )
+
+        likes = int(
+            preview.get(
+                "likes"
+            )
+            or 0
+        )
+
+        # Пока карточки рассылаются,
+        # Publish/Cancel ждут тот же lock.
+        # Поэтому ни один админ не сможет
+        # обработать preview посреди рассылки.
+        async with self._run_lock:
+
+            state = self._load_state()
+
+            pending = state.setdefault(
+                "pending_previews",
+                {},
+            )
+
+            stored = pending.get(
+                preview_id
+            )
+
+            if not isinstance(
+                stored,
+                dict,
+            ):
+                return
+
+            refs = stored.get(
+                "admin_messages",
+                [],
+            )
+
+            if not isinstance(
+                refs,
+                list,
+            ):
+                refs = []
+
+            for chat_id in chat_ids:
+
                 try:
-                    image_bytes = Path(image_path).read_bytes()
-                    await self.article_service.bot.send_photo(
-                        chat_id,
-                        BufferedInputFile(image_bytes, filename=f"preview_{preview_id}.jpg"),
-                        caption="🖼 Картинка статьи",
+                    await (
+                        self.article_service
+                        .bot
+                        .send_message(
+                            chat_id,
+                            "🔥 ПРЕДПРОСМОТР ПО "
+                            "ПОПУЛЯРНОМУ КОММЕНТАРИЮ"
+                            "\n\n"
+                            f"❤️ Лайков: {likes}\n"
+                            "💬 Комментарий:\n"
+                            f"{comment}\n\n"
+                            "📝 Тема:\n"
+                            f"{topic}",
+                        )
                     )
-                except Exception:
-                    log.exception("Не удалось отправить preview image админу")
 
-            await self.article_service.bot.send_message(
-                chat_id,
-                f"📄 LONG ДЛЯ ДЗЕНА\n\n{title}\n\n{full_body}",
-            )
-            await self.article_service.bot.send_message(
-                chat_id,
-                f"📱 SHORT ДЛЯ TELEGRAM\n\n{title}\n\n{short_body}",
-                reply_markup=kb,
+                    if image_path:
+                        try:
+                            image_bytes = (
+                                Path(
+                                    image_path
+                                ).read_bytes()
+                            )
+
+                            await (
+                                self.article_service
+                                .bot
+                                .send_photo(
+                                    chat_id,
+                                    BufferedInputFile(
+                                        image_bytes,
+                                        filename=(
+                                            "preview_"
+                                            f"{preview_id}"
+                                            ".jpg"
+                                        ),
+                                    ),
+                                    caption=(
+                                        "🖼 Картинка статьи"
+                                    ),
+                                )
+                            )
+
+                        except Exception:
+                            log.exception(
+                                "Не удалось отправить "
+                                "preview image админу"
+                            )
+
+                    await (
+                        self.article_service
+                        .bot
+                        .send_message(
+                            chat_id,
+                            "📄 LONG ДЛЯ ДЗЕНА"
+                            "\n\n"
+                            f"{title}\n\n"
+                            f"{full_body}",
+                        )
+                    )
+
+                    short_message = await (
+                        self.article_service
+                        .bot
+                        .send_message(
+                            chat_id,
+                            "📱 SHORT ДЛЯ TELEGRAM"
+                            "\n\n"
+                            f"{title}\n\n"
+                            f"{short_body}",
+                            reply_markup=kb,
+                        )
+                    )
+
+                    ref = {
+                        "chat_id": int(
+                            chat_id
+                        ),
+                        "message_id": int(
+                            short_message.message_id
+                        ),
+                    }
+
+                    if ref not in refs:
+                        refs.append(
+                            ref
+                        )
+
+                except Exception:
+                    log.exception(
+                        "Не удалось отправить "
+                        "preview админу %s",
+                        chat_id,
+                    )
+
+            stored[
+                "admin_messages"
+            ] = refs[-100:]
+
+            pending[
+                preview_id
+            ] = stored
+
+            self._save_state(
+                state
             )
 
     async def _select_candidate(self) -> dict[str, Any]:

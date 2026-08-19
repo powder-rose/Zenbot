@@ -271,6 +271,21 @@ async def authorize_tenant_dzen_by_qr(
                         True,
                     )
 
+                    await bot.send_message(
+                        user_id,
+                        "✅ <b>Дзен уже авторизован.</b>\n\n"
+                        "Повторный вход по QR-коду не требуется. "
+                        "Автоответы могут работать с текущим аккаунтом.",
+                        parse_mode="HTML",
+                    )
+
+                    log.info(
+                        "Tenant Dzen already authorized: "
+                        "user=%s profile=%s",
+                        user_id,
+                        profile,
+                    )
+
                     return {
                         "status": "already_authorized",
                     }

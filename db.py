@@ -141,88 +141,339 @@ async def deactivate_topic(topic_id: int) -> bool:
         await conn.commit()
         return cur.rowcount > 0
 
+
+async def _ensure_priority_columns() -> None:
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            "PRAGMA table_info(topics)"
+        )
+
+        columns = {
+            str(row[1])
+            for row in await cur.fetchall()
+        }
+
+        if "priority" not in columns:
+            await conn.execute(
+                """
+                ALTER TABLE topics
+                ADD COLUMN priority
+                INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
+        if "priority_at" not in columns:
+            await conn.execute(
+                """
+                ALTER TABLE topics
+                ADD COLUMN priority_at TEXT
+                """
+            )
+
+        await conn.commit()
+
+
+async def add_priority_topics(
+    titles: Iterable[str],
+) -> int:
+    await _ensure_priority_columns()
+
+    now = _now()
+    count = 0
+    seen = set()
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+
+        for raw in titles:
+            title = " ".join(
+                str(raw).split()
+            )
+
+            if not title:
+                continue
+
+            key = _key(title)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO topics(
+                    title,
+                    title_key,
+                    active,
+                    reserved,
+                    used_at,
+                    created_at,
+                    priority,
+                    priority_at
+                )
+                VALUES(?,?,1,0,NULL,?,1,?)
+                """,
+                (
+                    title,
+                    key,
+                    now,
+                    now,
+                ),
+            )
+
+            await conn.execute(
+                """
+                UPDATE topics
+                SET
+                    title=?,
+                    active=1,
+                    priority=1,
+                    priority_at=?
+                WHERE title_key=?
+                """,
+                (
+                    title,
+                    now,
+                    key,
+                ),
+            )
+
+            count += 1
+
+        await conn.commit()
+
+    return count
+
+
+async def list_priority_topics(
+    limit: int = 50,
+):
+    await _ensure_priority_columns()
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        conn.row_factory = aiosqlite.Row
+
+        cur = await conn.execute(
+            """
+            SELECT *
+            FROM topics
+            WHERE active=1
+              AND priority=1
+            ORDER BY
+                priority_at ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
+        return await cur.fetchall()
+
+
+async def clear_topic_priority(
+    topic_id: int,
+) -> bool:
+    await _ensure_priority_columns()
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            """
+            UPDATE topics
+            SET
+                priority=0,
+                priority_at=NULL
+            WHERE id=?
+            """,
+            (int(topic_id),),
+        )
+
+        await conn.commit()
+
+        return cur.rowcount > 0
+
+
+
 async def reserve_random_topic():
     """
-    Выбирает тему для очередной статьи.
+    Выбирает тему для очередной плановой статьи.
 
-    Правила:
-    1. Одна и та же тема не должна идти два раза подряд.
-    2. Сначала бот проходит темы, которые ещё ни разу не использовались.
-    3. Когда все темы уже использовались, повторения разрешены.
-    4. Среди повторов приоритет у темы, которая не использовалась дольше всего.
-
-    Если активная тема всего одна, повтор подряд неизбежен — бот использует её,
-    чтобы ежедневная публикация не остановилась.
+    Сначала всегда выбираются приоритетные темы.
+    Обычная очередь используется только тогда,
+    когда приоритетных тем больше нет.
     """
-    async with _DB_LOCK:
-        async with aiosqlite.connect(_path()) as conn:
-            conn.row_factory = aiosqlite.Row
-            await conn.execute("BEGIN IMMEDIATE")
 
-            # Последняя реально созданная публикация.
-            cur = await conn.execute("""
+    await _ensure_priority_columns()
+
+    async with _DB_LOCK:
+        async with aiosqlite.connect(
+            _path()
+        ) as conn:
+            conn.row_factory = aiosqlite.Row
+
+            await conn.execute(
+                "BEGIN IMMEDIATE"
+            )
+
+            cur = await conn.execute(
+                """
                 SELECT topic_id
                 FROM publications
                 WHERE topic_id IS NOT NULL
                 ORDER BY id DESC
                 LIMIT 1
-            """)
-            last_publication = await cur.fetchone()
+                """
+            )
+
+            last_publication = (
+                await cur.fetchone()
+            )
+
             last_topic_id = (
-                int(last_publication["topic_id"])
-                if last_publication is not None
+                int(
+                    last_publication[
+                        "topic_id"
+                    ]
+                )
+                if last_publication
                 else None
             )
 
-            # Если активных тем больше одной, последнюю тему исключаем.
-            cur = await conn.execute("""
-                SELECT COUNT(*)
-                FROM topics
-                WHERE active=1 AND reserved=0
-            """)
-            active_count = int((await cur.fetchone())[0])
-
-            params: list[int] = []
-            exclude_sql = ""
-
-            if last_topic_id is not None and active_count > 1:
-                exclude_sql = "AND id <> ?"
-                params.append(last_topic_id)
+            # ---------------------------------
+            # СНАЧАЛА ПРИОРИТЕТНАЯ ОЧЕРЕДЬ
+            # ---------------------------------
 
             cur = await conn.execute(
-                f"""
-                SELECT *
+                """
+                SELECT COUNT(*)
                 FROM topics
                 WHERE active=1
                   AND reserved=0
-                  {exclude_sql}
-                ORDER BY
-                    CASE WHEN used_at IS NULL THEN 0 ELSE 1 END ASC,
-                    used_at ASC,
-                    RANDOM()
-                LIMIT 1
-                """,
-                tuple(params),
+                  AND priority=1
+                """
             )
-            row = await cur.fetchone()
+
+            priority_count = int(
+                (await cur.fetchone())[0]
+            )
+
+            row = None
+
+            if priority_count > 0:
+                params = []
+                exclude = ""
+
+                # Если срочных тем несколько,
+                # стараемся не повторять
+                # последнюю статью подряд.
+                if (
+                    last_topic_id is not None
+                    and priority_count > 1
+                ):
+                    exclude = "AND id <> ?"
+                    params.append(
+                        last_topic_id
+                    )
+
+                cur = await conn.execute(
+                    f"""
+                    SELECT *
+                    FROM topics
+                    WHERE active=1
+                      AND reserved=0
+                      AND priority=1
+                      {exclude}
+                    ORDER BY
+                        priority_at ASC,
+                        id ASC
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                )
+
+                row = await cur.fetchone()
+
+            # ---------------------------------
+            # ОБЫЧНАЯ ОЧЕРЕДЬ
+            # ---------------------------------
+
+            if row is None:
+                cur = await conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM topics
+                    WHERE active=1
+                      AND reserved=0
+                    """
+                )
+
+                active_count = int(
+                    (await cur.fetchone())[0]
+                )
+
+                params = []
+                exclude = ""
+
+                if (
+                    last_topic_id is not None
+                    and active_count > 1
+                ):
+                    exclude = "AND id <> ?"
+                    params.append(
+                        last_topic_id
+                    )
+
+                cur = await conn.execute(
+                    f"""
+                    SELECT *
+                    FROM topics
+                    WHERE active=1
+                      AND reserved=0
+                      {exclude}
+                    ORDER BY
+                        CASE
+                            WHEN used_at IS NULL
+                            THEN 0
+                            ELSE 1
+                        END ASC,
+                        used_at ASC,
+                        RANDOM()
+                    LIMIT 1
+                    """,
+                    tuple(params),
+                )
+
+                row = await cur.fetchone()
 
             if row is None:
                 await conn.rollback()
                 return None
 
-            upd = await conn.execute("""
+            upd = await conn.execute(
+                """
                 UPDATE topics
                 SET reserved=1
-                WHERE id=? AND reserved=0 AND active=1
-            """, (row["id"],))
+                WHERE id=?
+                  AND reserved=0
+                  AND active=1
+                """,
+                (row["id"],),
+            )
 
             if upd.rowcount != 1:
                 await conn.rollback()
                 return None
 
             await conn.commit()
-            return dict(row)
 
+            return dict(row)
 
 async def release_topic(topic_id: int) -> None:
     async with aiosqlite.connect(_path()) as conn:
@@ -233,13 +484,31 @@ async def release_topic(topic_id: int) -> None:
         await conn.commit()
 
 
-async def mark_topic_used(topic_id: int) -> None:
-    async with aiosqlite.connect(_path()) as conn:
-        await conn.execute("""
+
+async def mark_topic_used(
+    topic_id: int,
+) -> None:
+    await _ensure_priority_columns()
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        await conn.execute(
+            """
             UPDATE topics
-            SET reserved=0, used_at=?
+            SET
+                reserved=0,
+                used_at=?,
+                priority=0,
+                priority_at=NULL
             WHERE id=?
-        """, (_now(), topic_id))
+            """,
+            (
+                _now(),
+                int(topic_id),
+            ),
+        )
+
         await conn.commit()
 
 async def add_manual_used_topic(title: str) -> int:
@@ -423,6 +692,121 @@ async def delete_schedule_time(schedule_id: int) -> bool:
         cur = await conn.execute("DELETE FROM schedule WHERE id=?", (schedule_id,))
         await conn.commit()
         return cur.rowcount > 0
+
+
+async def _ensure_subtopic_history() -> None:
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS
+            article_subtopic_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER,
+                parent_topic TEXT NOT NULL,
+                subtopic TEXT NOT NULL,
+                subtopic_key TEXT NOT NULL UNIQUE,
+                published_at TEXT NOT NULL
+            )
+            """
+        )
+
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_article_subtopic_history_date
+            ON article_subtopic_history(
+                published_at DESC
+            )
+            """
+        )
+
+        await conn.commit()
+
+
+async def list_used_subtopics(
+    parent_topic: str,
+    limit: int = 80,
+) -> list[str]:
+    await _ensure_subtopic_history()
+
+    parent_key = _key(
+        parent_topic
+    )
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            """
+            SELECT subtopic
+            FROM article_subtopic_history
+            WHERE lower(
+                trim(parent_topic)
+            )=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                parent_key,
+                int(limit),
+            ),
+        )
+
+        rows = await cur.fetchall()
+
+    return [
+        str(row[0])
+        for row in rows
+        if row and row[0]
+    ]
+
+
+async def record_used_subtopic(
+    topic_id: int | None,
+    parent_topic: str,
+    subtopic: str,
+) -> None:
+    await _ensure_subtopic_history()
+
+    value = " ".join(
+        str(subtopic).split()
+    )
+
+    if not value:
+        return
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO
+            article_subtopic_history(
+                topic_id,
+                parent_topic,
+                subtopic,
+                subtopic_key,
+                published_at
+            )
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                int(topic_id)
+                if topic_id is not None
+                else None,
+                " ".join(
+                    str(parent_topic).split()
+                ),
+                value,
+                _key(value),
+                _now(),
+            ),
+        )
+
+        await conn.commit()
+
 
 async def create_publication(
     *,

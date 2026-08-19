@@ -54,8 +54,97 @@ class TenantArticleService:
             self._locks[user_id] = lock
         return lock
 
-    async def _generate(self, user_id: int, topic: str) -> tuple[str, str, bytes]:
-        sources = await self.search.search(topic, max_results=8)
+
+    async def _select_auto_subtopic(
+        self,
+        user_id: int,
+        topic_id: int,
+        topic_title: str,
+    ) -> str | None:
+        """
+        Только обычная плановая статья.
+        """
+
+        try:
+            search_query = (
+                f"{topic_title} "
+                "актуальные изменения "
+                "новые требования практика"
+            )
+
+            sources = await self.search.search(
+                search_query,
+                max_results=12,
+            )
+
+            if not sources:
+                return None
+
+            used = (
+                await tenant_db.list_used_subtopics(
+                    user_id,
+                    topic_title,
+                    limit=80,
+                )
+            )
+
+            subtopic = (
+                await self.gpt.select_article_subtopic(
+                    topic=topic_title,
+                    sources=sources,
+                    used_subtopics=used,
+                )
+            )
+
+            subtopic = " ".join(
+                str(subtopic).split()
+            )
+
+            if not subtopic:
+                return None
+
+            if (
+                subtopic.casefold()
+                == topic_title.casefold()
+            ):
+                return None
+
+            log.info(
+                "Tenant плановая подтема: "
+                "user=%s parent=%s subtopic=%s",
+                user_id,
+                topic_title,
+                subtopic,
+            )
+
+            return subtopic
+
+        except Exception:
+            log.exception(
+                "Tenant: не удалось выбрать "
+                "подтему user=%s topic=%s. "
+                "Использую исходную тему.",
+                user_id,
+                topic_title,
+            )
+
+            return None
+
+
+    async def _generate(
+        self,
+        user_id: int,
+        topic: str,
+        subtopic: str | None = None,
+    ) -> tuple[str, str, bytes]:
+        focus_topic = (
+            subtopic or topic
+        ).strip()
+
+        sources = await self.search.search(
+            focus_topic,
+            max_results=8,
+        )
         article_prompt = (
             await tenant_db.get_setting(user_id, "prompt_article_system", "")
         ).strip() or ARTICLE_SYSTEM_PROMPT
@@ -66,13 +155,14 @@ class TenantArticleService:
         title, body = await self.gpt.generate_article_from_sources(
             topic=topic,
             sources=sources,
+            subtopic=subtopic,
             max_chars=3200,
             system_prompt=article_prompt,
         )
         title = clean_article_text(title)
         body = clean_article_text(body)
 
-        image_prompt = build_image_prompt(topic, image_template)
+        image_prompt = build_image_prompt(focus_topic, image_template)
         image_bytes = await self.art.generate_image(image_prompt)
         if not image_bytes:
             raise RuntimeError("YandexART вернул пустое изображение")
@@ -134,6 +224,7 @@ class TenantArticleService:
         topic_id: int | None,
         topic_title: str,
         trigger: str,
+        discover_subtopic: bool = False,
     ) -> dict[str, Any]:
         if not await tenant_db.is_subscription_active(user_id):
             if topic_id is not None:
@@ -175,8 +266,28 @@ class TenantArticleService:
                 await tenant_db.release_topic(user_id, topic_id)
             return {"status": "no_channel", "topic": topic_title}
 
+        selected_subtopic = None
+
+        if (
+            discover_subtopic
+            and topic_id is not None
+        ):
+            selected_subtopic = (
+                await self._select_auto_subtopic(
+                    user_id,
+                    topic_id,
+                    topic_title,
+                )
+            )
+
         try:
-            title, body, image_bytes = await self._generate(user_id, topic_title)
+            title, body, image_bytes = (
+                await self._generate(
+                    user_id,
+                    topic_title,
+                    subtopic=selected_subtopic,
+                )
+            )
         except Exception as exc:
             if topic_id is not None:
                 await tenant_db.release_topic(user_id, topic_id)
@@ -207,6 +318,24 @@ class TenantArticleService:
                 channels_published=published,
                 error="; ".join(errors)[:2000] if errors else None,
             )
+
+            if selected_subtopic:
+                try:
+                    await tenant_db.record_used_subtopic(
+                        user_id,
+                        topic_id,
+                        topic_title,
+                        selected_subtopic,
+                    )
+                except Exception:
+                    log.exception(
+                        "Tenant: не удалось "
+                        "сохранить подтему "
+                        "user=%s subtopic=%s",
+                        user_id,
+                        selected_subtopic,
+                    )
+
             return {
                 "status": "ok",
                 "topic": topic_title,
@@ -243,6 +372,16 @@ class TenantArticleService:
                 topic_id=int(topic["id"]),
                 topic_title=str(topic["title"]),
                 trigger=trigger,
+                discover_subtopic=(
+                    trigger == "auto"
+                    and int(
+                        topic.get(
+                            "priority",
+                            0,
+                        )
+                        or 0
+                    ) == 0
+                ),
             )
 
     async def publish_manual_topic(self, user_id: int, topic_title: str) -> dict[str, Any]:

@@ -690,6 +690,164 @@ def result_text(result: dict) -> str:
         f"Telegram: {result.get('telegram')}"
     )
 
+
+@dp.callback_query(
+    F.data == "urgent:priority:add"
+)
+async def cb_priority_topics_add(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if await deny(call):
+        return
+
+    await state.set_state(
+        AdminStates.waiting_priority_topics
+    )
+
+    await call.answer()
+
+    await call.message.answer(
+        "🔥 <b>Приоритетные темы</b>\n\n"
+        "Пришлите темы одним сообщением.\n"
+        "Каждая новая строка = отдельная тема.\n\n"
+        "Они <b>не будут опубликованы сразу</b>. "
+        "Бот поставит их впереди обычной очереди "
+        "и опубликует в ближайшие плановые слоты.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(
+    AdminStates.waiting_priority_topics
+)
+async def process_priority_topics_add(
+    message: Message,
+    state: FSMContext,
+):
+    if await deny(message):
+        return
+
+    lines = (
+        message.text or ""
+    ).splitlines()
+
+    count = await db.add_priority_topics(
+        lines
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Приоритетная очередь обновлена.</b>\n\n"
+        f"Добавлено/поднято в приоритет: "
+        f"<b>{count}</b>\n\n"
+        "Эти темы будут браться раньше обычных, "
+        "но публикация произойдёт только "
+        "по действующему расписанию.",
+        parse_mode="HTML",
+        reply_markup=urgent_menu(),
+    )
+
+
+@dp.callback_query(
+    F.data == "urgent:priority:list"
+)
+async def cb_priority_topics_list(
+    call: CallbackQuery,
+):
+    if await deny(call):
+        return
+
+    await call.answer()
+
+    rows = await db.list_priority_topics(
+        limit=50
+    )
+
+    if not rows:
+        await call.message.answer(
+            "📋 Приоритетная очередь пуста.",
+            reply_markup=urgent_menu(),
+        )
+        return
+
+    await call.message.answer(
+        "🔥 <b>Приоритетная очередь</b>\n\n"
+        f"Тем в очереди: <b>{len(rows)}</b>\n"
+        "Они будут опубликованы раньше "
+        "обычных тем.",
+        parse_mode="HTML",
+    )
+
+    for number, row in enumerate(
+        rows,
+        start=1,
+    ):
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Снять приоритет",
+                        callback_data=(
+                            "urgent:priority:remove:"
+                            f"{row['id']}"
+                        ),
+                    )
+                ]
+            ]
+        )
+
+        await call.message.answer(
+            f"<b>{number}.</b> "
+            f"{html.escape(str(row['title']))}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "urgent:priority:remove:"
+    )
+)
+async def cb_priority_topic_remove(
+    call: CallbackQuery,
+):
+    if await deny(call):
+        return
+
+    try:
+        topic_id = int(
+            call.data.rsplit(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        await call.answer(
+            "Некорректная тема",
+            show_alert=True,
+        )
+        return
+
+    ok = await db.clear_topic_priority(
+        topic_id
+    )
+
+    await call.answer(
+        "Приоритет снят"
+        if ok
+        else "Тема не найдена"
+    )
+
+    if ok:
+        await call.message.edit_text(
+            "↩️ Приоритет снят.\n\n"
+            "Тема остаётся в обычной очереди."
+        )
+
+
 @dp.callback_query(F.data == "urgent:random")
 async def cb_urgent_random(call: CallbackQuery):
     if await deny(call):
@@ -898,62 +1056,288 @@ async def cb_dzen_preview_now(call: CallbackQuery):
     await handle_preview_creation(call.message, chat_id=call.from_user.id)
 
 
-@dp.callback_query(F.data.startswith("dzenpc:publish:"))
-async def cb_dzen_preview_publish(call: CallbackQuery):
-    if await deny(call):
-        return
-    if popular_comment_worker is None:
-        await call.answer("Сервис ещё не запущен", show_alert=True)
-        return
-    preview_id = call.data.rsplit(":", 1)[1]
-    await call.answer("Публикую")
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    status_message = await call.message.answer(
-        "🚀 Публикую именно эту согласованную версию. Повторной генерации не будет…"
+
+@dp.callback_query(
+    F.data.startswith(
+        "dzenpc:publish:"
     )
-    try:
-        result = await popular_comment_worker.publish_preview(preview_id)
-    except Exception as exc:
-        log.exception("Ошибка публикации согласованного Dzen preview")
-        await status_message.edit_text(f"❌ Ошибка публикации: {exc}")
-        return
-
-    if result.get("status") == "ok":
-        await status_message.edit_text(
-            "✅ Согласованная статья опубликована LONG-постом. "
-            "Дальше сработает обычный цикл Дзен → удаление LONG → SHORT в Telegram."
-        )
-    elif result.get("status") == "preview_not_found":
-        await status_message.edit_text("❌ Этот предпросмотр уже опубликован, отменён или больше не существует.")
-    else:
-        error = (result.get("publish_result") or {}).get("error") or result.get("error") or result.get("status")
-        await status_message.edit_text(f"❌ Не удалось опубликовать предпросмотр: {error}")
-
-
-@dp.callback_query(F.data.startswith("dzenpc:cancel:"))
-async def cb_dzen_preview_cancel(call: CallbackQuery):
+)
+async def cb_dzen_preview_publish(
+    call: CallbackQuery,
+):
     if await deny(call):
         return
+
     if popular_comment_worker is None:
-        await call.answer("Сервис ещё не запущен", show_alert=True)
+        await call.answer(
+            "Сервис ещё не запущен",
+            show_alert=True,
+        )
         return
-    preview_id = call.data.rsplit(":", 1)[1]
-    ok = popular_comment_worker.cancel_preview(preview_id)
-    await call.answer("Предпросмотр отменён" if ok else "Предпросмотр не найден")
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    if ok:
+
+    preview_id = call.data.rsplit(
+        ":",
+        1,
+    )[1]
+
+    await call.answer(
+        "Проверяю статус…"
+    )
+
+    status_message = (
         await call.message.answer(
-            "❌ Предпросмотр отменён. По этому комментарию статья не будет создана повторно, "
-            "пока лидером не станет другой комментарий."
+            "⏳ Проверяю общий статус "
+            "статьи и запускаю публикацию…"
+        )
+    )
+
+    actor_name = (
+        call.from_user.full_name
+        or f"ID {call.from_user.id}"
+    )
+
+    try:
+        result = (
+            await popular_comment_worker
+            .publish_preview(
+                preview_id,
+                actor_user_id=(
+                    call.from_user.id
+                ),
+                actor_name=actor_name,
+            )
         )
 
+    except Exception as exc:
+        log.exception(
+            "Ошибка публикации "
+            "согласованного Dzen preview"
+        )
 
+        await status_message.edit_text(
+            "❌ Ошибка публикации: "
+            f"{exc}"
+        )
+        return
+
+    state = str(
+        result.get(
+            "status"
+        )
+        or ""
+    )
+
+    if state == "ok":
+
+        await status_message.edit_text(
+            "✅ Согласованная статья "
+            "опубликована.\n\n"
+            "Карточки синхронизированы "
+            "у всех суперадминов."
+        )
+
+        return
+
+    if state == "already_processed":
+
+        resolution = str(
+            result.get(
+                "resolution"
+            )
+            or ""
+        )
+
+        actor = str(
+            result.get(
+                "actor_name"
+            )
+            or "другим суперадмином"
+        )
+
+        try:
+            await call.message.edit_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        if resolution == "published":
+            text = (
+                "✅ Эта статья уже опубликована.\n"
+                f"Решение принял: {actor}"
+            )
+
+        elif resolution == "rejected":
+            text = (
+                "❌ Эта статья уже отменена.\n"
+                f"Решение принял: {actor}"
+            )
+
+        else:
+            text = (
+                "ℹ️ Эта статья уже была "
+                "обработана другим "
+                "суперадмином."
+            )
+
+        await status_message.edit_text(
+            text
+        )
+
+        return
+
+    if state == "preview_not_found":
+
+        try:
+            await call.message.edit_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        await status_message.edit_text(
+            "ℹ️ Эта статья уже была "
+            "обработана другим "
+            "суперадмином."
+        )
+
+        return
+
+    error = (
+        (
+            result.get(
+                "publish_result"
+            )
+            or {}
+        ).get(
+            "error"
+        )
+        or result.get(
+            "error"
+        )
+        or state
+    )
+
+    await status_message.edit_text(
+        "❌ Не удалось опубликовать "
+        "предпросмотр: "
+        f"{error}\n\n"
+        "Карточка остаётся активной, "
+        "публикацию можно повторить."
+    )
+
+
+@dp.callback_query(
+    F.data.startswith(
+        "dzenpc:cancel:"
+    )
+)
+async def cb_dzen_preview_cancel(
+    call: CallbackQuery,
+):
+    if await deny(call):
+        return
+
+    if popular_comment_worker is None:
+        await call.answer(
+            "Сервис ещё не запущен",
+            show_alert=True,
+        )
+        return
+
+    preview_id = call.data.rsplit(
+        ":",
+        1,
+    )[1]
+
+    await call.answer(
+        "Проверяю статус…"
+    )
+
+    actor_name = (
+        call.from_user.full_name
+        or f"ID {call.from_user.id}"
+    )
+
+    result = (
+        await popular_comment_worker
+        .cancel_preview(
+            preview_id,
+            actor_user_id=(
+                call.from_user.id
+            ),
+            actor_name=actor_name,
+        )
+    )
+
+    state = str(
+        result.get(
+            "status"
+        )
+        or ""
+    )
+
+    if state == "cancelled":
+
+        await call.message.answer(
+            "❌ Предпросмотр отменён.\n\n"
+            "Карточки синхронизированы "
+            "у всех суперадминов."
+        )
+
+        return
+
+    if state == "already_processed":
+
+        resolution = str(
+            result.get(
+                "resolution"
+            )
+            or ""
+        )
+
+        actor = str(
+            result.get(
+                "actor_name"
+            )
+            or "другим суперадмином"
+        )
+
+        try:
+            await call.message.edit_reply_markup(
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+        if resolution == "published":
+            text = (
+                "✅ Статья уже опубликована.\n"
+                f"Решение принял: {actor}"
+            )
+
+        elif resolution == "rejected":
+            text = (
+                "❌ Статья уже отменена.\n"
+                f"Решение принял: {actor}"
+            )
+
+        else:
+            text = (
+                "ℹ️ Статья уже обработана "
+                "другим суперадмином."
+            )
+
+        await call.message.answer(
+            text
+        )
+
+        return
+
+    await call.message.answer(
+        "ℹ️ Предпросмотр уже "
+        "не находится в очереди."
+    )
 
 # ---------------- АВТООТВЕТЫ НА КОММЕНТАРИИ ДЗЕНА
 
@@ -1444,6 +1828,7 @@ async def main():
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть бота"),
+        BotCommand(command="help", description="Помощь по работе с ботом"),
         BotCommand(command="admin", description="Панель администратора"),
         BotCommand(command="cabinet", description="Мой кабинет"),
         BotCommand(command="buy", description="Оплатить подписку"),

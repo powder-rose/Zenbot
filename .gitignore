@@ -10,3 +10,16 @@ __pycache__/
 .env.save
 .env.*
 !.env.example
+
+# Local backups / temporary files
+*.bak
+*.bak_*
+*.backup
+*.backup_*
+*.old
+*.old_*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+Thumbs.db

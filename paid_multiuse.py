@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 
 import html
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
@@ -52,11 +55,14 @@ _dzen_auth_tasks: set[asyncio.Task[Any]] = set()
 
 
 class PaidStates(StatesGroup):
+    waiting_admin_promo_code = State()
+    waiting_admin_promo_discount = State()
     waiting_promo_code = State()
     waiting_topics = State()
     waiting_edit_topic = State()
     waiting_schedule_time = State()
     waiting_urgent_topic = State()
+    waiting_priority_topics = State()
     waiting_prompt_parts = State()
     waiting_dzen_comments_url = State()
     waiting_dzen_login = State()
@@ -161,7 +167,7 @@ def cabinet_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⏰ Расписание", callback_data="tenant:schedule"),
-                InlineKeyboardButton(text="⚡ Срочная статья", callback_data="tenant:urgent"),
+                InlineKeyboardButton(text="🔥 Срочные статьи", callback_data="tenant:urgent"),
             ],
             [
                 InlineKeyboardButton(text="🧠 Промпты", callback_data="tenant:prompts"),
@@ -190,6 +196,12 @@ def dzen_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🔐 Авторизовать Дзен",
                     callback_data="tenant:dzen:auth",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💬 Комментарии и ответы",
+                    callback_data="tenant:dzen:history:0",
                 )
             ],
             [
@@ -257,15 +269,42 @@ def schedule_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+
 def urgent_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎲 Случайная тема", callback_data="tenant:urgent:random")],
-            [InlineKeyboardButton(text="✍️ Ввести тему", callback_data="tenant:urgent:manual")],
-            [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
+            [
+                InlineKeyboardButton(
+                    text="🔥 Добавить приоритетные темы",
+                    callback_data="tenant:priority:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Приоритетная очередь",
+                    callback_data="tenant:priority:list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚀 Случайную опубликовать сейчас",
+                    callback_data="tenant:urgent:random",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✍️ Свою тему опубликовать сейчас",
+                    callback_data="tenant:urgent:manual",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В кабинет",
+                    callback_data="tenant:home",
+                )
+            ],
         ]
     )
-
 
 def prompts_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -299,8 +338,74 @@ def prompt_edit_keyboard() -> InlineKeyboardMarkup:
 def super_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👥 Клиенты", callback_data="super:users")],
-            [InlineKeyboardButton(text="📊 SaaS статистика", callback_data="super:stats")],
+            [
+                InlineKeyboardButton(
+                    text="👥 Клиенты",
+                    callback_data="super:users",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎟 Промокоды",
+                    callback_data="super:promos",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 SaaS статистика",
+                    callback_data="super:stats",
+                )
+            ],
+        ]
+    )
+
+
+def super_promos_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать промокод",
+                    callback_data="super:promo:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data="super:promos",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="admin:home",
+                )
+            ],
+        ]
+    )
+
+
+def super_promos_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать промокод",
+                    callback_data="super:promo:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data="super:promos",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="super:home",
+                )
+            ],
         ]
     )
 
@@ -543,7 +648,9 @@ async def cb_promo(
     )
 
 
-@router.message(PaidStates.waiting_promo_code)
+@router.message(
+    PaidStates.waiting_promo_code
+)
 async def promo_received(
     message: Message,
     state: FSMContext,
@@ -584,6 +691,55 @@ async def promo_received(
         )
         return
 
+    # -----------------------------------------------------
+    # 100% скидка — подписка уже активирована backend'ом
+    # -----------------------------------------------------
+
+    if result.get("activated"):
+        expiry = str(
+            result.get("expires_at")
+            or ""
+        )
+
+        try:
+            dt = datetime.fromisoformat(
+                expiry
+            )
+
+            if dt.tzinfo is None:
+                dt = dt.replace(
+                    tzinfo=timezone.utc
+                )
+
+            expiry_text = (
+                dt.astimezone(
+                    ZoneInfo("Europe/Moscow")
+                )
+                .strftime("%d.%m.%Y %H:%M")
+            )
+
+        except Exception:
+            expiry_text = expiry or "—"
+
+        await message.answer(
+            "🎉 <b>Промокод применён!</b>\n\n"
+            f"Код: "
+            f"<code>{html.escape(result['code'])}</code>\n"
+            "Скидка: <b>100%</b>\n"
+            "К оплате: <b>0 ₽</b>\n\n"
+            "✅ Подписка активирована "
+            "на 30 дней.\n"
+            f"Действует до: "
+            f"<b>{html.escape(expiry_text)}</b>",
+            parse_mode="HTML",
+            reply_markup=cabinet_keyboard(),
+        )
+        return
+
+    # -----------------------------------------------------
+    # Обычная скидка
+    # -----------------------------------------------------
+
     final_kopecks = int(
         result["final_kopecks"]
     )
@@ -596,9 +752,12 @@ async def promo_received(
 
     await message.answer(
         "✅ <b>Промокод применён.</b>\n\n"
-        f"Код: <code>{html.escape(result['code'])}</code>\n"
-        f"Скидка: <b>{result['discount_percent']}%</b>\n"
-        f"Новая цена: <b>{final_text} ₽</b>.",
+        f"Код: "
+        f"<code>{html.escape(result['code'])}</code>\n"
+        f"Скидка: "
+        f"<b>{result['discount_percent']}%</b>\n"
+        f"Новая цена: "
+        f"<b>{final_text} ₽</b>.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -608,13 +767,17 @@ async def promo_received(
                             f"💳 Оплатить "
                             f"{final_text} ₽"
                         ),
-                        callback_data="billing:buy",
+                        callback_data=(
+                            "billing:buy"
+                        ),
                     )
                 ],
                 [
                     InlineKeyboardButton(
                         text="🗑 Убрать промокод",
-                        callback_data="billing:promo:clear",
+                        callback_data=(
+                            "billing:promo:clear"
+                        ),
                     )
                 ],
             ]
@@ -816,6 +979,449 @@ async def cb_tenant_dzen(
         call.message,
         call.from_user.id,
     )
+
+
+
+def _dzen_history_cut(
+    value: Any,
+    limit: int,
+) -> str:
+    text = " ".join(
+        str(value or "").split()
+    ).strip()
+
+    if len(text) <= limit:
+        return text
+
+    return (
+        text[: max(1, limit - 1)]
+        .rstrip()
+        + "…"
+    )
+
+
+def _dzen_history_time(
+    value: Any,
+    timezone_name: str,
+) -> str:
+    raw = str(value or "").strip()
+
+    if not raw:
+        return "время неизвестно"
+
+    try:
+        dt = datetime.fromisoformat(raw)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        try:
+            tz = ZoneInfo(
+                timezone_name
+            )
+        except Exception:
+            tz = timezone.utc
+
+        return (
+            dt.astimezone(tz)
+            .strftime("%d.%m.%Y %H:%M")
+        )
+
+    except Exception:
+        return raw[:40]
+
+
+async def build_dzen_history(
+    user_id: int,
+    page: int,
+) -> tuple[
+    str,
+    InlineKeyboardMarkup,
+]:
+    _, cfg, _ = _deps()
+
+    row = await tenant_db.tenant_dzen_account(
+        user_id
+    )
+
+    if not row:
+        return (
+            "💬 <b>Комментарии и ответы</b>\n\n"
+            "Аккаунт Дзена пока не подключён.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ К Дзену",
+                            callback_data="tenant:dzen",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    state_file = str(
+        row["state_file"] or ""
+    ).strip()
+
+    if not state_file:
+        return (
+            "💬 <b>Комментарии и ответы</b>\n\n"
+            "История пока отсутствует.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ К Дзену",
+                            callback_data="tenant:dzen",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    try:
+        data = json.loads(
+            Path(state_file).read_text(
+                encoding="utf-8"
+            )
+        )
+    except FileNotFoundError:
+        data = {}
+    except Exception:
+        log.exception(
+            "Не удалось прочитать Dzen "
+            "history: user=%s file=%s",
+            user_id,
+            state_file,
+        )
+        data = {}
+
+    processed = data.get(
+        "processed",
+        {},
+    )
+
+    if not isinstance(
+        processed,
+        dict,
+    ):
+        processed = {}
+
+    rows: list[dict[str, Any]] = []
+
+    for item in processed.values():
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        status = str(
+            item.get("status") or ""
+        ).strip()
+
+        reply = str(
+            item.get("reply") or ""
+        ).strip()
+
+        # Показываем только случаи,
+        # когда бот действительно
+        # подготовил и отправлял ответ.
+        if (
+            status
+            not in {
+                "replied",
+                "replied_unverified",
+            }
+            or not reply
+        ):
+            continue
+
+        rows.append(
+            {
+                "author":
+                    item.get("author"),
+                "comment":
+                    item.get("comment"),
+                "article_title":
+                    item.get(
+                        "article_title"
+                    ),
+                "reply":
+                    reply,
+                "status":
+                    status,
+                "at":
+                    item.get("at"),
+            }
+        )
+
+    rows.sort(
+        key=lambda item: str(
+            item.get("at") or ""
+        ),
+        reverse=True,
+    )
+
+    if not rows:
+        return (
+            "💬 <b>Комментарии и ответы</b>\n\n"
+            "Бот пока не отвечал "
+            "на комментарии.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Обновить",
+                            callback_data=(
+                                "tenant:dzen:"
+                                "history:0"
+                            ),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ К Дзену",
+                            callback_data="tenant:dzen",
+                        )
+                    ],
+                ]
+            ),
+        )
+
+    per_page = 2
+
+    total = len(rows)
+
+    total_pages = max(
+        1,
+        (
+            total
+            + per_page
+            - 1
+        )
+        // per_page,
+    )
+
+    page = max(
+        0,
+        min(
+            int(page),
+            total_pages - 1,
+        ),
+    )
+
+    start = page * per_page
+    end = min(
+        start + per_page,
+        total,
+    )
+
+    current = rows[start:end]
+
+    lines = [
+        "💬 <b>Комментарии и ответы Дзена</b>",
+        "",
+        (
+            f"Всего ответов в истории: "
+            f"<b>{total}</b>"
+        ),
+        (
+            f"Страница: "
+            f"<b>{page + 1}/{total_pages}</b>"
+        ),
+        "",
+    ]
+
+    for index, item in enumerate(
+        current,
+        start=start + 1,
+    ):
+        author = (
+            _dzen_history_cut(
+                item["author"],
+                80,
+            )
+            or "Автор не указан"
+        )
+
+        article = _dzen_history_cut(
+            item["article_title"],
+            150,
+        )
+
+        comment = (
+            _dzen_history_cut(
+                item["comment"],
+                500,
+            )
+            or "—"
+        )
+
+        reply = _dzen_history_cut(
+            item["reply"],
+            700,
+        )
+
+        time_text = _dzen_history_time(
+            item["at"],
+            cfg.timezone,
+        )
+
+        if (
+            item["status"]
+            == "replied"
+        ):
+            status_text = (
+                "✅ публикация подтверждена"
+            )
+        else:
+            status_text = (
+                "⚠️ отправлен, "
+                "подтверждение не получено"
+            )
+
+        lines.append(
+            f"<b>{index}. "
+            f"{html.escape(author)}</b>"
+        )
+
+        if article:
+            lines.append(
+                "📰 <b>Статья:</b> "
+                f"{html.escape(article)}"
+            )
+
+        lines.extend(
+            [
+                "",
+                "💭 <b>Комментарий:</b>",
+                html.escape(comment),
+                "",
+                "🤖 <b>Ответ бота:</b>",
+                html.escape(reply),
+                "",
+                (
+                    f"🕒 {html.escape(time_text)}"
+                    f" · {status_text}"
+                ),
+                "",
+                "──────────────",
+                "",
+            ]
+        )
+
+    buttons: list[
+        list[InlineKeyboardButton]
+    ] = []
+
+    navigation: list[
+        InlineKeyboardButton
+    ] = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️ Предыдущие",
+                callback_data=(
+                    "tenant:dzen:history:"
+                    f"{page - 1}"
+                ),
+            )
+        )
+
+    if page < total_pages - 1:
+        navigation.append(
+            InlineKeyboardButton(
+                text="Следующие ➡️",
+                callback_data=(
+                    "tenant:dzen:history:"
+                    f"{page + 1}"
+                ),
+            )
+        )
+
+    if navigation:
+        buttons.append(
+            navigation
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🔄 Обновить",
+                callback_data=(
+                    "tenant:dzen:history:"
+                    f"{page}"
+                ),
+            )
+        ]
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К Дзену",
+                callback_data="tenant:dzen",
+            )
+        ]
+    )
+
+    return (
+        "\n".join(lines).strip(),
+        InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith(
+        "tenant:dzen:history:"
+    )
+)
+async def cb_tenant_dzen_history(
+    call: CallbackQuery,
+):
+    if not await require_paid(call):
+        return
+
+    try:
+        page = int(
+            call.data.rsplit(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        page = 0
+
+    text, keyboard = (
+        await build_dzen_history(
+            call.from_user.id,
+            page,
+        )
+    )
+
+    await call.answer()
+
+    try:
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        # Например, если Telegram
+        # считает текст неизменившимся.
+        await call.message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
 
 
 @router.callback_query(F.data == "tenant:dzen:auth")
@@ -1373,6 +1979,173 @@ def result_text(result: dict) -> str:
     return mapping.get(status, "❌ Ошибка: " + str(result.get("error", status)))
 
 
+
+@router.callback_query(
+    F.data == "tenant:priority:add"
+)
+async def cb_tenant_priority_add(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not await require_paid(call):
+        return
+
+    await state.set_state(
+        PaidStates.waiting_priority_topics
+    )
+
+    await call.answer()
+
+    await call.message.answer(
+        "🔥 <b>Добавить приоритетные темы</b>\n\n"
+        "Отправьте темы одним сообщением.\n"
+        "Каждая новая строка = отдельная тема.\n\n"
+        "Они не публикуются сразу. "
+        "Бот поставит их впереди обычной очереди "
+        "и будет публиковать по вашему расписанию.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(
+    PaidStates.waiting_priority_topics
+)
+async def tenant_priority_topics_received(
+    message: Message,
+    state: FSMContext,
+):
+    if not await require_paid(message):
+        await state.clear()
+        return
+
+    lines = (
+        message.text or ""
+    ).splitlines()
+
+    count = (
+        await tenant_db.add_priority_topics(
+            message.from_user.id,
+            lines,
+        )
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Приоритетная очередь обновлена.</b>\n\n"
+        f"Добавлено/поднято в приоритет: "
+        f"<b>{count}</b>\n\n"
+        "Следующая плановая публикация сначала "
+        "возьмёт тему из этой очереди.",
+        parse_mode="HTML",
+        reply_markup=urgent_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "tenant:priority:list"
+)
+async def cb_tenant_priority_list(
+    call: CallbackQuery,
+):
+    if not await require_paid(call):
+        return
+
+    await call.answer()
+
+    rows = (
+        await tenant_db.list_priority_topics(
+            call.from_user.id,
+            limit=50,
+        )
+    )
+
+    if not rows:
+        await call.message.answer(
+            "📋 Приоритетная очередь пуста.",
+            reply_markup=urgent_keyboard(),
+        )
+        return
+
+    await call.message.answer(
+        "🔥 <b>Приоритетная очередь</b>\n\n"
+        f"Тем: <b>{len(rows)}</b>\n"
+        "Бот обработает их раньше обычных тем "
+        "в плановые часы публикации.",
+        parse_mode="HTML",
+    )
+
+    for number, row in enumerate(
+        rows,
+        start=1,
+    ):
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="↩️ Снять приоритет",
+                        callback_data=(
+                            "tenant:priority:remove:"
+                            f"{row['id']}"
+                        ),
+                    )
+                ]
+            ]
+        )
+
+        await call.message.answer(
+            f"<b>{number}.</b> "
+            f"{html.escape(str(row['title']))}",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+
+@router.callback_query(
+    F.data.startswith(
+        "tenant:priority:remove:"
+    )
+)
+async def cb_tenant_priority_remove(
+    call: CallbackQuery,
+):
+    if not await require_paid(call):
+        return
+
+    try:
+        topic_id = int(
+            call.data.rsplit(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        await call.answer(
+            "Некорректная тема",
+            show_alert=True,
+        )
+        return
+
+    ok = (
+        await tenant_db.clear_topic_priority(
+            call.from_user.id,
+            topic_id,
+        )
+    )
+
+    await call.answer(
+        "Приоритет снят"
+        if ok
+        else "Тема не найдена"
+    )
+
+    if ok:
+        await call.message.edit_text(
+            "↩️ Приоритет снят.\n\n"
+            "Тема остаётся в обычной очереди."
+        )
+
+
 @router.callback_query(F.data == "tenant:urgent:random")
 async def cb_urgent_random(call: CallbackQuery):
     if not await require_paid(call):
@@ -1551,6 +2324,529 @@ async def cb_stats(call: CallbackQuery):
         f"Последняя статья: {html.escape(stats['last_title'] or '—')}",
         parse_mode="HTML",
         reply_markup=cabinet_keyboard(),
+    )
+
+
+
+
+# =========================================================
+# HELP
+# =========================================================
+
+def help_keyboard(
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="🚀 Быстрый старт",
+                callback_data="help:start",
+            ),
+            InlineKeyboardButton(
+                text="📢 Канал",
+                callback_data="help:channel",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📝 Темы и статьи",
+                callback_data="help:articles",
+            ),
+            InlineKeyboardButton(
+                text="⏰ Расписание",
+                callback_data="help:schedule",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="💬 Дзен",
+                callback_data="help:dzen",
+            ),
+            InlineKeyboardButton(
+                text="🧠 Промпты",
+                callback_data="help:prompts",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="💳 Оплата",
+                callback_data="help:payment",
+            ),
+            InlineKeyboardButton(
+                text="❓ Частые вопросы",
+                callback_data="help:faq",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="⌨️ Все команды",
+                callback_data="help:commands",
+            ),
+        ],
+    ]
+
+    if is_superadmin(user_id):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🛠 Администрирование",
+                    callback_data="help:admin",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def help_back_keyboard(
+    user_id: int,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="⬅️ К разделам помощи",
+                callback_data="help:home",
+            )
+        ]
+    ]
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
+
+
+def help_home_text(
+    user_id: int,
+) -> str:
+    admin_note = ""
+
+    if is_superadmin(user_id):
+        admin_note = (
+            "\n\n🛠 Для вашего аккаунта также доступен "
+            "раздел администрирования."
+        )
+
+    return (
+        "❓ <b>Помощь по работе с ботом</b>\n\n"
+
+        "Бот автоматизирует подготовку и публикацию "
+        "контента: помогает управлять темами, "
+        "создаёт статьи и изображения, работает "
+        "по расписанию и может отвечать на комментарии "
+        "в Дзене.\n\n"
+
+        "<b>Рекомендуемый порядок настройки:</b>\n"
+        "1️⃣ Оформить или проверить подписку.\n"
+        "2️⃣ Подключить Telegram-канал.\n"
+        "3️⃣ Добавить темы статей.\n"
+        "4️⃣ Настроить расписание.\n"
+        "5️⃣ При необходимости изменить промпты.\n"
+        "6️⃣ Подключить Дзен для автоответов.\n\n"
+
+        "Выберите раздел ниже, чтобы посмотреть "
+        "подробную инструкцию."
+        + admin_note
+    )
+
+
+def help_section_text(
+    section: str,
+    user_id: int,
+) -> str:
+    if section == "start":
+        return (
+            "🚀 <b>Быстрый старт</b>\n\n"
+
+            "<b>1. Откройте кабинет</b>\n"
+            "Команда: /cabinet\n\n"
+
+            "<b>2. Проверьте подписку</b>\n"
+            "Откройте раздел «💳 Подписка». "
+            "Без активной подписки основные функции "
+            "пользовательского кабинета недоступны.\n\n"
+
+            "<b>3. Подключите канал</b>\n"
+            "Откройте «📢 Мой канал» → "
+            "«➕ Подключить канал» и выберите канал, "
+            "в который бот будет публиковать материалы.\n\n"
+
+            "<b>4. Добавьте темы</b>\n"
+            "Откройте «📝 Темы» → "
+            "«➕ Добавить темы». Каждая строка "
+            "сообщения считается отдельной темой.\n\n"
+
+            "<b>5. Настройте расписание</b>\n"
+            "Добавьте удобное время публикации и "
+            "включите автопубликацию.\n\n"
+
+            "<b>6. Готово</b>\n"
+            "После этого бот сможет автоматически "
+            "брать новые темы и готовить публикации."
+        )
+
+    if section == "channel":
+        return (
+            "📢 <b>Подключение Telegram-канала</b>\n\n"
+
+            "Откройте:\n"
+            "<b>/cabinet → 📢 Мой канал → "
+            "➕ Подключить канал</b>.\n\n"
+
+            "Telegram предложит выбрать канал. "
+            "Бот должен иметь права, необходимые "
+            "для публикации сообщений в этом канале.\n\n"
+
+            "После подключения канал появится "
+            "в вашем кабинете и будет использоваться "
+            "для автоматических и срочных публикаций.\n\n"
+
+            "Если бот не может публиковать, сначала "
+            "проверьте его права администратора "
+            "в настройках самого Telegram-канала."
+        )
+
+    if section == "articles":
+        return (
+            "📝 <b>Темы и создание статей</b>\n\n"
+
+            "<b>Добавление тем</b>\n"
+            "Откройте «📝 Темы» → "
+            "«➕ Добавить темы» и отправьте темы "
+            "одним сообщением.\n\n"
+
+            "Пример:\n"
+            "<code>Пожарная безопасность на складе\n"
+            "Обучение по охране труда\n"
+            "Паспорт безопасности объекта</code>\n\n"
+
+            "Каждая новая строка — отдельная тема.\n\n"
+
+            "<b>Новые</b> — темы, которые ещё "
+            "не были использованы.\n"
+            "<b>Использованные</b> — темы, по которым "
+            "публикация уже выполнялась.\n\n"
+
+            "Темы можно редактировать и удалять.\n\n"
+
+            "<b>⚡ Срочная статья</b>\n"
+            "Позволяет не ждать расписания. Можно "
+            "взять случайную тему из очереди либо "
+            "ввести тему вручную."
+        )
+
+    if section == "schedule":
+        return (
+            "⏰ <b>Расписание публикаций</b>\n\n"
+
+            "Откройте:\n"
+            "<b>/cabinet → ⏰ Расписание</b>.\n\n"
+
+            "Здесь можно:\n"
+            "• добавить время публикации;\n"
+            "• удалить ненужное время;\n"
+            "• включить или выключить "
+            "автопубликацию.\n\n"
+
+            "Время вводится в формате "
+            "<code>ЧЧ:ММ</code>, например "
+            "<code>09:00</code> или "
+            "<code>18:30</code>.\n\n"
+
+            "Бот работает в часовом поясе, "
+            "который указан в вашем кабинете.\n\n"
+
+            "Если автопубликация выключена, "
+            "расписание сохраняется, но статьи "
+            "по нему не запускаются."
+        )
+
+    if section == "dzen":
+        limit = (
+            10
+            if is_superadmin(user_id)
+            else 3
+        )
+
+        return (
+            "💬 <b>Автоответы в Дзене</b>\n\n"
+
+            "Откройте раздел <b>💬 Дзен</b> "
+            "в пользовательском кабинете.\n\n"
+
+            "<b>Первичная настройка:</b>\n"
+            "1️⃣ Укажите страницу комментариев "
+            "вашего Дзена.\n"
+            "2️⃣ Нажмите «🔐 Авторизовать Дзен».\n"
+            "3️⃣ Отсканируйте QR-код и войдите "
+            "в Яндекс со своего устройства.\n"
+            "4️⃣ После успешной авторизации "
+            "автоответы могут работать автоматически.\n\n"
+
+            "Пароль от Яндекса боту передавать "
+            "не требуется.\n\n"
+
+            f"Текущий дневной лимит для вашего "
+            f"аккаунта: <b>до {limit} подтверждённых "
+            "ответов в сутки</b>.\n\n"
+
+            "В разделе «💬 Комментарии и ответы» "
+            "можно посмотреть историю комментариев "
+            "и ответов, которые подготовил бот.\n\n"
+
+            "В дневной лимит учитываются только "
+            "ответы, публикация которых успешно "
+            "подтверждена."
+        )
+
+    if section == "prompts":
+        return (
+            "🧠 <b>Промпты</b>\n\n"
+
+            "Промпт определяет, <b>как именно</b> "
+            "ИИ должен создавать контент.\n\n"
+
+            "Откройте:\n"
+            "<b>/cabinet → 🧠 Промпты</b>.\n\n"
+
+            "Выберите нужный тип промпта. "
+            "Далее можно посмотреть текущую версию, "
+            "отредактировать её или вернуть "
+            "стандартный вариант.\n\n"
+
+            "После сохранения новый промпт "
+            "применяется к следующим генерациям. "
+            "Уже опубликованные материалы "
+            "не изменяются.\n\n"
+
+            "Если вы не уверены, что менять, "
+            "оставьте стандартный промпт — "
+            "бот продолжит работать."
+        )
+
+    if section == "payment":
+        return (
+            "💳 <b>Подписка и оплата</b>\n\n"
+
+            "Команда <b>/subscription</b> показывает "
+            "текущий статус и срок подписки.\n\n"
+
+            "Команда <b>/buy</b> открывает процесс "
+            "оформления подписки.\n\n"
+
+            "Если у вас есть промокод, примените его "
+            "перед оплатой через соответствующую "
+            "кнопку в разделе подписки.\n\n"
+
+            "<b>Промокод со скидкой 1–99%</b>\n"
+            "уменьшает стоимость оплаты.\n\n"
+
+            "<b>Промокод 100%</b>\n"
+            "не требует оплаты и после успешного "
+            "применения активирует доступ на "
+            "<b>30 дней</b>.\n\n"
+
+            "Один и тот же пользователь не может "
+            "повторно использовать уже применённый "
+            "им промокод."
+        )
+
+    if section == "faq":
+        return (
+            "❓ <b>Частые вопросы</b>\n\n"
+
+            "<b>Бот не публикует в канал</b>\n"
+            "Проверьте, подключён ли нужный канал "
+            "и есть ли у бота права на публикацию.\n\n"
+
+            "<b>Статья не выходит по расписанию</b>\n"
+            "Проверьте, включена ли автопубликация "
+            "и есть ли новые темы в очереди.\n\n"
+
+            "<b>Закончились темы</b>\n"
+            "Добавьте новые через раздел «📝 Темы» "
+            "или создайте срочную статью вручную.\n\n"
+
+            "<b>Изменил промпт, но старая статья "
+            "не изменилась</b>\n"
+            "Это нормально: новый промпт применяется "
+            "только к следующим генерациям.\n\n"
+
+            "<b>Дзен перестал отвечать</b>\n"
+            "Откройте раздел Дзен, обновите статус "
+            "и проверьте авторизацию.\n\n"
+
+            "<b>Где посмотреть статистику?</b>\n"
+            "В кабинете откройте «📊 Статистика»."
+        )
+
+    if section == "commands":
+        text = (
+            "⌨️ <b>Основные команды</b>\n\n"
+
+            "<b>/start</b> — открыть бота.\n"
+            "<b>/help</b> — эта инструкция.\n"
+            "<b>/cabinet</b> — пользовательский кабинет.\n"
+            "<b>/buy</b> — оформить подписку.\n"
+            "<b>/subscription</b> — проверить подписку.\n"
+        )
+
+        if is_superadmin(user_id):
+            text += (
+                "\n<b>Команды суперадмина</b>\n"
+                "<b>/admin</b> — основная админ-панель.\n"
+                "<b>/super</b> — управление "
+                "пользователями SaaS.\n"
+                "<b>/grant USER_ID DAYS</b> — "
+                "выдать доступ вручную.\n"
+                "<b>/revoke USER_ID</b> — "
+                "отозвать доступ."
+            )
+
+        return text
+
+    if section == "admin":
+        if not is_superadmin(user_id):
+            return (
+                "⛔ Этот раздел доступен "
+                "только суперадмину."
+            )
+
+        return (
+            "🛠 <b>Администрирование</b>\n\n"
+
+            "<b>/admin</b> — основная панель "
+            "управления ботом.\n\n"
+
+            "<b>🎟 Промокоды</b>\n"
+            "В админ-панели можно открыть список "
+            "промокодов, создать новый или удалить "
+            "действующий.\n\n"
+
+            "При создании указывается код и скидка "
+            "от <b>1 до 100%</b>.\n\n"
+
+            "Промокод со скидкой <b>100%</b> "
+            "активирует пользователю подписку "
+            "на 30 дней без CloudPayments.\n\n"
+
+            "При удалении промокод перестаёт "
+            "работать для новых применений, "
+            "но история уже совершённых "
+            "использований сохраняется.\n\n"
+
+            "<b>/grant USER_ID DAYS</b> — "
+            "выдать подписку вручную.\n"
+            "<b>/revoke USER_ID</b> — "
+            "отозвать подписку.\n"
+            "<b>/super</b> — посмотреть "
+            "SaaS-панель и пользователей."
+        )
+
+    return help_home_text(user_id)
+
+
+@router.message(Command("help"))
+async def cmd_help(
+    message: Message,
+    state: FSMContext,
+):
+    await state.clear()
+
+    if message.from_user:
+        await tenant_db.touch_user(
+            message.from_user
+        )
+
+    user_id = (
+        message.from_user.id
+        if message.from_user
+        else 0
+    )
+
+    await message.answer(
+        help_home_text(user_id),
+        parse_mode="HTML",
+        reply_markup=help_keyboard(
+            user_id
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "help:home"
+)
+async def cb_help_home(
+    call: CallbackQuery,
+):
+    user_id = call.from_user.id
+
+    await call.answer()
+
+    await call.message.edit_text(
+        help_home_text(user_id),
+        parse_mode="HTML",
+        reply_markup=help_keyboard(
+            user_id
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith("help:")
+)
+async def cb_help_section(
+    call: CallbackQuery,
+):
+    user_id = call.from_user.id
+
+    section = call.data.split(
+        ":",
+        1,
+    )[1]
+
+    allowed = {
+        "start",
+        "channel",
+        "articles",
+        "schedule",
+        "dzen",
+        "prompts",
+        "payment",
+        "faq",
+        "commands",
+        "admin",
+    }
+
+    if section not in allowed:
+        await call.answer(
+            "Раздел не найден",
+            show_alert=True,
+        )
+        return
+
+    if (
+        section == "admin"
+        and not is_superadmin(user_id)
+    ):
+        await call.answer(
+            "Нет доступа",
+            show_alert=True,
+        )
+        return
+
+    await call.answer()
+
+    await call.message.edit_text(
+        help_section_text(
+            section,
+            user_id,
+        ),
+        parse_mode="HTML",
+        reply_markup=help_back_keyboard(
+            user_id
+        ),
     )
 
 
@@ -1786,3 +3082,563 @@ async def cmd_promo_off(
             "❌ Такой промокод не найден."
         )
 
+
+
+# =========================================================
+# SUPERADMIN PROMOCODES UI
+# =========================================================
+
+@router.callback_query(
+    F.data == "super:home"
+)
+async def cb_super_home_promos(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        return
+
+    await state.clear()
+    await call.answer()
+
+    await call.message.answer(
+        "⚙️ <b>Панель суперадмина</b>",
+        parse_mode="HTML",
+        reply_markup=super_keyboard(),
+    )
+
+
+@router.callback_query(
+    F.data == "super:promos"
+)
+async def cb_super_promos(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Нет доступа",
+            show_alert=True,
+        )
+        return
+
+    await state.clear()
+    await call.answer()
+
+    rows = await list_promo_codes()
+
+    # В интерфейсе показываем только
+    # действующие промокоды.
+    active_rows = [
+        row
+        for row in rows
+        if bool(int(row["active"]))
+    ]
+
+    lines = [
+        "🎟 <b>Промокоды</b>",
+        "",
+    ]
+
+    buttons = []
+
+    if not active_rows:
+        lines.append(
+            "Активных промокодов пока нет."
+        )
+
+    else:
+        for index, row in enumerate(
+            active_rows[:40]
+        ):
+            code = str(
+                row["code"]
+            )
+
+            percent = int(
+                row["discount_percent"]
+            )
+
+            uses = int(
+                row["uses"]
+            )
+
+            if percent == 100:
+                price_text = "бесплатно"
+            else:
+                price = int(
+                    1200
+                    * (100 - percent)
+                    / 100
+                )
+
+                price_text = (
+                    f"{price} ₽"
+                )
+
+            lines.append(
+                f"🟢 <code>"
+                f"{html.escape(code)}"
+                f"</code> — "
+                f"<b>{percent}%</b>\n"
+                f"Цена: {price_text}\n"
+                f"Использований: {uses}"
+            )
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=(
+                            f"🗑 Удалить {code[:24]}"
+                        ),
+                        callback_data=(
+                            "super:promo:pick:"
+                            f"{index}"
+                        ),
+                    )
+                ]
+            )
+
+    buttons.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать промокод",
+                    callback_data=(
+                        "super:promo:add"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data=(
+                        "super:promos"
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=(
+                        "admin:home"
+                    ),
+                )
+            ],
+        ]
+    )
+
+    await call.message.answer(
+        "\n\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
+@router.callback_query(
+    F.data.startswith(
+        "super:promo:pick:"
+    )
+)
+async def cb_super_promo_delete_pick(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Нет доступа",
+            show_alert=True,
+        )
+        return
+
+    try:
+        index = int(
+            call.data.rsplit(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        await call.answer(
+            "Некорректный промокод",
+            show_alert=True,
+        )
+        return
+
+    rows = await list_promo_codes()
+
+    active_rows = [
+        row
+        for row in rows
+        if bool(int(row["active"]))
+    ]
+
+    if (
+        index < 0
+        or index >= len(active_rows)
+    ):
+        await call.answer(
+            "Список изменился. "
+            "Откройте промокоды заново.",
+            show_alert=True,
+        )
+        return
+
+    row = active_rows[index]
+
+    code = str(
+        row["code"]
+    )
+
+    percent = int(
+        row["discount_percent"]
+    )
+
+    await state.update_data(
+        super_delete_promo_code=code
+    )
+
+    await call.answer()
+
+    await call.message.answer(
+        "⚠️ <b>Удалить промокод?</b>\n\n"
+        f"Код: "
+        f"<code>{html.escape(code)}</code>\n"
+        f"Скидка: <b>{percent}%</b>\n\n"
+        "После удаления новые пользователи "
+        "не смогут его применить.\n"
+        "История уже совершённых активаций "
+        "сохранится.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Да, удалить",
+                        callback_data=(
+                            "super:promo:"
+                            "confirm_delete"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="❌ Отмена",
+                        callback_data=(
+                            "super:promo:"
+                            "cancel_delete"
+                        ),
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "super:promo:confirm_delete"
+)
+async def cb_super_promo_delete_confirm(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Нет доступа",
+            show_alert=True,
+        )
+        return
+
+    data = await state.get_data()
+
+    code = str(
+        data.get(
+            "super_delete_promo_code"
+        )
+        or ""
+    ).strip()
+
+    if not code:
+        await state.clear()
+
+        await call.answer(
+            "Промокод не выбран",
+            show_alert=True,
+        )
+        return
+
+    ok = await disable_promo_code(
+        code
+    )
+
+    await state.clear()
+
+    if not ok:
+        await call.answer(
+            "Промокод уже удалён "
+            "или не найден",
+            show_alert=True,
+        )
+        return
+
+    await call.answer(
+        "Промокод удалён"
+    )
+
+    await call.message.edit_text(
+        "✅ <b>Промокод удалён.</b>\n\n"
+        f"<code>{html.escape(code)}</code>\n\n"
+        "Он больше не действует.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🎟 К промокодам",
+                        callback_data=(
+                            "super:promos"
+                        ),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ В админ-панель",
+                        callback_data=(
+                            "admin:home"
+                        ),
+                    )
+                ],
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "super:promo:cancel_delete"
+)
+async def cb_super_promo_delete_cancel(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        return
+
+    await state.clear()
+
+    await call.answer(
+        "Удаление отменено"
+    )
+
+    await call.message.edit_text(
+        "❌ Удаление промокода отменено.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🎟 К промокодам",
+                        callback_data=(
+                            "super:promos"
+                        ),
+                    )
+                ]
+            ]
+        ),
+    )
+
+
+@router.callback_query(
+    F.data == "super:promo:add"
+)
+async def cb_super_promo_add(
+    call: CallbackQuery,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        call.from_user.id
+    ):
+        return
+
+    await state.set_state(
+        PaidStates.waiting_admin_promo_code
+    )
+
+    await call.answer()
+
+    await call.message.answer(
+        "🎟 <b>Создание промокода</b>\n\n"
+        "Введите название промокода.\n\n"
+        "Например:\n"
+        "<code>WELCOME20</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(
+    PaidStates.waiting_admin_promo_code
+)
+async def super_promo_code_received(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await state.clear()
+        return
+
+    code = (
+        message.text or ""
+    ).strip().upper()
+
+    if len(code) < 2:
+        await message.answer(
+            "❌ Код слишком короткий. "
+            "Введите другой."
+        )
+        return
+
+    if len(code) > 40:
+        await message.answer(
+            "❌ Максимум 40 символов."
+        )
+        return
+
+    await state.update_data(
+        admin_promo_code=code
+    )
+
+    await state.set_state(
+        PaidStates.waiting_admin_promo_discount
+    )
+
+    await message.answer(
+        "Теперь укажите размер скидки "
+        "от <b>1 до 100%</b>.\n\n"
+        "Например:\n"
+        "<code>20</code>\n\n"
+        "Для бесплатной подписки:\n"
+        "<code>100</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(
+    PaidStates.waiting_admin_promo_discount
+)
+async def super_promo_discount_received(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(
+        message.from_user.id
+    ):
+        await state.clear()
+        return
+
+    raw = (
+        message.text or ""
+    ).strip().replace("%", "")
+
+    try:
+        percent = int(raw)
+    except ValueError:
+        await message.answer(
+            "❌ Введите число от 1 до 100."
+        )
+        return
+
+    if not 1 <= percent <= 100:
+        await message.answer(
+            "❌ Скидка должна быть "
+            "от 1 до 100%."
+        )
+        return
+
+    data = await state.get_data()
+
+    code = str(
+        data.get(
+            "admin_promo_code"
+        )
+        or ""
+    ).strip()
+
+    if not code:
+        await state.clear()
+
+        await message.answer(
+            "❌ Код промокода потерян. "
+            "Создайте его заново.",
+            reply_markup=(
+                super_promos_keyboard()
+            ),
+        )
+        return
+
+    try:
+        promo = await create_promo_code(
+            code,
+            percent,
+        )
+    except Exception as exc:
+        log.exception(
+            "Ошибка создания promo "
+            "из superadmin UI"
+        )
+
+        await message.answer(
+            "❌ Не удалось создать "
+            "промокод:\n"
+            f"<code>{html.escape(str(exc))}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    await state.clear()
+
+    if percent == 100:
+        price_text = (
+            "0 ₽ — подписка активируется "
+            "сразу после ввода промокода"
+        )
+    else:
+        final_kopecks = int(
+            promo["final_kopecks"]
+        )
+
+        final_text = (
+            f"{final_kopecks / 100:,.2f}"
+            .replace(",", " ")
+            .replace(".00", "")
+        )
+
+        price_text = (
+            f"{final_text} ₽"
+        )
+
+    await message.answer(
+        "✅ <b>Промокод создан</b>\n\n"
+        f"Код: "
+        f"<code>{html.escape(promo['code'])}</code>\n"
+        f"Скидка: "
+        f"<b>{promo['discount_percent']}%</b>\n"
+        f"Цена: <b>{price_text}</b>\n\n"
+        "Один пользователь может "
+        "использовать промокод один раз.",
+        parse_mode="HTML",
+        reply_markup=(
+            super_promos_keyboard()
+        ),
+    )

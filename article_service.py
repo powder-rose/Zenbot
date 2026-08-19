@@ -429,17 +429,94 @@ class ArticleService:
     async def close(self) -> None:
         await self.telegram_web.close()
 
+
+    async def _select_auto_subtopic(
+        self,
+        topic_id: int,
+        topic_title: str,
+    ) -> str | None:
+        """
+        Используется ТОЛЬКО для обычной
+        плановой публикации.
+        """
+
+        try:
+            search_query = (
+                f"{topic_title} "
+                "актуальные изменения "
+                "новые требования практика"
+            )
+
+            sources = await self.search.search(
+                search_query,
+                max_results=12,
+            )
+
+            if not sources:
+                return None
+
+            used = await db.list_used_subtopics(
+                topic_title,
+                limit=80,
+            )
+
+            subtopic = (
+                await self.gpt.select_article_subtopic(
+                    topic=topic_title,
+                    sources=sources,
+                    used_subtopics=used,
+                )
+            )
+
+            subtopic = " ".join(
+                str(subtopic).split()
+            )
+
+            if not subtopic:
+                return None
+
+            if (
+                subtopic.casefold()
+                == topic_title.casefold()
+            ):
+                return None
+
+            log.info(
+                "Плановая подтема: "
+                "parent=%s subtopic=%s",
+                topic_title,
+                subtopic,
+            )
+
+            return subtopic
+
+        except Exception:
+            log.exception(
+                "Не удалось выбрать плановую "
+                "подтему для %s. "
+                "Использую исходную тему.",
+                topic_title,
+            )
+
+            return None
+
+
     async def _generate(
         self,
         topic_title: str,
+        subtopic: str | None = None,
     ) -> tuple[
         str,
         str,
         str,
         bytes,
     ]:
+        focus_topic = (
+            subtopic or topic_title
+        ).strip()
+
         sources = await self.search.search(
-            topic_title,
+            focus_topic,
             max_results=8,
         )
 
@@ -466,8 +543,9 @@ class ArticleService:
 
         # Long-версия: около 3000 символов с пробелами.
         title, full_body = await self.gpt.generate_article_from_sources(
-            topic=topic_title,
+            topic=focus_topic,
             sources=sources,
+            subtopic=subtopic,
             max_chars=3200,
             system_prompt=article_system_prompt,
         )
@@ -504,7 +582,7 @@ class ArticleService:
         )
 
         prompt = build_image_prompt(
-            topic_title,
+            focus_topic,
             image_prompt_template,
         )
 
@@ -756,6 +834,31 @@ class ArticleService:
                 "title"
             ]
 
+
+            selected_subtopic = None
+
+            # Автоподбор подтемы работает
+            # ТОЛЬКО для обычной плановой статьи.
+            #
+            # urgent_random -> без подбора
+            # priority=1   -> без подбора
+            if (
+                trigger == "auto"
+                and int(
+                    topic.get(
+                        "priority",
+                        0,
+                    )
+                    or 0
+                ) == 0
+            ):
+                selected_subtopic = (
+                    await self._select_auto_subtopic(
+                        topic_id,
+                        topic_title,
+                    )
+                )
+
             try:
                 (
                     title,
@@ -763,7 +866,8 @@ class ArticleService:
                     short_body,
                     image_bytes,
                 ) = await self._generate(
-                    topic_title
+                    topic_title,
+                    subtopic=selected_subtopic,
                 )
             except Exception as exc:
                 await db.release_topic(
@@ -815,6 +919,26 @@ class ArticleService:
                 image_bytes,
                 image_path,
             )
+
+
+            if (
+                selected_subtopic
+                and destinations.get(
+                    "telegram"
+                ) == "published"
+            ):
+                try:
+                    await db.record_used_subtopic(
+                        topic_id,
+                        topic_title,
+                        selected_subtopic,
+                    )
+                except Exception:
+                    log.exception(
+                        "Не удалось сохранить "
+                        "историю подтемы: %s",
+                        selected_subtopic,
+                    )
 
             return {
                 "status": "ok",

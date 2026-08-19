@@ -4,12 +4,13 @@ def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Темы", callback_data="admin:topics"),
          InlineKeyboardButton(text="⏰ Расписание", callback_data="admin:schedule")],
-        [InlineKeyboardButton(text="⚡ Срочная статья", callback_data="admin:urgent"),
+        [InlineKeyboardButton(text="🔥 Срочные статьи", callback_data="admin:urgent"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
         [InlineKeyboardButton(text="🧠 Промпты", callback_data="admin:prompts")],
         [InlineKeyboardButton(text="🔥 Комментарии Дзена", callback_data="admin:dzencomments")],
         [InlineKeyboardButton(text="💬 Автоответы Дзена", callback_data="admin:dzenresponder")],
         [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="admin:restart")],
+        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="super:promos")],
     ])
 
 def topics_menu():
@@ -38,13 +39,42 @@ def schedule_delete(schedule_id: int):
         InlineKeyboardButton(text="🗑 Удалить это время", callback_data=f"schedule:delete:{schedule_id}")
     ]])
 
-def urgent_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 Случайная тема из очереди", callback_data="urgent:random")],
-        [InlineKeyboardButton(text="✍️ Ввести тему вручную", callback_data="urgent:manual")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
-    ])
 
+def urgent_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔥 Добавить приоритетные темы",
+                    callback_data="urgent:priority:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📋 Приоритетная очередь",
+                    callback_data="urgent:priority:list",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚀 Случайную опубликовать сейчас",
+                    callback_data="urgent:random",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✍️ Свою тему опубликовать сейчас",
+                    callback_data="urgent:manual",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="admin:home",
+                )
+            ],
+        ]
+    )
 
 def prompts_menu():
     return InlineKeyboardMarkup(inline_keyboard=[

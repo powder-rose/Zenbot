@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dtlib
+
 import base64
 import hashlib
 import hmac
@@ -201,7 +203,7 @@ def _promo_quote(
     ) // 100
 
     final = max(
-        100,
+        0,
         base - discount,
     )
 
@@ -231,9 +233,9 @@ async def create_promo_code(
         discount_percent
     )
 
-    if not 1 <= discount_percent <= 99:
+    if not 1 <= discount_percent <= 100:
         raise ValueError(
-            "Скидка должна быть от 1 до 99%"
+            "Скидка должна быть от 1 до 100%"
         )
 
     now = _now().isoformat(
@@ -366,6 +368,8 @@ async def apply_user_promo(
 ) -> dict:
     await ensure_schema()
 
+    user_id = int(user_id)
+
     normalized = _normalize_promo_code(
         code
     )
@@ -407,7 +411,7 @@ async def apply_user_promo(
             """,
             (
                 normalized,
-                int(user_id),
+                user_id,
             ),
         )
 
@@ -416,6 +420,244 @@ async def apply_user_promo(
                 "ok": False,
                 "reason": "already_used",
             }
+
+        discount_percent = int(
+            promo["discount_percent"]
+        )
+
+        quote = _promo_quote(
+            discount_percent
+        )
+
+        # =================================================
+        # 100% СКИДКА
+        #
+        # CloudPayments не нужен:
+        # подписка активируется непосредственно,
+        # а промокод сразу фиксируется использованным.
+        # =================================================
+
+        if discount_percent == 100:
+            now_dt = _now()
+
+            now_text = now_dt.isoformat(
+                timespec="seconds"
+            )
+
+            cur = await db.execute(
+                """
+                SELECT
+                    status,
+                    starts_at,
+                    expires_at
+                FROM subscriptions
+                WHERE user_id=?
+                """,
+                (user_id,),
+            )
+
+            subscription = (
+                await cur.fetchone()
+            )
+
+            base_dt = now_dt
+            starts_at = now_text
+
+            if subscription:
+                old_status = str(
+                    subscription["status"]
+                    or ""
+                ).strip().lower()
+
+                old_expiry_raw = str(
+                    subscription["expires_at"]
+                    or ""
+                ).strip()
+
+                if (
+                    old_status == "active"
+                    and old_expiry_raw
+                ):
+                    try:
+                        old_expiry = (
+                            dtlib.datetime.fromisoformat(
+                                old_expiry_raw
+                            )
+                        )
+
+                        if old_expiry.tzinfo is None:
+                            old_expiry = (
+                                old_expiry.replace(
+                                    tzinfo=dtlib.timezone.utc
+                                )
+                            )
+
+                        old_expiry = (
+                            old_expiry.astimezone(
+                                dtlib.timezone.utc
+                            )
+                        )
+
+                        if old_expiry > now_dt:
+                            base_dt = old_expiry
+
+                            starts_at = str(
+                                subscription[
+                                    "starts_at"
+                                ]
+                                or now_text
+                            )
+
+                    except Exception:
+                        pass
+
+            expiry_dt = (
+                base_dt
+                + dtlib.timedelta(days=30)
+            )
+
+            expiry_text = (
+                expiry_dt.isoformat(
+                    timespec="seconds"
+                )
+            )
+
+            invoice_id = (
+                f"promo-free-"
+                f"{user_id}-"
+                f"{uuid.uuid4().hex}"
+            )
+
+            transaction_id = (
+                f"promo-free:"
+                f"{normalized}:"
+                f"{user_id}:"
+                f"{uuid.uuid4().hex}"
+            )
+
+            # На случай, если пользователь
+            # ещё не успел попасть в app_users.
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO app_users(
+                    user_id,
+                    created_at,
+                    updated_at
+                )
+                VALUES(?,?,?)
+                """,
+                (
+                    user_id,
+                    now_text,
+                    now_text,
+                ),
+            )
+
+            await db.execute(
+                """
+                INSERT INTO promo_redemptions(
+                    code,
+                    user_id,
+                    invoice_id,
+                    transaction_id,
+                    discount_percent,
+                    discount_kopecks,
+                    redeemed_at
+                )
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (
+                    normalized,
+                    user_id,
+                    invoice_id,
+                    transaction_id,
+                    100,
+                    int(
+                        quote[
+                            "discount_kopecks"
+                        ]
+                    ),
+                    now_text,
+                ),
+            )
+
+            await db.execute(
+                """
+                INSERT INTO subscriptions(
+                    user_id,
+                    status,
+                    starts_at,
+                    expires_at,
+                    source,
+                    stars_amount,
+                    telegram_payment_charge_id,
+                    is_recurring,
+                    updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(user_id)
+                DO UPDATE SET
+                    status='active',
+                    starts_at=excluded.starts_at,
+                    expires_at=excluded.expires_at,
+                    source=excluded.source,
+                    stars_amount=0,
+                    telegram_payment_charge_id=NULL,
+                    is_recurring=0,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    user_id,
+                    "active",
+                    starts_at,
+                    expiry_text,
+                    f"promo:{normalized}",
+                    0,
+                    None,
+                    0,
+                    now_text,
+                ),
+            )
+
+            await db.execute(
+                """
+                DELETE FROM user_promo_codes
+                WHERE user_id=?
+                """,
+                (user_id,),
+            )
+
+            await db.commit()
+
+            log.info(
+                "Free promo redeemed: "
+                "user=%s code=%s expiry=%s",
+                user_id,
+                normalized,
+                expiry_text,
+            )
+
+            return {
+                "ok": True,
+                "code": normalized,
+                "discount_percent": 100,
+                "base_kopecks":
+                    quote[
+                        "base_kopecks"
+                    ],
+                "discount_kopecks":
+                    quote[
+                        "discount_kopecks"
+                    ],
+                "final_kopecks": 0,
+                "free": True,
+                "activated": True,
+                "expires_at": expiry_text,
+            }
+
+        # =================================================
+        # ОБЫЧНЫЙ ПРОМОКОД 1–99%
+        # =================================================
 
         await db.execute(
             """
@@ -432,7 +674,7 @@ async def apply_user_promo(
                     excluded.applied_at
             """,
             (
-                int(user_id),
+                user_id,
                 normalized,
                 _now().isoformat(
                     timespec="seconds"
@@ -442,21 +684,16 @@ async def apply_user_promo(
 
         await db.commit()
 
-    quote = _promo_quote(
-        int(promo["discount_percent"])
-    )
-
     return {
         "ok": True,
         "code": normalized,
         "discount_percent":
-            int(
-                promo[
-                    "discount_percent"
-                ]
-            ),
+            discount_percent,
+        "free": False,
+        "activated": False,
         **quote,
     }
+
 
 
 async def clear_user_promo(

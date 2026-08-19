@@ -33,8 +33,8 @@ DEFAULT_REPLY_PROMPT = """
 3. На нормальную благодарность можно ответить коротко и доброжелательно.
 4. На спам, бессвязный текст, явную провокацию без смысла или комментарий, на который нельзя
    корректно ответить, верни ровно одно слово: SKIP
-5. Если это естественно по смыслу, можно мягко пригласить посмотреть другие практические
-   материалы: https://boykovgroup.ru/blog . Не вставляй ссылку в каждый ответ насильно.
+5. По умолчанию не добавляй ссылки, URL, адреса сайтов и призывы перейти на сайт или в блог.
+   Ссылку добавляй только в том случае, если это прямо указано пользователем в текущем промпте.
 6. Не пиши служебных пояснений, JSON, Markdown-код, «Ответ:» и т.п.
 Верни только готовый текст ответа либо SKIP.
 """.strip()
@@ -87,9 +87,13 @@ class DzenCommentResponderWorker:
         # ответами за календарные сутки.
         # Старый общий worker остаётся без этого ограничения.
         self.daily_reply_limit = (
-            3
-            if self.tenant_user_id is not None
-            else None
+            10
+            if self.tenant_user_id == 46674838
+            else (
+                3
+                if self.tenant_user_id is not None
+                else None
+            )
         )
 
         self.comments_url = (
@@ -1091,19 +1095,24 @@ class DzenCommentResponderWorker:
 
         return None
 
-    async def _generate_reply(self, item: ResponderComment) -> str:
+    async def _generate_reply(
+        self,
+        item: ResponderComment,
+    ) -> str:
         prompt = (
-            f"ЗАГОЛОВОК МАТЕРИАЛА:\n{item.article_title or 'не указан'}\n\n"
-            f"АВТОР КОММЕНТАРИЯ:\n{item.author or 'не указан'}\n\n"
-            f"КОММЕНТАРИЙ:\n{item.text}"
+            f"ЗАГОЛОВОК МАТЕРИАЛА:\n"
+            f"{item.article_title or 'не указан'}\n\n"
+            f"АВТОР КОММЕНТАРИЯ:\n"
+            f"{item.author or 'не указан'}\n\n"
+            f"КОММЕНТАРИЙ:\n"
+            f"{item.text}"
         )
+
         auth = await self.gpt.auth_header()
-        reply_prompt = (
-            self.get_reply_prompt()
-            + "\n\nВАЖНО: не добавляй в ответ никакие ссылки, URL, "
-              "адрес сайта, призывы перейти на сайт или в блог. "
-              "Ссылка на блог будет добавлена программой автоматически."
-        )
+
+        # Используем текущий промпт пользователя
+        # БЕЗ скрытых дополнений программы.
+        reply_prompt = self.get_reply_prompt()
 
         raw = await asyncio.to_thread(
             self.gpt._complete_sync,
@@ -1113,65 +1122,20 @@ class DzenCommentResponderWorker:
             self.reply_timeout_seconds,
         )
 
-        reply = self._clean_reply(str(raw or ""))
+        reply = self._clean_reply(
+            str(raw or "")
+        )
+
         if not reply:
             return ""
 
-        # На всякий случай удаляем URL, если модель всё же его добавила.
-        reply = re.sub(
-            r"https?://\S+",
-            "",
-            reply,
-            flags=re.I,
-        )
-        reply = re.sub(
-            r"[ \t]{2,}",
-            " ",
-            reply,
-        ).strip()
-
-        blog_url = "https://boykovgroup.ru/blog"
-        suffix = f"\n\nБольше материалов: {blog_url}"
-
-        # Ссылка добавляется ПОСЛЕ обрезки основного текста,
-        # поэтому адрес никогда не превратится в "htt...".
-        try:
-            max_chars = int(
-                getattr(
-                    self,
-                    "max_reply_chars",
-                    1000,
-                )
-            )
-        except Exception:
-            max_chars = 1000
-
-        max_chars = max(
-            max_chars,
-            len(suffix) + 150,
+        # Только ограничиваем длину.
+        # Никакие ссылки программа сама
+        # больше не добавляет.
+        return self._truncate_reply(
+            reply
         )
 
-        body_limit = max_chars - len(suffix)
-
-        if len(reply) > body_limit:
-            shortened = reply[:body_limit].rstrip()
-
-            # Стараемся закончить на завершённом предложении.
-            last_sentence = max(
-                shortened.rfind("."),
-                shortened.rfind("!"),
-                shortened.rfind("?"),
-            )
-
-            if last_sentence >= int(body_limit * 0.55):
-                shortened = shortened[:last_sentence + 1]
-            else:
-                shortened = shortened.rsplit(" ", 1)[0]
-                shortened = shortened.rstrip(" ,;:-")
-
-            reply = shortened
-
-        return (reply + suffix).strip()
 
     def _clean_reply(self, text: str) -> str:
         text = text.strip()

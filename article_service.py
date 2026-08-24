@@ -540,19 +540,49 @@ class ArticleService:
                 max_results=8,
             )
 
-        article_system_prompt = (
+        custom_article_prompt = (
             await db.get_setting(
                 "prompt_article_system",
                 "",
             )
-        ).strip() or ARTICLE_SYSTEM_PROMPT
+        ).strip()
 
-        short_system_prompt = (
+        custom_short_prompt = (
             await db.get_setting(
                 "prompt_short_system",
                 "",
             )
-        ).strip() or SYNCBOT_SYSTEM_PROMPT
+        ).strip()
+
+        article_system_prompt = (
+            custom_article_prompt
+            if custom_article_prompt
+            else ARTICLE_SYSTEM_PROMPT
+        )
+
+        short_system_prompt = (
+            custom_short_prompt
+            if custom_short_prompt
+            else SYNCBOT_SYSTEM_PROMPT
+        )
+
+        log.info(
+            "Промпты статьи: "
+            "LONG=%s (%s chars), "
+            "SHORT=%s (%s chars)",
+            (
+                "CUSTOM"
+                if custom_article_prompt
+                else "DEFAULT"
+            ),
+            len(article_system_prompt),
+            (
+                "CUSTOM"
+                if custom_short_prompt
+                else "DEFAULT"
+            ),
+            len(short_system_prompt),
+        )
 
         image_prompt_template = (
             await db.get_setting(
@@ -582,9 +612,10 @@ class ArticleService:
             "article_short",
             metadata={"topic": topic_title},
         ):
-            _, short_body = await self.gpt.generate_syncbot_article_from_sources(
+            _, short_body = await self.gpt.generate_syncbot_article_from_article(
                 topic=topic_title,
-                sources=sources,
+                article_title=title,
+                article_body=full_body,
                 max_chars=820,
                 system_prompt=short_system_prompt,
             )

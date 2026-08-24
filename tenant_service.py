@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ai_usage import usage_context
+from yandex_gpt import ContentBlockedError
 
 import asyncio
 import logging
@@ -332,6 +333,26 @@ class TenantArticleService:
                     subtopic=selected_subtopic,
                 )
             )
+        except ContentBlockedError as exc:
+            if topic_id is not None:
+                await tenant_db.mark_topic_used(
+                    user_id,
+                    topic_id,
+                )
+
+            log.warning(
+                "Tenant topic blocked: "
+                "user=%s topic=%s",
+                user_id,
+                topic_title,
+            )
+
+            return {
+                "status": "content_blocked",
+                "topic": topic_title,
+                "error": str(exc),
+            }
+
         except Exception as exc:
             if topic_id is not None:
                 await tenant_db.release_topic(user_id, topic_id)

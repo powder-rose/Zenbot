@@ -274,6 +274,67 @@ SYNCBOT_SYSTEM_PROMPT = """
 Не добавляй никаких комментариев до или после материала.
 """.strip()
 
+
+class ContentBlockedError(RuntimeError):
+    """YandexGPT отказался генерировать контент по теме."""
+
+
+_REFUSAL_MARKERS = (
+    "я не могу обсуждать",
+    "не могу обсуждать эту тему",
+    "я не могу помочь с",
+    "я не могу помочь в",
+    "я не могу предоставить",
+    "я не могу создать",
+    "я не могу написать",
+    "я не могу выполнить",
+    "я не могу продолжить",
+    "не могу содействовать",
+    "извините, но я не могу",
+    "извините, я не могу",
+    "к сожалению, я не могу",
+    "данная тема нарушает",
+    "эта тема нарушает",
+    "этот запрос нарушает",
+    "запрос нарушает правила",
+    "не могу поддержать этот запрос",
+    "i can't help with",
+    "i cannot help with",
+    "i can't assist with",
+    "i cannot assist with",
+    "i can't discuss",
+    "i cannot discuss",
+    "i'm unable to help with",
+)
+
+
+def is_refusal_text(
+    value: str | None,
+) -> bool:
+    """
+    Определяет не статью, а служебный отказ модели.
+
+    Проверяем начало ответа, чтобы фраза вроде
+    «не могу обсуждать» внутри нормальной большой статьи
+    случайно не заблокировала публикацию.
+    """
+
+    text = " ".join(
+        str(value or "")
+        .casefold()
+        .split()
+    )
+
+    if not text:
+        return False
+
+    prefix = text[:700]
+
+    return any(
+        marker in prefix
+        for marker in _REFUSAL_MARKERS
+    )
+
 class YandexGPTClient:
     def __init__(self, folder_id: str, api_key: str | None = None, sa_key_file: str | None = None):
         self.folder_id = folder_id
@@ -340,6 +401,20 @@ class YandexGPTClient:
         if not alternatives:
             raise RuntimeError(
                 f"YandexGPT вернул неожиданный ответ: {data}"
+            )
+
+        alternative_status = str(
+            alternatives[0].get("status")
+            or ""
+        ).strip().upper()
+
+        if (
+            alternative_status
+            == "ALTERNATIVE_STATUS_CONTENT_FILTER"
+        ):
+            raise ContentBlockedError(
+                "YandexGPT заблокировал тему "
+                "фильтром безопасности"
             )
 
         text = (
@@ -468,6 +543,12 @@ class YandexGPTClient:
             )
         except Exception:
             pass
+
+        if is_refusal_text(text):
+            raise ContentBlockedError(
+                "YandexGPT отказался генерировать "
+                "материал по этой теме"
+            )
 
         return text
 

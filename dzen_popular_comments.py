@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from ai_usage import usage_context
+from yandex_gpt import ContentBlockedError
 
 import asyncio
 import hashlib
@@ -1038,6 +1039,16 @@ class DzenPopularCommentWorker:
                     ),
                 )
 
+            elif status == "content_blocked":
+                self._mark_content_blocked(
+                    selected,
+                    topic,
+                    str(
+                        result.get("error")
+                        or ""
+                    ),
+                )
+
             return {
                 "status":
                     status
@@ -2049,6 +2060,42 @@ class DzenPopularCommentWorker:
                 "no_article_worthy_comments"
         }
 
+    def _mark_content_blocked(
+        self,
+        selected: DzenComment,
+        topic: str,
+        reason: str = "",
+    ) -> None:
+
+        state = self._load_state()
+
+        used = state.setdefault(
+            "used",
+            {},
+        )
+
+        fingerprint = (
+            self._comment_fingerprint(
+                selected.text
+            )
+        )
+
+        used[selected.key] = {
+            "status": "content_blocked",
+            "likes": selected.likes,
+            "text": selected.text[:1500],
+            "topic": topic,
+            "source_url": selected.source_url,
+            "comment_fingerprint": fingerprint,
+            "reason": str(reason or "")[:500],
+            "at": self._now(),
+        }
+
+        self._save_state(
+            state
+        )
+
+
     def _mark_published(
         self,
         selected: DzenComment,
@@ -2139,10 +2186,26 @@ class DzenPopularCommentWorker:
             if not topic or topic.upper() == "SKIP":
                 return ""
             return topic[:280].rstrip(" .,:;—-")
+        except ContentBlockedError:
+            log.info(
+                "Dzen popular comment: тема заблокирована "
+                "YandexGPT, комментарий пропускается"
+            )
+            return ""
+
         except Exception:
-            log.exception("Не удалось сформулировать тему из Dzen-комментария")
-            cleaned = " ".join(text.split()).strip()
-            return cleaned[:240] if len(cleaned) >= 20 else ""
+            log.exception(
+                "Не удалось сформулировать тему "
+                "из Dzen-комментария"
+            )
+            cleaned = " ".join(
+                text.split()
+            ).strip()
+            return (
+                cleaned[:240]
+                if len(cleaned) >= 20
+                else ""
+            )
 
     def _load_state(self) -> dict[str, Any]:
         try:

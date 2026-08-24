@@ -29,6 +29,7 @@ from yandex_gpt import (
     ARTICLE_SYSTEM_PROMPT,
     SYNCBOT_SYSTEM_PROMPT,
     YandexGPTClient,
+    ContentBlockedError,
 )
 
 log = logging.getLogger(__name__)
@@ -906,6 +907,22 @@ class ArticleService:
                     topic_title,
                     subtopic=selected_subtopic,
                 )
+            except ContentBlockedError as exc:
+                await db.mark_topic_used(
+                    topic_id
+                )
+
+                log.warning(
+                    "Тема заблокирована YandexGPT: %s",
+                    topic_title,
+                )
+
+                return {
+                    "status": "content_blocked",
+                    "topic": topic_title,
+                    "error": str(exc),
+                }
+
             except Exception as exc:
                 await db.release_topic(
                     topic_id
@@ -1110,6 +1127,19 @@ class ArticleService:
                 ) = await self._generate(
                     topic_title
                 )
+            except ContentBlockedError as exc:
+                log.warning(
+                    "Ручная тема заблокирована "
+                    "YandexGPT: %s",
+                    topic_title,
+                )
+
+                return {
+                    "status": "content_blocked",
+                    "topic": topic_title,
+                    "error": str(exc),
+                }
+
             except Exception as exc:
                 log.exception(
                     "Ошибка генерации срочной статьи"

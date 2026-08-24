@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_usage import usage_context
+
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -72,10 +74,17 @@ class TenantArticleService:
                 "новые требования практика"
             )
 
-            sources = await self.search.search(
-                search_query,
-                max_results=12,
-            )
+            with usage_context(
+                "search_subtopic",
+                user_id=user_id,
+                metadata={
+                    "topic": topic_title,
+                },
+            ):
+                sources = await self.search.search(
+                    search_query,
+                    max_results=12,
+                )
 
             if not sources:
                 return None
@@ -88,13 +97,18 @@ class TenantArticleService:
                 )
             )
 
-            subtopic = (
-                await self.gpt.select_article_subtopic(
-                    topic=topic_title,
-                    sources=sources,
-                    used_subtopics=used,
+            with usage_context(
+                "subtopic_select",
+                user_id=user_id,
+                metadata={"topic": topic_title},
+            ):
+                subtopic = (
+                    await self.gpt.select_article_subtopic(
+                        topic=topic_title,
+                        sources=sources,
+                        used_subtopics=used,
+                    )
                 )
-            )
 
             subtopic = " ".join(
                 str(subtopic).split()
@@ -141,10 +155,18 @@ class TenantArticleService:
             subtopic or topic
         ).strip()
 
-        sources = await self.search.search(
-            focus_topic,
-            max_results=8,
-        )
+        with usage_context(
+            "search_article",
+            user_id=user_id,
+            metadata={
+                "topic": topic,
+                "subtopic": subtopic,
+            },
+        ):
+            sources = await self.search.search(
+                focus_topic,
+                max_results=8,
+            )
         article_prompt = (
             await tenant_db.get_setting(user_id, "prompt_article_system", "")
         ).strip() or ARTICLE_SYSTEM_PROMPT
@@ -152,18 +174,40 @@ class TenantArticleService:
             await tenant_db.get_setting(user_id, "prompt_image_template", "")
         ).strip() or DEFAULT_IMAGE_PROMPT_TEMPLATE
 
-        title, body = await self.gpt.generate_article_from_sources(
-            topic=topic,
-            sources=sources,
-            subtopic=subtopic,
-            max_chars=3200,
-            system_prompt=article_prompt,
-        )
+        with usage_context(
+            "article_full",
+            user_id=user_id,
+            metadata={
+                "topic": topic,
+                "subtopic": subtopic,
+            },
+        ):
+            title, body = await self.gpt.generate_article_from_sources(
+                topic=topic,
+                sources=sources,
+                subtopic=subtopic,
+                max_chars=3200,
+                system_prompt=article_prompt,
+            )
         title = clean_article_text(title)
         body = clean_article_text(body)
 
-        image_prompt = build_image_prompt(focus_topic, image_template)
-        image_bytes = await self.art.generate_image(image_prompt)
+        image_prompt = build_image_prompt(
+            focus_topic,
+            image_template,
+        )
+
+        with usage_context(
+            "image_generation",
+            user_id=user_id,
+            metadata={
+                "topic": topic,
+                "subtopic": subtopic,
+            },
+        ):
+            image_bytes = await self.art.generate_image(
+                image_prompt
+            )
         if not image_bytes:
             raise RuntimeError("YandexART вернул пустое изображение")
         return title, body, image_bytes

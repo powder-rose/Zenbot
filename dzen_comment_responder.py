@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_usage import usage_context
+
 import asyncio
 import hashlib
 import json
@@ -1114,13 +1116,20 @@ class DzenCommentResponderWorker:
         # БЕЗ скрытых дополнений программы.
         reply_prompt = self.get_reply_prompt()
 
-        raw = await asyncio.to_thread(
-            self.gpt._complete_sync,
-            auth,
-            reply_prompt,
-            prompt,
-            self.reply_timeout_seconds,
-        )
+        with usage_context(
+            "comment_reply",
+            user_id=getattr(self, "user_id", None),
+            metadata={
+                "article_title": item.article_title,
+            },
+        ):
+            raw = await asyncio.to_thread(
+                self.gpt._complete_sync,
+                auth,
+                reply_prompt,
+                prompt,
+                self.reply_timeout_seconds,
+            )
 
         reply = self._clean_reply(
             str(raw or "")

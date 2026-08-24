@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import time
+
+from ai_usage import usage_context
+
 import asyncio
 import hashlib
 import json
@@ -454,37 +458,384 @@ class DzenPopularCommentSource:
 
 
 class DzenPopularCommentWorker:
-    def __init__(self, *, article_service: Any, gpt_client: Any, cfg: Any) -> None:
+    def __init__(
+        self,
+        *,
+        article_service: Any,
+        gpt_client: Any,
+        cfg: Any,
+    ) -> None:
         self.article_service = article_service
         self.gpt = gpt_client
         self.cfg = cfg
         self.source = DzenPopularCommentSource()
+
         self.interval_seconds = max(
-            300, int(os.getenv("DZEN_COMMENT_CHECK_MINUTES", "30")) * 60
+            300,
+            int(
+                os.getenv(
+                    "DZEN_COMMENT_CHECK_MINUTES",
+                    "30",
+                )
+            ) * 60,
         )
-        self.min_likes = max(0, int(os.getenv("DZEN_COMMENT_MIN_LIKES", "1")))
+
+        self.publish_interval_seconds = max(
+            3600,
+            int(
+                os.getenv(
+                    "DZEN_COMMENT_PUBLISH_HOURS",
+                    "48",
+                )
+            ) * 3600,
+        )
+
+        self.min_likes = max(
+            0,
+            int(
+                os.getenv(
+                    "DZEN_COMMENT_MIN_LIKES",
+                    "1",
+                )
+            ),
+        )
+
         self.state_path = Path(
-            os.getenv("DZEN_COMMENT_STATE_FILE", "data/dzen_popular_comment_state.json")
+            os.getenv(
+                "DZEN_COMMENT_STATE_FILE",
+                "data/dzen_popular_comment_state.json",
+            )
         )
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.state_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
         self._run_lock = asyncio.Lock()
 
         state = self._load_state()
-        env_enabled = os.getenv("DZEN_POPULAR_COMMENT_ENABLED", "false").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        env_preview = os.getenv("DZEN_COMMENT_PREVIEW_ENABLED", "true").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        self.enabled = bool(state.get("enabled", env_enabled))
-        self.preview_enabled = bool(state.get("preview_enabled", env_preview))
+
+        env_enabled = (
+            os.getenv(
+                "DZEN_POPULAR_COMMENT_ENABLED",
+                "false",
+            )
+            .strip()
+            .lower()
+            in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        )
+
+        self.enabled = bool(
+            state.get(
+                "enabled",
+                env_enabled,
+            )
+        )
+
+        # Предпросмотр отключён окончательно.
+        self.preview_enabled = False
+
         state["enabled"] = self.enabled
-        state["preview_enabled"] = self.preview_enabled
-        state.setdefault("used", {})
-        state.setdefault("pending_previews", {})
-        self._save_state(state)
+        state["preview_enabled"] = False
+
+        state.setdefault(
+            "used",
+            {},
+        )
+
+        state.setdefault(
+            "pending_previews",
+            {},
+        )
+
+        self._migrate_state(
+            state
+        )
+
+        self._save_state(
+            state
+        )
+
+
+    @staticmethod
+    def _comment_fingerprint(
+        text: str,
+    ) -> str:
+        """
+        Стабильный отпечаток комментария.
+
+        Убираем динамические элементы интерфейса Дзена:
+        "15 д", "2 недели назад", "3 часа назад" и т.п.
+        Поэтому один комментарий не становится новым
+        только из-за изменения относительной даты.
+        """
+
+        value = str(
+            text or ""
+        ).casefold()
+
+        value = re.sub(
+            r"https?://\S+",
+            " ",
+            value,
+        )
+
+        value = re.sub(
+            (
+                r"\b\d+\s*"
+                r"(?:"
+                r"сек(?:унд[а-я]*)?|"
+                r"мин(?:ут[а-я]*)?|"
+                r"ч(?:ас(?:а|ов)?)?|"
+                r"д(?:н(?:я|ей)?)?|"
+                r"дн(?:я|ей)?|"
+                r"недел(?:я|и|ь)?|"
+                r"мес(?:яц(?:а|ев)?)?|"
+                r"год(?:а|ов)?"
+                r")"
+                r"\s*(?:назад)?\b"
+            ),
+            " ",
+            value,
+            flags=re.I,
+        )
+
+        value = re.sub(
+            r"\b(?:сегодня|вчера|позавчера)\b",
+            " ",
+            value,
+            flags=re.I,
+        )
+
+        value = re.sub(
+            r"\b\d{1,2}[.:]\d{2}\b",
+            " ",
+            value,
+        )
+
+        value = re.sub(
+            r"\s+",
+            " ",
+            value,
+        ).strip()
+
+        if not value:
+            return ""
+
+        return hashlib.sha256(
+            value.encode(
+                "utf-8"
+            )
+        ).hexdigest()
+
+
+    def _migrate_state(
+        self,
+        state: dict[str, Any],
+    ) -> None:
+        """
+        Миграция старого preview-режима.
+
+        Старые preview_pending считаем уже использованными,
+        чтобы после отключения preview они не ушли
+        повторно в генерацию/публикацию.
+        """
+
+        used = state.setdefault(
+            "used",
+            {},
+        )
+
+        pending = state.setdefault(
+            "pending_previews",
+            {},
+        )
+
+        if isinstance(
+            pending,
+            dict,
+        ):
+            for preview in pending.values():
+
+                if not isinstance(
+                    preview,
+                    dict,
+                ):
+                    continue
+
+                key = str(
+                    preview.get(
+                        "comment_key"
+                    )
+                    or ""
+                )
+
+                if not key:
+                    continue
+
+                current = used.get(
+                    key
+                )
+
+                if not isinstance(
+                    current,
+                    dict,
+                ):
+                    current = {}
+
+                current.setdefault(
+                    "likes",
+                    int(
+                        preview.get(
+                            "likes"
+                        )
+                        or 0
+                    ),
+                )
+
+                current.setdefault(
+                    "text",
+                    str(
+                        preview.get(
+                            "comment"
+                        )
+                        or ""
+                    )[:1500],
+                )
+
+                current.setdefault(
+                    "topic",
+                    str(
+                        preview.get(
+                            "topic"
+                        )
+                        or ""
+                    ),
+                )
+
+                current.setdefault(
+                    "source_url",
+                    str(
+                        preview.get(
+                            "source_url"
+                        )
+                        or ""
+                    ),
+                )
+
+                if (
+                    str(
+                        current.get(
+                            "status"
+                        )
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                    == "preview_pending"
+                ):
+                    current[
+                        "status"
+                    ] = "consumed_preview"
+
+                current.setdefault(
+                    "at",
+                    self._now(),
+                )
+
+                used[
+                    key
+                ] = current
+
+        # Формируем стабильные fingerprints
+        # для всей старой истории.
+        for item in used.values():
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            old_text = str(
+                item.get(
+                    "text"
+                )
+                or ""
+            )
+
+            fingerprint = (
+                self._comment_fingerprint(
+                    old_text
+                )
+            )
+
+            if fingerprint:
+                item[
+                    "comment_fingerprint"
+                ] = fingerprint
+
+        # Предпросмотры больше не используются.
+        state[
+            "pending_previews"
+        ] = {}
+
+        state[
+            "preview_enabled"
+        ] = False
+
+
+    def _cooldown_remaining_seconds(
+        self,
+        state: dict[str, Any] | None = None,
+    ) -> int:
+
+        if state is None:
+            state = self._load_state()
+
+        raw = str(
+            state.get(
+                "last_published_at"
+            )
+            or ""
+        ).strip()
+
+        if not raw:
+            return 0
+
+        try:
+            last = datetime.fromisoformat(
+                raw.replace(
+                    "Z",
+                    "+00:00",
+                )
+            )
+
+            elapsed = (
+                time.time()
+                - last.timestamp()
+            )
+
+        except Exception:
+            return 0
+
+        remaining = (
+            self.publish_interval_seconds
+            - elapsed
+        )
+
+        return max(
+            0,
+            int(remaining),
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -492,12 +843,36 @@ class DzenPopularCommentWorker:
 
     def status(self) -> dict[str, Any]:
         state = self._load_state()
+
+        remaining = (
+            self._cooldown_remaining_seconds(
+                state
+            )
+        )
+
         return {
-            "enabled": bool(state.get("enabled", self.enabled)),
-            "preview_enabled": bool(state.get("preview_enabled", self.preview_enabled)),
+            "enabled": bool(
+                state.get(
+                    "enabled",
+                    self.enabled,
+                )
+            ),
+            "preview_enabled": False,
             "min_likes": self.min_likes,
-            "interval_seconds": self.interval_seconds,
-            "pending_count": len(state.get("pending_previews", {}) or {}),
+            "interval_seconds":
+                self.interval_seconds,
+            "publish_interval_seconds":
+                self.publish_interval_seconds,
+            "publish_interval_hours":
+                self.publish_interval_seconds
+                // 3600,
+            "cooldown_remaining_seconds":
+                remaining,
+            "last_published_at":
+                state.get(
+                    "last_published_at"
+                ),
+            "pending_count": 0,
         }
 
     def set_enabled(self, value: bool) -> bool:
@@ -511,16 +886,29 @@ class DzenPopularCommentWorker:
     def toggle_enabled(self) -> bool:
         return self.set_enabled(not self.enabled)
 
-    def set_preview_enabled(self, value: bool) -> bool:
-        self.preview_enabled = bool(value)
-        state = self._load_state()
-        state["preview_enabled"] = self.preview_enabled
-        self._save_state(state)
-        self._wake.set()
-        return self.preview_enabled
+    def set_preview_enabled(
+        self,
+        value: bool,
+    ) -> bool:
+        # Preview больше не поддерживается.
+        self.preview_enabled = False
 
-    def toggle_preview_enabled(self) -> bool:
-        return self.set_preview_enabled(not self.preview_enabled)
+        state = self._load_state()
+        state["preview_enabled"] = False
+        state["pending_previews"] = {}
+
+        self._save_state(
+            state
+        )
+
+        return False
+
+    def toggle_preview_enabled(
+        self,
+    ) -> bool:
+        return self.set_preview_enabled(
+            False
+        )
 
     async def run(self) -> None:
         log.info(
@@ -564,101 +952,129 @@ class DzenPopularCommentWorker:
             except asyncio.CancelledError:
                 pass
 
-    async def run_once(self, *, force: bool = False) -> dict[str, Any]:
-        if not self.enabled and not force:
-            return {"status": "disabled"}
+    async def run_once(
+        self,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
 
-        # In preview mode the automatic cycle prepares the article and waits for approval.
-        if self.preview_enabled:
-            result = await self.create_preview(force=force)
-            if result.get("status") == "preview_ready" and not force:
-                await self.send_preview_to_admins(result)
-            return result
-
-        async with self._run_lock:
-            selection = await self._select_candidate()
-            if selection.get("status") != "candidate_ready":
-                return selection
-
-            selected: DzenComment = selection["comment_obj"]
-            topic = str(selection["topic"])
-            result = await self.article_service.publish_manual_topic(topic)
-            status = str(result.get("status") or "")
-            if status == "ok":
-                self._mark_published(selected, topic, result.get("article_title"))
-
+        if (
+            not self.enabled
+            and not force
+        ):
             return {
-                "status": status or "publish_error",
-                "likes": selected.likes,
-                "comment": selected.text[:500],
-                "topic": topic,
-                "article_title": result.get("article_title"),
-                "publish_result": result,
+                "status": "disabled"
             }
-
-    async def create_preview(self, *, force: bool = False) -> dict[str, Any]:
-        if not self.enabled and not force:
-            return {"status": "disabled"}
 
         async with self._run_lock:
-            selection = await self._select_candidate()
-            if selection.get("status") != "candidate_ready":
-                # Manual request may re-open the already prepared preview. The automatic
-                # loop must NOT resend the same preview every check interval.
-                if selection.get("status") == "preview_pending" and force:
-                    preview_id = str(selection.get("preview_id") or "")
-                    existing = self.get_preview(preview_id)
-                    if existing:
-                        existing["status"] = "preview_ready"
-                        existing["already_pending"] = True
-                        return existing
-                return selection
-
-            selected: DzenComment = selection["comment_obj"]
-            topic = str(selection["topic"])
-
-            generated = await self.article_service.generate_manual_preview(topic)
-            if generated.get("status") != "preview_ready":
-                return {
-                    "status": generated.get("status") or "generation_error",
-                    "likes": selected.likes,
-                    "comment": selected.text[:500],
-                    "topic": topic,
-                    "error": generated.get("error"),
-                }
-
-            import uuid
-            preview_id = uuid.uuid4().hex[:12]
-            preview = {
-                "preview_id": preview_id,
-                "comment_key": selected.key,
-                "likes": selected.likes,
-                "comment": selected.text[:1500],
-                "source_url": selected.source_url,
-                "topic": topic,
-                "article_title": generated.get("article_title"),
-                "full_body": generated.get("full_body"),
-                "short_body": generated.get("short_body"),
-                "image_path": generated.get("image_path"),
-                "created_at": self._now(),
-            }
 
             state = self._load_state()
-            pending = state.setdefault("pending_previews", {})
-            pending[preview_id] = preview
-            used = state.setdefault("used", {})
-            used[selected.key] = {
-                "status": "preview_pending",
-                "preview_id": preview_id,
-                "likes": selected.likes,
-                "text": selected.text[:1500],
-                "topic": topic,
-                "source_url": selected.source_url,
-                "at": self._now(),
-            }
-            self._save_state(state)
 
-            return {"status": "preview_ready", **preview}
+            remaining = (
+                self._cooldown_remaining_seconds(
+                    state
+                )
+            )
+
+            # Даже ручная проверка не позволяет
+            # нарушить интервал в 48 часов.
+            if remaining > 0:
+                return {
+                    "status": "cooldown",
+                    "remaining_seconds":
+                        remaining,
+                    "publish_interval_seconds":
+                        self.publish_interval_seconds,
+                    "last_published_at":
+                        state.get(
+                            "last_published_at"
+                        ),
+                }
+
+            selection = (
+                await self._select_candidate()
+            )
+
+            if (
+                selection.get(
+                    "status"
+                )
+                != "candidate_ready"
+            ):
+                return selection
+
+            selected: DzenComment = (
+                selection[
+                    "comment_obj"
+                ]
+            )
+
+            topic = str(
+                selection[
+                    "topic"
+                ]
+            )
+
+            result = await (
+                self.article_service
+                .publish_manual_topic(
+                    topic
+                )
+            )
+
+            status = str(
+                result.get(
+                    "status"
+                )
+                or ""
+            )
+
+            if status == "ok":
+                self._mark_published(
+                    selected,
+                    topic,
+                    result.get(
+                        "article_title"
+                    ),
+                )
+
+            return {
+                "status":
+                    status
+                    or "publish_error",
+
+                "likes":
+                    selected.likes,
+
+                "comment":
+                    selected.text[:500],
+
+                "topic":
+                    topic,
+
+                "article_title":
+                    result.get(
+                        "article_title"
+                    ),
+
+                "publish_result":
+                    result,
+            }
+
+    async def create_preview(
+        self,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        # Предпросмотр полностью отключён.
+        return {
+            "status": "preview_disabled",
+            "message": (
+                "Предпросмотр отключён. "
+                "Статьи публикуются автоматически "
+                "не чаще одного раза в 48 часов."
+            ),
+        }
 
     def get_preview(self, preview_id: str) -> dict[str, Any] | None:
         if not preview_id:
@@ -1451,101 +1867,273 @@ class DzenPopularCommentWorker:
                 state
             )
 
-    async def _select_candidate(self) -> dict[str, Any]:
-        ranked = await self.source.ranked_comments()
+    async def _select_candidate(
+        self,
+    ) -> dict[str, Any]:
+
+        ranked = await (
+            self.source
+            .ranked_comments()
+        )
+
         if not ranked:
-            return {"status": "no_comments"}
+            return {
+                "status": "no_comments"
+            }
 
         state = self._load_state()
-        used: dict[str, Any] = state.setdefault("used", {})
-        eligible = [c for c in ranked if c.likes >= self.min_likes]
+
+        used: dict[str, Any] = (
+            state.setdefault(
+                "used",
+                {},
+            )
+        )
+
+        eligible = [
+            comment
+            for comment in ranked
+            if comment.likes
+            >= self.min_likes
+        ]
+
         if not eligible:
             return {
-                "status": "no_liked_comments",
-                "max_likes": ranked[0].likes if ranked else 0,
+                "status":
+                    "no_liked_comments",
+
+                "max_likes":
+                    ranked[0].likes
+                    if ranked
+                    else 0,
             }
 
-        published_skipped = 0
+        # Все комментарии, которые уже когда-либо
+        # попадали в историю, считаются использованными.
+        known_fingerprints: set[str] = set()
+
+        for item in used.values():
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            fingerprint = str(
+                item.get(
+                    "comment_fingerprint"
+                )
+                or ""
+            ).strip()
+
+            if not fingerprint:
+
+                fingerprint = (
+                    self._comment_fingerprint(
+                        str(
+                            item.get(
+                                "text"
+                            )
+                            or ""
+                        )
+                    )
+                )
+
+                if fingerprint:
+                    item[
+                        "comment_fingerprint"
+                    ] = fingerprint
+
+            if fingerprint:
+                known_fingerprints.add(
+                    fingerprint
+                )
+
+        skipped_existing = 0
 
         for candidate in eligible:
-            previous = used.get(candidate.key)
-            if isinstance(previous, dict):
-                previous_status = str(previous.get("status") or "").strip().lower()
 
-                if previous_status == "skipped":
-                    continue
+            # Самый надёжный случай:
+            # стабильный Dzen comment id/key.
+            if candidate.key in used:
+                skipped_existing += 1
+                continue
 
-                # Уже опубликованный комментарий больше не блокирует рейтинг.
-                # Просто идём к следующему по количеству лайков.
-                if previous_status == "published":
-                    published_skipped += 1
-                    continue
+            fingerprint = (
+                self._comment_fingerprint(
+                    candidate.text
+                )
+            )
 
-                if previous_status == "rejected":
-                    return {
-                        "status": "top_rejected",
-                        "likes": candidate.likes,
-                        "comment": candidate.text[:300],
-                    }
+            # Вторичная защита:
+            # один и тот же комментарий
+            # с другим URL/относительной датой.
+            if (
+                fingerprint
+                and fingerprint
+                in known_fingerprints
+            ):
+                skipped_existing += 1
+                continue
 
-                if previous_status == "preview_pending":
-                    return {
-                        "status": "preview_pending",
-                        "preview_id": previous.get("preview_id"),
-                        "likes": candidate.likes,
-                        "comment": candidate.text[:300],
-                    }
+            topic = await (
+                self._topic_from_comment(
+                    candidate.text
+                )
+            )
 
-            topic = await self._topic_from_comment(candidate.text)
             if topic:
                 return {
-                    "status": "candidate_ready",
-                    "comment_obj": candidate,
-                    "topic": topic,
+                    "status":
+                        "candidate_ready",
+
+                    "comment_obj":
+                        candidate,
+
+                    "topic":
+                        topic,
+
+                    "comment_fingerprint":
+                        fingerprint,
                 }
 
-            used[candidate.key] = {
-                "status": "skipped",
-                "likes": candidate.likes,
-                "text": candidate.text[:1000],
-                "at": self._now(),
-            }
-            self._save_state(state)
+            used[
+                candidate.key
+            ] = {
+                "status":
+                    "skipped",
 
-        if published_skipped:
+                "likes":
+                    candidate.likes,
+
+                "text":
+                    candidate.text[
+                        :1500
+                    ],
+
+                "source_url":
+                    candidate.source_url,
+
+                "comment_fingerprint":
+                    fingerprint,
+
+                "at":
+                    self._now(),
+            }
+
+            if fingerprint:
+                known_fingerprints.add(
+                    fingerprint
+                )
+
+            self._save_state(
+                state
+            )
+
+        self._save_state(
+            state
+        )
+
+        if skipped_existing:
             return {
-                "status": "no_fresh_comments",
-                "used_count": published_skipped,
+                "status":
+                    "no_fresh_comments",
+
+                "used_count":
+                    skipped_existing,
             }
 
-        return {"status": "no_article_worthy_comments"}
-
-    def _mark_published(self, selected: DzenComment, topic: str, article_title: Any) -> None:
-        state = self._load_state()
-        used = state.setdefault("used", {})
-        used[selected.key] = {
-            "status": "published",
-            "likes": selected.likes,
-            "text": selected.text[:1500],
-            "topic": topic,
-            "source_url": selected.source_url,
-            "article_title": article_title,
-            "at": self._now(),
+        return {
+            "status":
+                "no_article_worthy_comments"
         }
-        state["last_published_key"] = selected.key
-        state["last_published_at"] = self._now()
-        self._save_state(state)
+
+    def _mark_published(
+        self,
+        selected: DzenComment,
+        topic: str,
+        article_title: Any,
+    ) -> None:
+
+        state = self._load_state()
+
+        used = state.setdefault(
+            "used",
+            {},
+        )
+
+        fingerprint = (
+            self._comment_fingerprint(
+                selected.text
+            )
+        )
+
+        used[
+            selected.key
+        ] = {
+            "status":
+                "published",
+
+            "likes":
+                selected.likes,
+
+            "text":
+                selected.text[:1500],
+
+            "topic":
+                topic,
+
+            "source_url":
+                selected.source_url,
+
+            "article_title":
+                article_title,
+
+            "comment_fingerprint":
+                fingerprint,
+
+            "at":
+                self._now(),
+        }
+
+        state[
+            "last_published_key"
+        ] = selected.key
+
+        state[
+            "last_published_fingerprint"
+        ] = fingerprint
+
+        state[
+            "last_published_at"
+        ] = self._now()
+
+        state[
+            "preview_enabled"
+        ] = False
+
+        state[
+            "pending_previews"
+        ] = {}
+
+        self._save_state(
+            state
+        )
 
     async def _topic_from_comment(self, text: str) -> str:
         prompt = "КОММЕНТАРИЙ:\n" + text[:2200]
         try:
             auth = await self.gpt.auth_header()
-            raw = await asyncio.to_thread(
-                self.gpt._complete_sync,
-                auth,
-                _TOPIC_SYSTEM_PROMPT,
-                prompt,
-            )
+            with usage_context(
+                "popular_comment_topic",
+            ):
+                raw = await asyncio.to_thread(
+                    self.gpt._complete_sync,
+                    auth,
+                    _TOPIC_SYSTEM_PROMPT,
+                    prompt,
+                )
             topic = " ".join(str(raw).split()).strip(" \"'«»")
             topic = re.sub(r"^(?:ТЕМА\s*:\s*)", "", topic, flags=re.I).strip()
             if not topic or topic.upper() == "SKIP":

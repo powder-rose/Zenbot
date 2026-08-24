@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio, base64, ssl, time
 from collections.abc import Awaitable, Callable
 import httpx, truststore
+from ai_usage import record_image
 
 GENERATE_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/imageGenerationAsync"
 OPERATION_URL = "https://operation.api.cloud.yandex.net/operations/{operation_id}"
@@ -48,8 +49,27 @@ class YandexArtClient:
                         raise RuntimeError(f"YandexART error: {data['error']}")
                     image_b64 = (data.get("response") or {}).get("image")
                     if not image_b64:
-                        raise RuntimeError(f"YandexART не вернул изображение: {data}")
-                    return base64.b64decode(image_b64)
+                        raise RuntimeError(
+                            f"YandexART не вернул изображение: {data}"
+                        )
+
+                    image_bytes = base64.b64decode(
+                        image_b64
+                    )
+
+                    # Учёт не должен ломать генерацию.
+                    try:
+                        record_image(
+                            model="yandex-art/latest",
+                            metadata={
+                                "aspect_ratio":
+                                    f"{aspect_ratio[0]}:{aspect_ratio[1]}",
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                    return image_bytes
                 time.sleep(3)
         raise TimeoutError("YandexART не завершил генерацию за 180 секунд")
 

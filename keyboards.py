@@ -6,12 +6,68 @@ def admin_menu():
          InlineKeyboardButton(text="⏰ Расписание", callback_data="admin:schedule")],
         [InlineKeyboardButton(text="🔥 Срочные статьи", callback_data="admin:urgent"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="💰 Расходы AI", callback_data="admin:ai_usage")],
         [InlineKeyboardButton(text="🧠 Промпты", callback_data="admin:prompts")],
         [InlineKeyboardButton(text="🔥 Комментарии Дзена", callback_data="admin:dzencomments")],
         [InlineKeyboardButton(text="💬 Автоответы Дзена", callback_data="admin:dzenresponder")],
         [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="admin:restart")],
         [InlineKeyboardButton(text="🎟 Промокоды", callback_data="super:promos")],
     ])
+
+
+def ai_usage_menu(
+    period: str = "today",
+) -> InlineKeyboardMarkup:
+
+    def label(
+        key: str,
+        text: str,
+    ) -> str:
+        if period == key:
+            return "✅ " + text
+        return text
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=label(
+                        "today",
+                        "Сегодня",
+                    ),
+                    callback_data="admin:ai_usage:today",
+                ),
+                InlineKeyboardButton(
+                    text=label(
+                        "month",
+                        "Месяц",
+                    ),
+                    callback_data="admin:ai_usage:month",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=label(
+                        "all",
+                        "Всё время",
+                    ),
+                    callback_data="admin:ai_usage:all",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Обновить",
+                    callback_data=f"admin:ai_usage:{period}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="admin:home",
+                ),
+            ],
+        ]
+    )
 
 def topics_menu():
     return InlineKeyboardMarkup(inline_keyboard=[

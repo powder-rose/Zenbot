@@ -22,6 +22,7 @@ from aiogram.types import (
 
 import db
 import tenant_db
+from ai_usage import period_report
 from article_service import (
     ArticleService,
     DEFAULT_IMAGE_PROMPT_TEMPLATE,
@@ -31,6 +32,7 @@ from cloudpayments_service import CloudPaymentsWebhookServer
 from image_gen import YandexArtClient
 from keyboards import (
     admin_menu,
+    ai_usage_menu,
     schedule_delete,
     schedule_menu,
     topic_actions,
@@ -888,55 +890,121 @@ async def process_urgent_manual(message: Message, state: FSMContext):
 def dzen_comment_control_keyboard() -> InlineKeyboardMarkup:
     if popular_comment_worker is None:
         return InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")]]
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="admin:home",
+                    )
+                ]
+            ]
         )
-    status = popular_comment_worker.status()
-    auto_on = bool(status.get("enabled"))
-    preview_on = bool(status.get("preview_enabled"))
+
+    status = (
+        popular_comment_worker
+        .status()
+    )
+
+    enabled = bool(
+        status.get(
+            "enabled"
+        )
+    )
+
+    toggle_text = (
+        "⏸ Выключить автопубликацию"
+        if enabled
+        else "▶️ Включить автопубликацию"
+    )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=("🟢 Авто по комментариям: ВКЛ" if auto_on else "🔴 Авто по комментариям: ВЫКЛ"),
+                    text=toggle_text,
                     callback_data="dzenpc:toggle",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=("👁 Предпросмотр: ВКЛ" if preview_on else "⚡ Предпросмотр: ВЫКЛ"),
-                    callback_data="dzenpc:previewtoggle",
+                    text="⬅️ Назад",
+                    callback_data="admin:home",
                 )
             ],
-            [
-                InlineKeyboardButton(
-                    text="🔥 Создать предпросмотр сейчас",
-                    callback_data="dzenpc:previewnow",
-                )
-            ],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:home")],
         ]
     )
 
 
 def dzen_comment_control_text() -> str:
     if popular_comment_worker is None:
-        return "🔥 <b>Комментарии Дзена</b>\n\nСервис ещё не запущен."
-    status = popular_comment_worker.status()
-    auto_on = bool(status.get("enabled"))
-    preview_on = bool(status.get("preview_enabled"))
-    pending = int(status.get("pending_count") or 0)
-    interval_min = max(1, int(status.get("interval_seconds") or 0) // 60)
+        return (
+            "🔥 <b>Статьи по популярным "
+            "комментариям Дзена</b>\n\n"
+            "Воркер не инициализирован."
+        )
+
+    status = (
+        popular_comment_worker
+        .status()
+    )
+
+    enabled = bool(
+        status.get(
+            "enabled"
+        )
+    )
+
+    remaining = int(
+        status.get(
+            "cooldown_remaining_seconds"
+        )
+        or 0
+    )
+
+    if remaining > 0:
+        hours, rest = divmod(
+            remaining,
+            3600,
+        )
+
+        minutes = (
+            rest // 60
+        )
+
+        next_text = (
+            f"⏳ До следующей возможной "
+            f"публикации: "
+            f"<b>{hours} ч {minutes} мин</b>"
+        )
+
+    else:
+        next_text = (
+            "✅ Новую статью можно "
+            "опубликовать при наличии "
+            "свежего популярного комментария."
+        )
+
+    state_text = (
+        "🟢 Включено"
+        if enabled
+        else "🔴 Выключено"
+    )
+
     return (
-        "🔥 <b>Статьи по популярным комментариям Дзена</b>\n\n"
-        f"Автоматический поиск: {'🟢 ВКЛ' if auto_on else '🔴 ВЫКЛ'}\n"
-        f"Предпросмотр перед публикацией: {'🟢 ВКЛ' if preview_on else '🔴 ВЫКЛ'}\n"
-        f"Минимум лайков: <b>{status.get('min_likes', 0)}</b>\n"
-        f"Проверка: каждые <b>{interval_min} мин.</b>\n"
-        f"Ожидают решения: <b>{pending}</b>\n\n"
-        "Если предпросмотр включён, бот найдёт новый самый залайканный комментарий, "
-        "полностью сгенерирует LONG, SHORT и картинку и пришлёт их сюда. "
-        "В канал статья уйдёт только после кнопки «✅ Опубликовать».\n\n"
-        "Если предпросмотр выключен, новый лидер публикуется автоматически."
+        "🔥 <b>Статьи по популярным "
+        "комментариям Дзена</b>\n\n"
+
+        f"Статус: <b>{state_text}</b>\n"
+        "Режим: <b>автоматически, "
+        "без предпросмотра</b>\n"
+        "Интервал публикаций: "
+        "<b>1 статья / 48 часов</b>\n"
+        "Повтор одного комментария: "
+        "<b>запрещён</b>\n"
+        f"Минимум лайков: "
+        f"<b>{status.get('min_likes', 0)}</b>\n\n"
+
+        f"{next_text}"
     )
 
 
@@ -1766,6 +1834,226 @@ async def cb_stats(call: CallbackQuery):
         parse_mode="HTML",
         reply_markup=admin_menu(),
     )
+
+
+# ---------------- РАСХОДЫ AI
+
+_AI_ACTION_NAMES = {
+    "search_subtopic":
+        "🔎 Поиск актуальной подтемы",
+
+    "subtopic_select":
+        "🧭 Выбор подтемы",
+
+    "search_article":
+        "🔎 Поиск для статьи",
+
+    "article_full":
+        "📝 Основная статья",
+
+    "article_short":
+        "✂️ Короткая версия",
+
+    "image_generation":
+        "🖼 Изображение",
+
+    "comment_reply":
+        "💬 Ответ на комментарий",
+
+    "popular_comment_topic":
+        "🔥 Тема из комментария",
+
+    "unknown":
+        "❔ Без категории",
+}
+
+
+_AI_SERVICE_NAMES = {
+    "yandexgpt":
+        "YandexGPT",
+
+    "yandex_art":
+        "YandexART",
+
+    "yandex_search":
+        "Search API",
+}
+
+
+def _format_ai_usage_report(
+    period: str,
+) -> str:
+
+    report = period_report(
+        period,
+        timezone_name=getattr(
+            cfg,
+            "timezone",
+            "Europe/Moscow",
+        ),
+    )
+
+    period_names = {
+        "today": "Сегодня",
+        "month": "Текущий месяц",
+        "all": "Всё время",
+    }
+
+    lines = [
+        "💰 <b>Расходы AI</b>",
+        "",
+        (
+            "📅 Период: "
+            f"<b>{period_names.get(period, 'Сегодня')}</b>"
+        ),
+        "",
+        (
+            "💵 Всего: "
+            f"<b>{report['cost_rub']:.2f} ₽</b>"
+        ),
+        (
+            "🔢 API-запросов: "
+            f"<b>{report['requests']}</b>"
+        ),
+        "",
+        "🧠 <b>Токены YandexGPT</b>",
+        (
+            "Входящие: "
+            f"{report['input_tokens']:,}"
+        ).replace(",", " "),
+        (
+            "Кешированные: "
+            f"{report['cached_tokens']:,}"
+        ).replace(",", " "),
+        (
+            "Исходящие: "
+            f"{report['output_tokens']:,}"
+        ).replace(",", " "),
+    ]
+
+    if report["services"]:
+        lines.extend([
+            "",
+            "☁️ <b>По сервисам</b>",
+        ])
+
+        for row in report["services"]:
+            name = _AI_SERVICE_NAMES.get(
+                row["service"],
+                row["service"],
+            )
+
+            lines.append(
+                f"• {html.escape(name)}: "
+                f"<b>{row['cost_rub']:.2f} ₽</b> "
+                f"({row['requests']} запр.)"
+            )
+
+    if report["actions"]:
+        lines.extend([
+            "",
+            "📋 <b>По действиям</b>",
+        ])
+
+        for row in report["actions"]:
+            name = _AI_ACTION_NAMES.get(
+                row["action"],
+                row["action"],
+            )
+
+            lines.append(
+                f"• {html.escape(name)} — "
+                f"<b>{row['cost_rub']:.3f} ₽</b> "
+                f"({row['operations']})"
+            )
+
+    if report["users"]:
+        lines.extend([
+            "",
+            "👥 <b>Самые дорогие пользователи</b>",
+        ])
+
+        for row in report["users"]:
+            lines.append(
+                f"• <code>{row['user_id']}</code> — "
+                f"<b>{row['cost_rub']:.2f} ₽</b>"
+            )
+
+    if report["operations"] == 0:
+        lines.extend([
+            "",
+            "ℹ️ За выбранный период "
+            "ещё нет записанных расходов.",
+        ])
+
+    lines.extend([
+        "",
+        "ℹ️ Учитываются расходы, записанные "
+        "внутренним счётчиком Zenbot.",
+    ])
+
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "admin:ai_usage")
+async def cb_ai_usage(
+    call: CallbackQuery,
+):
+    if await deny(call):
+        return
+
+    await call.answer()
+
+    period = "today"
+
+    await call.message.answer(
+        _format_ai_usage_report(period),
+        parse_mode="HTML",
+        reply_markup=ai_usage_menu(period),
+    )
+
+
+@dp.callback_query(
+    F.data.startswith("admin:ai_usage:")
+)
+async def cb_ai_usage_period(
+    call: CallbackQuery,
+):
+    if await deny(call):
+        return
+
+    await call.answer()
+
+    period = call.data.rsplit(
+        ":",
+        1,
+    )[-1]
+
+    if period not in {
+        "today",
+        "month",
+        "all",
+    }:
+        period = "today"
+
+    text = _format_ai_usage_report(
+        period
+    )
+
+    try:
+        await call.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=ai_usage_menu(period),
+        )
+
+    except Exception:
+        await call.message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=ai_usage_menu(period),
+        )
+
 
 async def main():
     global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker, comment_responder_worker, tenant_dzen_manager

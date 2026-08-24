@@ -3,6 +3,7 @@ import asyncio, json, re, ssl, time
 from pathlib import Path
 from typing import Any
 import httpx, jwt, truststore
+from ai_usage import record_gpt
 
 IAM_TOKEN_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -328,12 +329,146 @@ class YandexGPTClient:
         if response.status_code >= 400:
             raise RuntimeError(f"YandexGPT HTTP {response.status_code}: {response.text}")
         data = response.json()
-        alternatives = data.get("result", {}).get("alternatives") or data.get("alternatives")
+
+        result = data.get("result") or {}
+
+        alternatives = (
+            result.get("alternatives")
+            or data.get("alternatives")
+        )
+
         if not alternatives:
-            raise RuntimeError(f"YandexGPT вернул неожиданный ответ: {data}")
-        text = alternatives[0].get("message", {}).get("text", "").strip()
+            raise RuntimeError(
+                f"YandexGPT вернул неожиданный ответ: {data}"
+            )
+
+        text = (
+            alternatives[0]
+            .get("message", {})
+            .get("text", "")
+            .strip()
+        )
+
         if not text:
-            raise RuntimeError("YandexGPT вернул пустой текст")
+            raise RuntimeError(
+                "YandexGPT вернул пустой текст"
+            )
+
+        # -------------------------------------------------
+        # Фактический usage YandexGPT
+        # -------------------------------------------------
+
+        usage = (
+            result.get("usage")
+            or data.get("usage")
+            or {}
+        )
+
+        def usage_int(*keys: str) -> int:
+            for key in keys:
+                value = usage.get(key)
+
+                if value is None:
+                    continue
+
+                try:
+                    return max(
+                        int(float(value)),
+                        0,
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            return 0
+
+        input_tokens = usage_int(
+            "inputTextTokens",
+            "inputTokens",
+            "promptTokens",
+            "input_tokens",
+            "prompt_tokens",
+        )
+
+        output_tokens = usage_int(
+            "completionTokens",
+            "outputTextTokens",
+            "outputTokens",
+            "completion_tokens",
+            "output_tokens",
+        )
+
+        cached_tokens = usage_int(
+            "cachedTextTokens",
+            "cachedTokens",
+            "inputCachedTokens",
+            "cachedInputTokens",
+            "cached_tokens",
+            "input_cached_tokens",
+        )
+
+        # Некоторые версии API кладут информацию
+        # о кешированных токенах во вложенный объект.
+        if cached_tokens == 0:
+            details = (
+                usage.get("inputTextTokensDetails")
+                or usage.get("inputTokensDetails")
+                or usage.get("promptTokensDetails")
+                or {}
+            )
+
+            if isinstance(details, dict):
+                for key in (
+                    "cachedTokens",
+                    "cachedTextTokens",
+                    "cached_tokens",
+                ):
+                    value = details.get(key)
+
+                    if value is None:
+                        continue
+
+                    try:
+                        cached_tokens = max(
+                            int(float(value)),
+                            0,
+                        )
+                        break
+                    except (TypeError, ValueError):
+                        pass
+
+        # Fallback: если API вернул total,
+        # но не вернул output отдельно.
+        if output_tokens == 0:
+            total_tokens = usage_int(
+                "totalTokens",
+                "total_tokens",
+            )
+
+            if (
+                total_tokens > 0
+                and input_tokens > 0
+                and total_tokens >= input_tokens
+            ):
+                output_tokens = (
+                    total_tokens
+                    - input_tokens
+                )
+
+        # Учёт расходов НЕ должен ломать генерацию,
+        # даже если база временно недоступна.
+        try:
+            record_gpt(
+                input_tokens=input_tokens,
+                cached_tokens=cached_tokens,
+                output_tokens=output_tokens,
+                model="yandexgpt/latest",
+                metadata={
+                    "usage_raw": usage,
+                },
+            )
+        except Exception:
+            pass
+
         return text
 
     @staticmethod

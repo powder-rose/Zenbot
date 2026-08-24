@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ai_usage import usage_context
+
 import asyncio
 import html
 import logging
@@ -447,10 +449,16 @@ class ArticleService:
                 "новые требования практика"
             )
 
-            sources = await self.search.search(
-                search_query,
-                max_results=12,
-            )
+            with usage_context(
+                "search_subtopic",
+                metadata={
+                    "topic": topic_title,
+                },
+            ):
+                sources = await self.search.search(
+                    search_query,
+                    max_results=12,
+                )
 
             if not sources:
                 return None
@@ -460,13 +468,17 @@ class ArticleService:
                 limit=80,
             )
 
-            subtopic = (
-                await self.gpt.select_article_subtopic(
-                    topic=topic_title,
-                    sources=sources,
-                    used_subtopics=used,
+            with usage_context(
+                "subtopic_select",
+                metadata={"topic": topic_title},
+            ):
+                subtopic = (
+                    await self.gpt.select_article_subtopic(
+                        topic=topic_title,
+                        sources=sources,
+                        used_subtopics=used,
+                    )
                 )
-            )
 
             subtopic = " ".join(
                 str(subtopic).split()
@@ -515,10 +527,17 @@ class ArticleService:
             subtopic or topic_title
         ).strip()
 
-        sources = await self.search.search(
-            focus_topic,
-            max_results=8,
-        )
+        with usage_context(
+            "search_article",
+            metadata={
+                "topic": topic_title,
+                "subtopic": subtopic,
+            },
+        ):
+            sources = await self.search.search(
+                focus_topic,
+                max_results=8,
+            )
 
         article_system_prompt = (
             await db.get_setting(
@@ -542,21 +561,32 @@ class ArticleService:
         ).strip() or DEFAULT_IMAGE_PROMPT_TEMPLATE
 
         # Long-версия: около 3000 символов с пробелами.
-        title, full_body = await self.gpt.generate_article_from_sources(
-            topic=focus_topic,
-            sources=sources,
-            subtopic=subtopic,
-            max_chars=3200,
-            system_prompt=article_system_prompt,
-        )
+        with usage_context(
+            "article_full",
+            metadata={
+                "topic": topic_title,
+                "subtopic": subtopic,
+            },
+        ):
+            title, full_body = await self.gpt.generate_article_from_sources(
+                topic=focus_topic,
+                sources=sources,
+                subtopic=subtopic,
+                max_chars=3200,
+                system_prompt=article_system_prompt,
+            )
 
         # Short-версия: остаётся в Telegram после удаления long-post.
-        _, short_body = await self.gpt.generate_syncbot_article_from_sources(
-            topic=topic_title,
-            sources=sources,
-            max_chars=820,
-            system_prompt=short_system_prompt,
-        )
+        with usage_context(
+            "article_short",
+            metadata={"topic": topic_title},
+        ):
+            _, short_body = await self.gpt.generate_syncbot_article_from_sources(
+                topic=topic_title,
+                sources=sources,
+                max_chars=820,
+                system_prompt=short_system_prompt,
+            )
 
         title = clean_article_text(
             title
@@ -604,9 +634,16 @@ class ArticleService:
                     attempt,
                 )
 
-                image_bytes = await self.art.generate_image(
-                    prompt
-                )
+                with usage_context(
+                    "image_generation",
+                    metadata={
+                        "topic": topic_title,
+                        "subtopic": subtopic,
+                    },
+                ):
+                    image_bytes = await self.art.generate_image(
+                        prompt
+                    )
 
                 if not image_bytes:
                     raise RuntimeError(

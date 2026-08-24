@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio, base64, html, re, ssl, xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable
 import httpx, truststore
+from ai_usage import record_search
 
 SEARCH_URL = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 
@@ -45,7 +46,21 @@ class YandexSearchClient:
                 json=body,
             )
         if response.status_code >= 400:
-            raise RuntimeError(f"Yandex Search HTTP {response.status_code}: {response.text}")
+            raise RuntimeError(
+                f"Yandex Search HTTP {response.status_code}: {response.text}"
+            )
+
+        # Запрос успешно принят Search API.
+        # Учёт не должен влиять на поиск.
+        try:
+            record_search(
+                metadata={
+                    "max_results": max_results,
+                },
+            )
+        except Exception:
+            pass
+
         data = response.json()
         raw = data.get("rawData")
         if not raw:

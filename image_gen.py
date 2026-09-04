@@ -73,9 +73,9 @@ class YandexArtClient:
                 time.sleep(3)
         raise TimeoutError("YandexART не завершил генерацию за 180 секунд")
 
-    async def generate_image(self, prompt: str, aspect_ratio: tuple[int,int] = (1,1)) -> bytes:
+    async def generate_image(self, prompt: str, aspect_ratio: tuple[int,int] = (4,3)) -> bytes:
         prompt = " ".join(prompt.split())
-        if len(prompt) > 480:
-            prompt = prompt[:480].rsplit(" ",1)[0].rstrip()
+        if len(prompt) > 500:
+            prompt = prompt[:500].rstrip()
         auth = await self.get_auth_header()
         return await asyncio.to_thread(self._generate_sync, auth, prompt, aspect_ratio)

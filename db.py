@@ -554,12 +554,14 @@ async def set_auto_publish_enabled(enabled: bool) -> None:
 async def ensure_default_daily_schedule(
     default_times: tuple[str, ...] = (
         "09:00",
-        "14:00",
-        "19:00",
+        "12:00",
+        "15:00",
+        "18:00",
+        "21:00",
     ),
 ) -> None:
     """
-    Инициализирует три ежедневных автоматических публикации.
+    Инициализирует пять ежедневных автоматических публикаций.
 
     По умолчанию:
       09:00
@@ -596,7 +598,7 @@ async def ensure_default_daily_schedule(
                 value
             )
 
-    migration_key = "daily_schedule_v36_initialized"
+    migration_key = "daily_schedule_v58_five_articles"
 
     if await get_setting(
         migration_key,
@@ -638,6 +640,11 @@ async def ensure_default_daily_schedule(
                     "19:00",
                 }
             )
+            or existing == [
+                "09:00",
+                "14:00",
+                "19:00",
+            ]
         )
 
         if should_replace_old_default:

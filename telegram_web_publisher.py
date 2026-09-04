@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import html
+
 import asyncio
 import base64
 import json
@@ -390,29 +392,53 @@ class TelegramWebPublisher:
             page
         )
 
-        # Telegram Web — SPA. Иногда прямой hash-route не успевает.
-        composer = await self._get_main_composer(
-            page,
-            optional=True,
-        )
+        # Telegram Web — SPA.
+        # Канал может открыться раньше, чем composer станет видимым.
+        composer = None
 
-        if composer is not None:
-            return
+        for _ in range(12):
+            composer = await self._get_main_composer(
+                page,
+                optional=True,
+            )
+
+            if composer is not None:
+                log.info(
+                    "Telegram Web: канал открыт через direct route, "
+                    "composer найден."
+                )
+                return
+
+            await page.wait_for_timeout(500)
 
         # Fallback через поиск.
-        search = await self._first_visible(
-            [
-                page.locator(
-                    'input[placeholder*="Search" i]'
-                ),
-                page.locator(
-                    'input[placeholder*="Поиск" i]'
-                ),
-                page.locator(
-                    '.input-search-input'
-                ),
-            ]
-        )
+        #
+        # Telegram Web иногда сначала показывает shimmer/loading,
+        # а поле поиска становится видимым через несколько секунд.
+        # Поэтому не проверяем его только один раз.
+        search = None
+
+        search_candidates = [
+            page.locator(
+                '.input-search-input'
+            ),
+            page.locator(
+                'input[placeholder*="Search" i]'
+            ),
+            page.locator(
+                'input[placeholder*="Поиск" i]'
+            ),
+        ]
+
+        for attempt in range(15):
+            search = await self._first_visible(
+                search_candidates
+            )
+
+            if search is not None:
+                break
+
+            await page.wait_for_timeout(1000)
 
         if search is None:
             await self._debug_capture(
@@ -421,7 +447,7 @@ class TelegramWebPublisher:
             )
             raise RuntimeError(
                 "Не удалось открыть канал в Telegram Web: "
-                "не найдено поле поиска."
+                "поле поиска не стало доступно за 15 секунд."
             )
 
         await search.click()
@@ -429,6 +455,24 @@ class TelegramWebPublisher:
             self.channel
         )
         await page.wait_for_timeout(1800)
+
+        # Поиск Telegram может сам открыть уже существующий
+        # подходящий диалог. В этом случае не нужно искать
+        # username в видимом названии результата.
+        for _ in range(10):
+            composer = await self._get_main_composer(
+                page,
+                optional=True,
+            )
+
+            if composer is not None:
+                log.info(
+                    "Telegram Web: composer появился после поиска, "
+                    "канал уже открыт."
+                )
+                return
+
+            await page.wait_for_timeout(500)
 
         result = await self._first_visible(
             [
@@ -1218,29 +1262,312 @@ class TelegramWebPublisher:
 
         return None
 
-    async def _send_media_popup(
+    @staticmethod
+    def _caption_markdown_to_html(
+        caption: str,
+    ) -> tuple[str, str]:
+        """
+        Преобразует простую разметку пользователя
+        в HTML для Telegram Web.
+
+        Поддерживается:
+        **жирный**
+        *курсив*
+        __подчёркнутый__
+        ~~зачёркнутый~~
+        ==выделенный==
+
+        ==...== отображаем жирным, так как отдельного
+        текстового маркера-highlight Telegram не имеет.
+        """
+        source = str(caption or "")
+
+        # ----------------------------------------------------
+        # Пользовательский prompt может использовать
+        # собственные теги форматирования.
+        # Сначала приводим их к единому Markdown-виду.
+        # ----------------------------------------------------
+
+        custom_replacements = {
+            "[[B]]": "**",
+            "[[/B]]": "**",
+
+            "[[I]]": "*",
+            "[[/I]]": "*",
+
+            "[[U]]": "__",
+            "[[/U]]": "__",
+
+            "[[S]]": "~~",
+            "[[/S]]": "~~",
+        }
+
+        for old, new in custom_replacements.items():
+            source = source.replace(
+                old,
+                new,
+            )
+
+        def quote_repl(match):
+            content = match.group(1).strip()
+
+            return "\n".join(
+                (
+                    "> " + line
+                    if line.strip()
+                    else ">"
+                )
+                for line in content.splitlines()
+            )
+
+        source = re.sub(
+            r"\[\[Q\]\](.*?)\[\[/Q\]\]",
+            quote_repl,
+            source,
+            flags=re.I | re.S,
+        )
+
+        # [URL](URL) -> обычный URL.
+        source = re.sub(
+            r"\[(https?://[^\]\s]+)\]\(\1\)",
+            r"\1",
+            source,
+        )
+
+        def render_inline(value: str) -> str:
+            value = html.escape(
+                value,
+                quote=False,
+            )
+
+            value = re.sub(
+                r"\*\*(.+?)\*\*",
+                r"<b>\1</b>",
+                value,
+            )
+
+            value = re.sub(
+                r"__(.+?)__",
+                r"<u>\1</u>",
+                value,
+            )
+
+            value = re.sub(
+                r"~~(.+?)~~",
+                r"<s>\1</s>",
+                value,
+            )
+
+            value = re.sub(
+                r"==(.+?)==",
+                r"<b>\1</b>",
+                value,
+            )
+
+            value = re.sub(
+                r"(?<!\*)\*([^*\n]+?)\*(?!\*)",
+                r"<i>\1</i>",
+                value,
+            )
+
+            value = re.sub(
+                r"(?<!_)_([^_\n]+?)_(?!_)",
+                r"<i>\1</i>",
+                value,
+            )
+
+            return value
+
+        lines = source.split("\n")
+
+        rendered_lines: list[str] = []
+
+        for index, line in enumerate(lines):
+            stripped = line.lstrip()
+
+            is_quote = (
+                stripped.startswith("> ")
+                or stripped == ">"
+            )
+
+            if is_quote:
+                quote_text = (
+                    stripped[1:].lstrip()
+                )
+
+                rendered = render_inline(
+                    quote_text
+                )
+
+                rendered = (
+                    f"<blockquote>{rendered}</blockquote>"
+                )
+            else:
+                rendered = render_inline(
+                    line
+                )
+
+            # Первая строка caption — заголовок.
+            if (
+                index == 0
+                and rendered.strip()
+                and not is_quote
+                and not rendered.lstrip().startswith("<b>")
+            ):
+                rendered = f"<b>{rendered}</b>"
+
+            rendered_lines.append(
+                rendered
+            )
+
+        rich_html = "<br>".join(
+            rendered_lines
+        )
+
+        plain = source
+
+        replacements = [
+            (r"\*\*(.+?)\*\*", r"\1"),
+            (r"__(.+?)__", r"\1"),
+            (r"~~(.+?)~~", r"\1"),
+            (r"==(.+?)==", r"\1"),
+            (
+                r"(?<!\*)\*([^*\n]+?)\*(?!\*)",
+                r"\1",
+            ),
+            (
+                r"(?<!_)_([^_\n]+?)_(?!_)",
+                r"\1",
+            ),
+        ]
+
+        for pattern, repl in replacements:
+            plain = re.sub(
+                pattern,
+                repl,
+                plain,
+            )
+
+        return plain, rich_html
+
+
+    async def _fill_rich_caption(
         self,
         page: Page,
-        dialog: Locator,
+        editor: Locator,
         caption: str,
-    ) -> None:
-        editor = await self._get_caption_editor(
-            page,
-            dialog,
+    ) -> str:
+        """
+        Вставляет LONG caption в Telegram Web
+        с реальным форматированием.
+
+        Возвращает plain-caption без Markdown-маркеров,
+        чтобы последующая проверка отправки искала
+        фактически опубликованный текст.
+        """
+        plain, rich_html = (
+            self._caption_markdown_to_html(
+                caption
+            )
         )
 
         await editor.click(
             force=True
         )
+
+        # Сначала очищаем contenteditable штатным способом.
+        await editor.fill("")
+
+        try:
+            result = await editor.evaluate(
+                """(el, richHtml) => {
+                    try {
+                        el.focus();
+
+                        const selection =
+                            window.getSelection();
+
+                        const range =
+                            document.createRange();
+
+                        range.selectNodeContents(el);
+                        range.collapse(false);
+
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+
+                        const ok =
+                            document.execCommand(
+                                "insertHTML",
+                                false,
+                                richHtml
+                            );
+
+                        el.dispatchEvent(
+                            new InputEvent(
+                                "input",
+                                {
+                                    bubbles: true,
+                                    inputType: "insertHTML"
+                                }
+                            )
+                        );
+
+                        return {
+                            ok: Boolean(ok),
+                            text: el.innerText || "",
+                            html: el.innerHTML || ""
+                        };
+                    } catch (e) {
+                        return {
+                            ok: false,
+                            error: String(e)
+                        };
+                    }
+                }""",
+                rich_html,
+            )
+
+            if (
+                isinstance(result, dict)
+                and result.get("ok")
+            ):
+                log.info(
+                    "Telegram Web: LONG caption "
+                    "вставлен с rich formatting."
+                )
+
+                await page.wait_for_timeout(
+                    300
+                )
+
+                return plain
+
+            log.warning(
+                "Telegram Web: rich caption "
+                "insertHTML не подтверждён: %r",
+                result,
+            )
+
+        except Exception:
+            log.exception(
+                "Telegram Web: rich caption "
+                "вставить не удалось."
+            )
+
+        # --------------------------------------------
+        # Безопасный fallback:
+        # если rich-вставка не поддержалась,
+        # отправляем хотя бы чистый текст
+        # БЕЗ Markdown-звёздочек.
+        # --------------------------------------------
+
         await editor.fill(
-            caption
-        )
-        await page.wait_for_timeout(
-            300
+            plain
         )
 
-        # Заголовок — первая строка caption — жирный.
-        # В сам текст Markdown-звёздочки не добавляются.
+        # Заголовок остаётся жирным,
+        # как работало раньше.
         try:
             await editor.press(
                 "Control+Home"
@@ -1254,19 +1581,215 @@ class TelegramWebPublisher:
             await editor.press(
                 "End"
             )
-            await page.wait_for_timeout(
-                150
-            )
         except Exception:
             log.exception(
-                "Не удалось применить жирное начертание "
-                "к заголовку Telegram Web."
+                "Не удалось применить жирное "
+                "начертание к LONG-заголовку."
             )
+
+        await page.wait_for_timeout(
+            300
+        )
+
+        return plain
+
+
+    async def _send_media_popup(
+        self,
+        page: Page,
+        dialog: Locator,
+        caption: str,
+        *,
+        silent: bool = False,
+    ) -> None:
+        editor = await self._get_caption_editor(
+            page,
+            dialog,
+        )
+
+        # Markdown из пользовательского LONG-промпта
+        # превращаем в настоящее форматирование Telegram Web.
+        #
+        # caption заменяем на plain-версию, чтобы дальнейшая
+        # проверка фактически отправленного сообщения
+        # не искала Markdown-маркеры.
+        caption = await self._fill_rich_caption(
+            page,
+            editor,
+            caption,
+        )
 
         send = await self._find_media_send_button(
             page,
             dialog,
         )
+
+        if silent:
+            if send is None:
+                await self._debug_capture(
+                    page,
+                    "silent_send_button_not_found",
+                )
+                raise RuntimeError(
+                    "Telegram Web: запрошена тихая отправка, "
+                    "но кнопка Send не найдена. "
+                    "Обычная отправка запрещена."
+                )
+
+            silent_pattern = re.compile(
+                (
+                    r"send\s+without\s+sound|"
+                    r"send\s+silently|"
+                    r"without\s+sound|"
+                    r"отправить\s+без\s+звука|"
+                    r"без\s+звука"
+                ),
+                re.I,
+            )
+
+            async def find_silent_action():
+                return await self._first_visible(
+                    [
+                        page.get_by_role(
+                            "menuitem",
+                            name=silent_pattern,
+                        ),
+                        page.get_by_role(
+                            "button",
+                            name=silent_pattern,
+                        ),
+                        page.get_by_text(
+                            silent_pattern
+                        ),
+                        page.locator(
+                            '[role="menuitem"], '
+                            '.btn-menu-item, '
+                            '.menu-item, '
+                            '[class*="MenuItem"], '
+                            '[class*="menu-item"]'
+                        ).filter(
+                            has_text=silent_pattern
+                        ),
+                    ]
+                )
+
+            silent_item = None
+
+            # Telegram Web обычно открывает дополнительные
+            # варианты отправки по правому клику Send.
+            try:
+                await send.click(
+                    button="right",
+                    force=True,
+                    timeout=5000,
+                )
+                await page.wait_for_timeout(
+                    700
+                )
+                silent_item = await find_silent_action()
+            except Exception:
+                silent_item = None
+
+            # Если правый клик открыл меню, но нужного
+            # пункта там нет, закрываем его перед long-press.
+            if silent_item is None:
+                try:
+                    await page.keyboard.press(
+                        "Escape"
+                    )
+                    await page.wait_for_timeout(
+                        300
+                    )
+                except Exception:
+                    pass
+
+            # Fallback: длительное нажатие на Send.
+            if silent_item is None:
+                try:
+                    box = await send.bounding_box()
+
+                    if box:
+                        x = (
+                            box["x"]
+                            + box["width"] / 2
+                        )
+                        y = (
+                            box["y"]
+                            + box["height"] / 2
+                        )
+
+                        await page.mouse.move(
+                            x,
+                            y,
+                        )
+                        await page.mouse.down()
+                        await page.wait_for_timeout(
+                            900
+                        )
+                        await page.mouse.up()
+
+                        await page.wait_for_timeout(
+                            700
+                        )
+
+                        silent_item = (
+                            await find_silent_action()
+                        )
+                except Exception:
+                    silent_item = None
+
+            if silent_item is None:
+                await self._debug_capture(
+                    page,
+                    "silent_send_menu_not_found",
+                )
+                raise RuntimeError(
+                    "Telegram Web: не найден пункт "
+                    "'Send without sound / Отправить без звука'. "
+                    "Обычная отправка LONG запрещена."
+                )
+
+            wrapper = silent_item.locator(
+                "xpath=ancestor-or-self::*["
+                "self::button or "
+                "@role='menuitem' or "
+                "contains(@class,'btn-menu-item') or "
+                "contains(@class,'menu-item')"
+                "][1]"
+            )
+
+            if await wrapper.count():
+                await wrapper.click(
+                    force=True,
+                    timeout=5000,
+                )
+            else:
+                await silent_item.click(
+                    force=True,
+                    timeout=5000,
+                )
+
+            if await self._media_send_completed(
+                page,
+                dialog,
+                caption,
+                timeout_ms=7000,
+            ):
+                log.info(
+                    "Telegram Web: media post отправлен "
+                    "БЕЗ ЗВУКА."
+                )
+                return
+
+            await self._debug_capture(
+                page,
+                "silent_send_not_completed",
+            )
+
+            raise RuntimeError(
+                "Telegram Web: выбран тихий режим, "
+                "но media post не был подтверждён как отправленный."
+            )
 
         if send is not None:
             try:
@@ -1545,6 +2068,8 @@ class TelegramWebPublisher:
         self,
         image_bytes: bytes,
         caption: str,
+        *,
+        silent: bool = False,
     ) -> WebPostRef:
         if not image_bytes:
             raise RuntimeError(
@@ -1579,6 +2104,7 @@ class TelegramWebPublisher:
                     page,
                     media_dialog,
                     caption,
+                    silent=silent,
                 )
 
                 ref = await self._capture_ref(

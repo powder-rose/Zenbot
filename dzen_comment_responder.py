@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from yandex_gpt import ContentBlockedError
+
 from ai_usage import usage_context
 
 import asyncio
@@ -90,12 +92,8 @@ class DzenCommentResponderWorker:
         # Старый общий worker остаётся без этого ограничения.
         self.daily_reply_limit = (
             10
-            if self.tenant_user_id == 46674838
-            else (
-                3
-                if self.tenant_user_id is not None
-                else None
-            )
+            if self.tenant_user_id is not None
+            else None
         )
 
         self.comments_url = (
@@ -583,8 +581,24 @@ class DzenCommentResponderWorker:
                 if not reply:
                     return index, item, "", "skipped_ai", ""
                 return index, item, reply, "ok", ""
+            except ContentBlockedError as exc:
+                log.warning(
+                    "Dzen responder: safety skip comment=%s error=%s",
+                    item.comment_id or item.key,
+                    exc,
+                )
+                return (
+                    index,
+                    item,
+                    "",
+                    "skipped_safety",
+                    str(exc),
+                )
             except Exception as exc:
-                log.exception("Dzen responder: ошибка YandexGPT для %s", item.key)
+                log.exception(
+                    "Dzen responder: ошибка YandexGPT для %s",
+                    item.key,
+                )
                 return index, item, "", "error", str(exc)
             finally:
                 # Счётчик прогресса безопасен в рамках одного event loop.
@@ -612,10 +626,33 @@ class DzenCommentResponderWorker:
                 skipped += 1
                 continue
             if status == "skipped_ai":
-                self._mark_processed(state, item, status="skipped_ai", reply="")
+                self._mark_processed(
+                    state,
+                    item,
+                    status="skipped_ai",
+                    reply="",
+                )
                 skipped += 1
                 self._bump_stat(state, "skipped")
                 continue
+
+            if status == "skipped_safety":
+                self._mark_processed(
+                    state,
+                    item,
+                    status="skipped_safety",
+                    reply="",
+                )
+                skipped += 1
+                self._bump_stat(state, "skipped")
+
+                log.info(
+                    "Dzen responder: comment permanently skipped "
+                    "by safety filter comment=%s",
+                    item.comment_id or item.key,
+                )
+                continue
+
             ai_errors += 1
             self._bump_stat(state, "errors")
             log.error("Dzen responder: YandexGPT failed comment=%s error=%s", item.comment_id or item.key, error)

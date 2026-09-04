@@ -35,6 +35,110 @@ from yandex_gpt import (
 log = logging.getLogger(__name__)
 
 
+def normalize_user_rich_markup(text: str) -> str:
+    """
+    Нормализует пользовательскую разметку.
+
+    Поддерживаем оба варианта:
+
+    [[B]]жирный[[/B]]
+    [[I]]курсив[[/I]]
+    [[U]]подчёркнутый[[/U]]
+    [[S]]зачёркнутый[[/S]]
+    [[Q]]цитата[[/Q]]
+
+    и обычный Markdown.
+    """
+    if not text:
+        return ""
+
+    value = str(text)
+
+    replacements = {
+        "[[B]]": "<b>",
+        "[[/B]]": "</b>",
+
+        "[[I]]": "<i>",
+        "[[/I]]": "</i>",
+
+        "[[U]]": "<u>",
+        "[[/U]]": "</u>",
+
+        "[[S]]": "<s>",
+        "[[/S]]": "</s>",
+    }
+
+    for old, new in replacements.items():
+        value = value.replace(
+            old,
+            new,
+        )
+
+    # Цитата -> Rich Markdown quote.
+    def quote_repl(match):
+        content = match.group(1).strip()
+
+        return "\n".join(
+            (
+                "> " + line
+                if line.strip()
+                else ">"
+            )
+            for line in content.splitlines()
+        )
+
+    value = re.sub(
+        r"\[\[Q\]\](.*?)\[\[/Q\]\]",
+        quote_repl,
+        value,
+        flags=re.I | re.S,
+    )
+
+    # Частый вариант модели:
+    # [https://site.ru](https://site.ru)
+    # превращаем просто в ссылку.
+    value = re.sub(
+        r"\[(https?://[^\]\s]+)\]\(\1\)",
+        r"\1",
+        value,
+    )
+
+    return value
+
+
+def clean_short_article_text(text: str) -> str:
+    """
+    Минимальная очистка SHORT-текста.
+
+    ВАЖНО:
+    Markdown и поддерживаемый Telegram Rich HTML
+    намеренно сохраняются, чтобы пользовательский
+    prompt мог управлять оформлением публикации.
+    """
+    if not text:
+        return ""
+
+    text = normalize_user_rich_markup(
+        text
+    )
+
+    text = str(text).replace(
+        "\r\n",
+        "\n",
+    ).replace(
+        "\r",
+        "\n",
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
+
+
 def clean_article_text(text: str) -> str:
     if not text:
         return ""
@@ -132,17 +236,13 @@ def clean_article_text(text: str) -> str:
     return text.strip()
 
 
+MAX_YANDEX_ART_PROMPT_CHARS = 500
+
 DEFAULT_IMAGE_PROMPT_TEMPLATE = (
-    "Тема: {topic}. "
-    "Минималистичная editorial-иллюстрация в корпоративном стиле. "
-    "Покажи человека или предмет, напрямую связанный с темой статьи. "
-    "Главный образ точно передаёт смысл. "
-    "Нереалистичный, слегка абстрактный стиль: чёткие силуэты, "
-    "простые формы, минимум деталей, допустима геометризация. "
-    "Персонаж: маленькая голова, крупные руки и тело. "
-    "Образ почти на весь кадр, немного воздуха. "
-    "Приглушённые цвета, один акцент — синий или оранжевый. "
-    "Без текста, букв, подписей и логотипов."
+    "Создай качественную иллюстрацию по теме: {topic}. "
+    "Визуально передай основной смысл темы. "
+    "Изображение должно быть цельным, понятным "
+    "и подходящим для публикации."
 )
 
 ALLOWED_BLOG_URL = "https://boykovgroup.ru/blog"
@@ -153,44 +253,59 @@ def build_image_prompt(
     template: str | None = None,
 ) -> str:
     """
-    Пользователь может менять шаблон через Telegram-админку.
+    Формирует prompt для YandexART.
 
-    Маркер {topic} заменяется текущей темой статьи.
-    Если пользователь удалил {topic}, тема автоматически добавляется в начало.
+    Пользовательский шаблон имеет абсолютный приоритет.
 
-    YandexART принимает короткий prompt, поэтому финальный текст
-    жёстко ограничивается 480 символами.
+    Если в пользовательском шаблоне есть {topic},
+    маркер заменяется текущей темой.
+
+    Если пользователь удалил {topic}, код ничего
+    дополнительно к его prompt не добавляет.
+
+    Если пользовательский prompt отсутствует,
+    используется универсальный стандартный шаблон.
+
+    Максимальная длина prompt YandexART — 500 символов.
     """
-    template = (
-        (template or "").strip()
-        or DEFAULT_IMAGE_PROMPT_TEMPLATE
+    custom_template = str(
+        template or ""
+    ).strip()
+
+    effective_template = (
+        custom_template
+        if custom_template
+        else DEFAULT_IMAGE_PROMPT_TEMPLATE
     )
 
     clean_topic = " ".join(
-        topic.split()
+        str(topic or "").split()
     )
 
-    if "{topic}" in template:
-        result = template.replace(
+    if "{topic}" in effective_template:
+        result = effective_template.replace(
             "{topic}",
             clean_topic,
         )
     else:
-        result = (
-            f"Тема: {clean_topic}. {template}"
+        # ВАЖНО:
+        # ничего не дописываем к пользовательскому
+        # prompt автоматически.
+        result = effective_template
+
+    result = result.strip()
+
+    if len(result) > MAX_YANDEX_ART_PROMPT_CHARS:
+        log.warning(
+            "YandexART prompt truncated: "
+            "chars=%s limit=%s",
+            len(result),
+            MAX_YANDEX_ART_PROMPT_CHARS,
         )
 
-    result = " ".join(
-        result.split()
-    )
-
-    if len(result) > 480:
-        result = result[:480].rstrip()
-        if " " in result:
-            result = result.rsplit(
-                " ",
-                1,
-            )[0].rstrip()
+        result = result[
+            :MAX_YANDEX_ART_PROMPT_CHARS
+        ].rstrip()
 
     return result
 
@@ -331,30 +446,21 @@ def build_short_rich_message(
     image_bytes: bytes,
 ) -> InputRichMessage:
     """
-    После удаления long-post публикуем новый short Rich Message.
-    Это намеренно другой Telegram-формат: по фактическому тесту пользователя
-    Синхробот Дзена не переносил такие Rich Messages.
+    SHORT Rich Message.
+
+    Если пользовательская разметка [[B]] / [[I]] /
+    [[U]] / [[S]] уже преобразована в HTML-теги,
+    используем чистый Rich HTML.
+
+    Для обычного Markdown сохраняем старый
+    Rich Markdown режим.
     """
     clean_title = clean_article_text(
         title
     )
-    clean_body = clean_article_text(
+
+    rich_body = clean_short_article_text(
         body
-    )
-
-    paragraphs = [
-        f"<p>{html.escape(block)}</p>"
-        for block in _paragraphs(
-            clean_body
-        )
-    ]
-
-    article_html = (
-        '<img src="tg://photo?id=article_cover"/>'
-        f"<p><b>{html.escape(clean_title)}</b></p>"
-        + "<br>".join(
-            paragraphs
-        )
     )
 
     image_file = BufferedInputFile(
@@ -362,16 +468,151 @@ def build_short_rich_message(
         filename="article.jpg",
     )
 
-    return InputRichMessage(
-        html=article_html,
-        media=[
-            InputRichMessageMedia(
-                id="article_cover",
-                media=InputMediaPhoto(
-                    media=image_file,
-                ),
+    media = [
+        InputRichMessageMedia(
+            id="article_cover",
+            media=InputMediaPhoto(
+                media=image_file,
+            ),
+        )
+    ]
+
+    # Наши служебные теги после normalize_user_rich_markup()
+    # становятся HTML-тегами. Не смешиваем их с markdown=.
+    use_html = bool(
+        re.search(
+            r"</?(?:b|i|u|s)>",
+            rich_body,
+            re.I,
+        )
+    )
+
+    if use_html:
+        allowed_tags = (
+            "b",
+            "/b",
+            "i",
+            "/i",
+            "u",
+            "/u",
+            "s",
+            "/s",
+        )
+
+        def escape_preserving_rich_tags(
+            value: str,
+        ) -> str:
+            result = html.escape(
+                value,
+                quote=False,
             )
-        ],
+
+            for tag in allowed_tags:
+                result = result.replace(
+                    f"&lt;{tag}&gt;",
+                    f"<{tag}>",
+                )
+
+            return result
+
+        blocks = [
+            '<img src="tg://photo?id=article_cover"/>',
+            (
+                "<p><b>"
+                + html.escape(clean_title)
+                + "</b></p>"
+            ),
+        ]
+
+        for block in re.split(
+            r"\n\s*\n",
+            rich_body,
+        ):
+            block = block.strip()
+
+            if not block:
+                continue
+
+            lines = block.splitlines()
+
+            nonempty = [
+                line
+                for line in lines
+                if line.strip()
+            ]
+
+            is_quote = (
+                bool(nonempty)
+                and all(
+                    line.lstrip().startswith(">")
+                    for line in nonempty
+                )
+            )
+
+            if is_quote:
+                quote_lines = []
+
+                for line in lines:
+                    stripped = line.lstrip()
+
+                    if stripped.startswith(">"):
+                        stripped = stripped[1:]
+
+                        if stripped.startswith(" "):
+                            stripped = stripped[1:]
+
+                    quote_lines.append(
+                        escape_preserving_rich_tags(
+                            stripped
+                        )
+                    )
+
+                blocks.append(
+                    "<blockquote>"
+                    + "<br>".join(quote_lines)
+                    + "</blockquote>"
+                )
+
+            else:
+                safe_lines = [
+                    escape_preserving_rich_tags(
+                        line
+                    )
+                    for line in lines
+                ]
+
+                blocks.append(
+                    "<p>"
+                    + "<br>".join(safe_lines)
+                    + "</p>"
+                )
+
+        article_html = "".join(
+            blocks
+        )
+
+        return InputRichMessage(
+            html=article_html,
+            media=media,
+        )
+
+    # Fallback для клиентов, которые используют
+    # обычный Markdown вместо служебных [[...]].
+    article_markdown = (
+        "![](tg://photo?id=article_cover)"
+        "\n\n"
+        f"<b>{html.escape(clean_title)}</b>"
+    )
+
+    if rich_body:
+        article_markdown += (
+            "\n\n"
+            + rich_body
+        )
+
+    return InputRichMessage(
+        markdown=article_markdown,
+        media=media,
     )
 
 
@@ -444,10 +685,40 @@ class ArticleService:
         """
 
         try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            try:
+                current_tz = ZoneInfo(
+                    str(
+                        getattr(
+                            self.cfg,
+                            "timezone",
+                            "Europe/Moscow",
+                        )
+                    )
+                )
+            except Exception:
+                current_tz = ZoneInfo(
+                    "Europe/Moscow"
+                )
+
+            now_local = datetime.now(
+                current_tz
+            )
+
+            today_text = now_local.strftime(
+                "%d.%m.%Y"
+            )
+
             search_query = (
                 f"{topic_title} "
-                "актуальные изменения "
-                "новые требования практика"
+                f"актуально на {today_text} "
+                f"{now_local.year} "
+                "сегодня актуальные изменения "
+                "новые требования "
+                "будущие изменения "
+                "вступит в силу практика"
             )
 
             with usage_context(
@@ -522,11 +793,47 @@ class ArticleService:
         str,
         str,
         str,
+        str,
         bytes,
     ]:
         focus_topic = (
             subtopic or topic_title
         ).strip()
+
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        try:
+            current_tz = ZoneInfo(
+                str(
+                    getattr(
+                        self.cfg,
+                        "timezone",
+                        "Europe/Moscow",
+                    )
+                )
+            )
+        except Exception:
+            current_tz = ZoneInfo(
+                "Europe/Moscow"
+            )
+
+        now_local = datetime.now(
+            current_tz
+        )
+
+        today_text = now_local.strftime(
+            "%d.%m.%Y"
+        )
+
+        article_search_query = (
+            f"{focus_topic} "
+            f"актуально на {today_text} "
+            f"{now_local.year} "
+            "сегодня актуальные требования "
+            "будущие изменения "
+            "вступит в силу"
+        )
 
         with usage_context(
             "search_article",
@@ -536,7 +843,7 @@ class ArticleService:
             },
         ):
             sources = await self.search.search(
-                focus_topic,
+                article_search_query,
                 max_results=8,
             )
 
@@ -612,7 +919,7 @@ class ArticleService:
             "article_short",
             metadata={"topic": topic_title},
         ):
-            _, short_body = await self.gpt.generate_syncbot_article_from_article(
+            short_title, short_body = await self.gpt.generate_syncbot_article_from_article(
                 topic=topic_title,
                 article_title=title,
                 article_body=full_body,
@@ -623,19 +930,34 @@ class ArticleService:
         title = clean_article_text(
             title
         )
-        full_body = clean_article_text(
-            full_body
-        )
-        short_body = clean_article_text(
-            short_body
-        )
 
-        full_body = enforce_single_blog_link(
-            full_body
-        )
-        short_body = enforce_single_blog_link(
-            short_body
-        )
+        short_title = clean_article_text(
+            short_title
+        ) or title
+        if custom_article_prompt:
+            full_body = clean_short_article_text(
+                full_body
+            )
+        else:
+            full_body = clean_article_text(
+                full_body
+            )
+        short_body = clean_short_article_text(short_body)
+
+        # Содержательная постобработка допустима только
+        # для стандартных промптов.
+        #
+        # Пользовательский prompt имеет абсолютный приоритет:
+        # не добавляем, не удаляем и не заменяем его CTA/URL.
+        if not custom_article_prompt:
+            full_body = enforce_single_blog_link(
+                full_body
+            )
+
+        if not custom_short_prompt:
+            short_body = enforce_single_blog_link(
+                short_body
+            )
 
         log.info(
             "Тексты готовы: long=%s chars, short=%s chars",
@@ -716,6 +1038,7 @@ class ArticleService:
         return (
             title,
             full_body,
+            short_title,
             short_body,
             image_bytes,
         )
@@ -725,6 +1048,7 @@ class ArticleService:
         publication_id: int,
         title: str,
         full_body: str,
+        short_title: str,
         short_body: str,
         image_bytes: bytes | None,
         image_path: str | None,
@@ -758,6 +1082,7 @@ class ArticleService:
             post_ref = await self.telegram_web.send_media_post(
                 image_bytes,
                 full_caption,
+                silent=True,
             )
 
             serialized_ref = (
@@ -808,7 +1133,7 @@ class ArticleService:
                         1.5
                     )
 
-                    short_body_clean = clean_article_text(
+                    short_body_clean = clean_short_article_text(
                         short_body
                     )
 
@@ -820,7 +1145,7 @@ class ArticleService:
                     short_message_id = await send_short_rich_message(
                         self.bot,
                         self.cfg.telegram_channel_id,
-                        title,
+                        short_title,
                         short_body_clean,
                         image_bytes,
                     )
@@ -932,6 +1257,7 @@ class ArticleService:
                 (
                     title,
                     full_body,
+                    short_title,
                     short_body,
                     image_bytes,
                 ) = await self._generate(
@@ -1000,6 +1326,7 @@ class ArticleService:
                 publication_id,
                 title,
                 full_body,
+                short_title,
                 short_body,
                 image_bytes,
                 image_path,
@@ -1050,7 +1377,7 @@ class ArticleService:
                 }
 
             try:
-                title, full_body, short_body, image_bytes = await self._generate(
+                title, full_body, short_title, short_body, image_bytes = await self._generate(
                     topic_title
                 )
             except Exception as exc:
@@ -1071,6 +1398,7 @@ class ArticleService:
                 "status": "preview_ready",
                 "topic": topic_title,
                 "article_title": title,
+                "short_title": short_title,
                 "full_body": full_body,
                 "short_body": short_body,
                 "image_path": image_path,
@@ -1084,14 +1412,20 @@ class ArticleService:
         full_body: str,
         short_body: str,
         image_path: str,
+        short_title: str | None = None,
         trigger_type: str = "dzen_comment_approved",
     ) -> dict[str, Any]:
         """Publish the exact article previously shown in preview."""
         async with self.lock:
             topic_title = " ".join((topic_title or "").split())
             title = clean_article_text(title or "")
+            short_title = clean_article_text(
+                short_title or title
+            )
             full_body = clean_article_text(full_body or "")
-            short_body = clean_article_text(short_body or "")
+            short_body = clean_short_article_text(
+                short_body or ""
+            )
 
             if not topic_title or not title or not full_body or not short_body:
                 return {
@@ -1122,6 +1456,7 @@ class ArticleService:
                 publication_id,
                 title,
                 full_body,
+                short_title,
                 short_body,
                 image_bytes,
                 image_path,
@@ -1153,6 +1488,7 @@ class ArticleService:
                 (
                     title,
                     full_body,
+                    short_title,
                     short_body,
                     image_bytes,
                 ) = await self._generate(
@@ -1211,6 +1547,7 @@ class ArticleService:
                 publication_id,
                 title,
                 full_body,
+                short_title,
                 short_body,
                 image_bytes,
                 image_path,

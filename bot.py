@@ -2060,6 +2060,19 @@ async def main():
 
     await db.init_db(cfg.db_path)
     await tenant_db.init_db(cfg.db_path)
+
+    migrated_schedules = (
+        await tenant_db.migrate_default_schedules(
+            cfg.default_publish_times
+        )
+    )
+
+    if migrated_schedules:
+        log.info(
+            "Tenant schedules migrated to "
+            "5 publications/day: %s",
+            migrated_schedules,
+        )
     seeded = await db.seed_topics(DEFAULT_TOPICS)
     log.info("Добавлено стартовых тем: %s", seeded)
 
@@ -2095,10 +2108,6 @@ async def main():
         cfg=cfg,
     )
 
-    tenant_dzen_manager = TenantDzenManager(
-        gpt_client=gpt_client,
-        cfg=cfg,
-    )
 
     tenant_service = TenantArticleService(
         bot=bot,
@@ -2106,6 +2115,12 @@ async def main():
         gpt_client=gpt_client,
         search_client=search_client,
         art_client=art_client,
+    )
+
+    tenant_dzen_manager = TenantDzenManager(
+        gpt_client=gpt_client,
+        cfg=cfg,
+        article_service=tenant_service,
     )
     tenant_scheduler = TenantScheduler(tenant_service, cfg)
     configure_paid_multiuse(
@@ -2127,9 +2142,13 @@ async def main():
 
     scheduler_task = asyncio.create_task(scheduler.run())
     tenant_scheduler_task = asyncio.create_task(tenant_scheduler.run())
-    popular_comment_task = asyncio.create_task(popular_comment_worker.run())
-    comment_responder_task = asyncio.create_task(comment_responder_worker.run())
-    tenant_dzen_manager_task = asyncio.create_task(tenant_dzen_manager.run())
+
+    # Legacy Dzen workers больше не запускаются фоном.
+    # Они остаются доступны для ручных admin-команд.
+    # Автоматический Dzen обслуживает TenantDzenManager.
+    tenant_dzen_manager_task = asyncio.create_task(
+        tenant_dzen_manager.run()
+    )
     try:
         await dp.start_polling(bot)
     finally:
@@ -2140,10 +2159,13 @@ async def main():
         tenant_dzen_manager.stop()
         scheduler_task.cancel()
         tenant_scheduler_task.cancel()
-        popular_comment_task.cancel()
-        comment_responder_task.cancel()
         tenant_dzen_manager_task.cancel()
-        for task in (scheduler_task, tenant_scheduler_task, popular_comment_task, comment_responder_task, tenant_dzen_manager_task):
+
+        for task in (
+            scheduler_task,
+            tenant_scheduler_task,
+            tenant_dzen_manager_task,
+        ):
             try:
                 await task
             except asyncio.CancelledError:

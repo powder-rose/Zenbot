@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from yandex_gpt import SYNCBOT_SYSTEM_PROMPT
+
 import asyncio
 
 import html
@@ -81,6 +83,12 @@ PROMPTS = {
         "key": "prompt_article_system",
         "default": ARTICLE_SYSTEM_PROMPT,
         "filename": "article_prompt.txt",
+    },
+    "short": {
+        "title": "📱 Промпт короткой статьи",
+        "key": "prompt_short_system",
+        "default": SYNCBOT_SYSTEM_PROMPT,
+        "filename": "short_prompt.txt",
     },
     "image": {
         "title": "🖼 Промпт изображения",
@@ -316,7 +324,8 @@ def urgent_keyboard() -> InlineKeyboardMarkup:
 def prompts_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✍️ Текст статьи", callback_data="tenant:prompt:view:article")],
+            [InlineKeyboardButton(text="✍️ Длинная статья", callback_data="tenant:prompt:view:article")],
+            [InlineKeyboardButton(text="📱 Короткая статья", callback_data="tenant:prompt:view:short")],
             [InlineKeyboardButton(text="🖼 Изображение", callback_data="tenant:prompt:view:image")],
             [InlineKeyboardButton(text="⬅️ В кабинет", callback_data="tenant:home")],
         ]
@@ -905,7 +914,7 @@ async def show_tenant_dzen(
         cfg.timezone,
     )
 
-    remaining = max(0, 3 - used)
+    remaining = max(0, 10 - used)
 
     if row:
         comments_url = str(
@@ -929,12 +938,12 @@ async def show_tenant_dzen(
         "💬 <b>Дзен — автоответы</b>\n\n"
         f"Страница комментариев: "
         f"<code>{url_text}</code>\n\n"
-        f"Ответов сегодня: <b>{used}/3</b>\n"
+        f"Ответов сегодня: <b>{used}/10</b>\n"
         f"Осталось сегодня: <b>{remaining}</b>\n\n"
         f"Автоответы: "
         f"{'🟢 включены' if enabled else '⚪ пока не включены'}\n\n"
         "В подписку входит до "
-        "<b>3 подтверждённых ответов в сутки</b>.\n"
+        "<b>10 подтверждённых ответов в сутки</b>.\n"
         "Неудачные попытки и пропущенные комментарии "
         "лимит не расходуют.\n\n"
         "Сначала укажите страницу комментариев Дзена. "
@@ -2178,7 +2187,7 @@ async def cb_prompts(call: CallbackQuery, state: FSMContext):
     await call.answer()
     await call.message.answer(
         "🧠 <b>Мои промпты</b>\n\n"
-        "Промпт текста и изображения индивидуальны для вашего аккаунта. "
+        "Промпты длинной статьи, короткой статьи и изображения индивидуальны для вашего аккаунта. "
         "Изменение применяется со следующей статьи.\n\n"
         "Для изображения используйте <code>{topic}</code> — сюда подставляется текущая тема.",
         parse_mode="HTML",

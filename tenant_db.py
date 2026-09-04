@@ -377,6 +377,133 @@ async def ensure_defaults(user_id: int, publish_times: Iterable[str], topics: It
         await conn.commit()
 
 
+async def migrate_default_schedules(
+    publish_times,
+) -> int:
+    """
+    Переводит только старое стандартное расписание:
+    09:00 / 14:00 / 19:00
+
+    на новое расписание из config.
+
+    Пользовательские расписания не изменяются.
+    """
+    normalized = []
+
+    for raw in publish_times:
+        value = str(raw).strip()
+
+        parts = value.split(":")
+
+        if len(parts) != 2:
+            continue
+
+        if not all(
+            part.isdigit()
+            for part in parts
+        ):
+            continue
+
+        hour = int(parts[0])
+        minute = int(parts[1])
+
+        if not (
+            0 <= hour <= 23
+            and 0 <= minute <= 59
+        ):
+            continue
+
+        value = f"{hour:02d}:{minute:02d}"
+
+        if value not in normalized:
+            normalized.append(value)
+
+    if not normalized:
+        return 0
+
+    old_default = [
+        "10:00",
+        "15:00",
+        "20:00",
+    ]
+
+    migrated = 0
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+
+        conn.row_factory = aiosqlite.Row
+
+        cur = await conn.execute(
+            """
+            SELECT DISTINCT user_id
+            FROM tenant_schedule
+            ORDER BY user_id
+            """
+        )
+
+        users = await cur.fetchall()
+
+        for row in users:
+
+            user_id = int(
+                row["user_id"]
+            )
+
+            cur = await conn.execute(
+                """
+                SELECT publish_time
+                FROM tenant_schedule
+                WHERE user_id=?
+                  AND enabled=1
+                ORDER BY publish_time
+                """,
+                (user_id,),
+            )
+
+            rows = await cur.fetchall()
+
+            existing = [
+                str(item["publish_time"])
+                for item in rows
+            ]
+
+            if existing != old_default:
+                continue
+
+            await conn.execute(
+                """
+                DELETE FROM tenant_schedule
+                WHERE user_id=?
+                """,
+                (user_id,),
+            )
+
+            for publish_time in normalized:
+
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO tenant_schedule(
+                        user_id,
+                        publish_time,
+                        enabled
+                    )
+                    VALUES (?, ?, 1)
+                    """,
+                    (
+                        user_id,
+                        publish_time,
+                    ),
+                )
+
+            migrated += 1
+
+        await conn.commit()
+
+    return migrated
+
+
 async def get_setting(user_id: int, key: str, default: str = "") -> str:
     async with aiosqlite.connect(_path()) as conn:
         cur = await conn.execute(
@@ -1246,14 +1373,18 @@ async def record_tenant_dzen_reply(
 async def successful_publications_today(
     user_id: int,
     timezone_name: str = "Europe/Moscow",
+    *,
+    trigger_type: str | None = None,
+    exclude_trigger_type: str | None = None,
 ) -> int:
-    """Количество успешно опубликованных пакетов статьи за текущие локальные сутки."""
     try:
         tz = ZoneInfo(timezone_name)
     except Exception:
         tz = ZoneInfo("Europe/Moscow")
 
-    now_local = datetime.now(timezone.utc).astimezone(tz)
+    now_local = datetime.now(
+        timezone.utc
+    ).astimezone(tz)
 
     start_local = now_local.replace(
         hour=0,
@@ -1264,33 +1395,60 @@ async def successful_publications_today(
 
     end_local = start_local + timedelta(days=1)
 
-    start_utc = start_local.astimezone(timezone.utc).isoformat(
-        timespec="seconds"
-    )
-    end_utc = end_local.astimezone(timezone.utc).isoformat(
-        timespec="seconds"
-    )
+    start_utc = start_local.astimezone(
+        timezone.utc
+    ).isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(_path()) as conn:
-        cur = await conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM tenant_publications
-            WHERE user_id=?
-              AND status='published'
-              AND created_at>=?
-              AND created_at<?
-            """,
-            (
-                int(user_id),
-                start_utc,
-                end_utc,
-            ),
+    end_utc = end_local.astimezone(
+        timezone.utc
+    ).isoformat(timespec="seconds")
+
+    conditions = [
+        "user_id=?",
+        "status='published'",
+        "created_at>=?",
+        "created_at<?",
+    ]
+
+    params = [
+        int(user_id),
+        start_utc,
+        end_utc,
+    ]
+
+    if trigger_type is not None:
+        conditions.append(
+            "trigger_type=?"
         )
+        params.append(
+            str(trigger_type)
+        )
+
+    elif exclude_trigger_type is not None:
+        conditions.append(
+            "(trigger_type IS NULL OR trigger_type!=?)"
+        )
+        params.append(
+            str(exclude_trigger_type)
+        )
+
+    sql = f"""
+        SELECT COUNT(*)
+        FROM tenant_publications
+        WHERE {' AND '.join(conditions)}
+    """
+
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            sql,
+            tuple(params),
+        )
+
         row = await cur.fetchone()
 
     return int(row[0] or 0) if row else 0
-
 
 
 async def _ensure_subtopic_history() -> None:
@@ -1328,6 +1486,49 @@ async def _ensure_subtopic_history() -> None:
         )
 
         await conn.commit()
+
+
+async def list_recent_article_titles(
+    user_id: int,
+    limit: int = 15,
+) -> list[str]:
+    """
+    Последние успешно опубликованные заголовки
+    пользователя.
+
+    Используются для защиты от публикации
+    похожих статей подряд.
+    """
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+
+        cur = await conn.execute(
+            """
+            SELECT article_title
+            FROM tenant_publications
+            WHERE user_id=?
+              AND status='published'
+              AND article_title IS NOT NULL
+              AND trim(article_title) != ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                int(user_id),
+                max(1, int(limit)),
+            ),
+        )
+
+        rows = await cur.fetchall()
+
+    return [
+        str(row[0]).strip()
+        for row in rows
+        if row
+        and row[0]
+        and str(row[0]).strip()
+    ]
 
 
 async def list_used_subtopics(

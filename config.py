@@ -54,7 +54,7 @@ def load_config() -> Config:
             part.strip()
             for part in os.getenv(
                 "DEFAULT_PUBLISH_TIMES",
-                "09:00,14:00,19:00",
+                "09:00,12:00,15:00,18:00,21:00",
             ).split(",")
             if part.strip()
         ),

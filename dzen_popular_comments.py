@@ -12,10 +12,11 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -798,14 +799,18 @@ class DzenPopularCommentWorker:
         self,
         state: dict[str, Any] | None = None,
     ) -> int:
+        """
+        Разрешена максимум одна статья
+        по популярному комментарию
+        за календарные сутки.
 
+        Это не rolling-интервал в 24 часа.
+        """
         if state is None:
             state = self._load_state()
 
         raw = str(
-            state.get(
-                "last_published_at"
-            )
+            state.get("last_published_at")
             or ""
         ).strip()
 
@@ -820,23 +825,64 @@ class DzenPopularCommentWorker:
                 )
             )
 
-            elapsed = (
-                time.time()
-                - last.timestamp()
+            if last.tzinfo is None:
+                last = last.replace(
+                    tzinfo=timezone.utc
+                )
+
+            try:
+                tz = ZoneInfo(
+                    str(
+                        getattr(
+                            self.cfg,
+                            "timezone",
+                            "Europe/Moscow",
+                        )
+                    )
+                )
+            except Exception:
+                tz = ZoneInfo(
+                    "Europe/Moscow"
+                )
+
+            now_local = datetime.now(
+                timezone.utc
+            ).astimezone(tz)
+
+            last_local = last.astimezone(
+                tz
+            )
+
+            # Если последняя статья была вчера —
+            # сегодня уже можно публиковать новую.
+            if last_local.date() != now_local.date():
+                return 0
+
+            # Если статья уже была сегодня,
+            # блокируем до следующей полуночи.
+            next_midnight = (
+                now_local
+                + timedelta(days=1)
+            ).replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+
+            return max(
+                1,
+                int(
+                    (
+                        next_midnight
+                        - now_local
+                    ).total_seconds()
+                ),
             )
 
         except Exception:
             return 0
 
-        remaining = (
-            self.publish_interval_seconds
-            - elapsed
-        )
-
-        return max(
-            0,
-            int(remaining),
-        )
 
     def stop(self) -> None:
         self._stop.set()

@@ -2,13 +2,43 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Any
 
 import tenant_db
 from dzen_comment_responder import DzenCommentResponderWorker
 
+from dzen_popular_comments import (
+    DzenPopularCommentWorker,
+)
+
 
 log = logging.getLogger("tenant_dzen_manager")
+
+
+class _TenantPopularArticleAdapter:
+    """
+    Связывает popular-comment worker
+    с TenantArticleService конкретного пользователя.
+    """
+
+    def __init__(
+        self,
+        service: Any,
+        user_id: int,
+    ) -> None:
+        self.service = service
+        self.user_id = int(user_id)
+
+    async def publish_manual_topic(
+        self,
+        topic_title: str,
+    ) -> dict[str, Any]:
+        return await self.service.publish_manual_topic(
+            self.user_id,
+            topic_title,
+            trigger="popular_comment",
+        )
 
 
 class TenantDzenManager:
@@ -17,16 +47,28 @@ class TenantDzenManager:
         *,
         gpt_client: Any,
         cfg: Any,
+        article_service: Any | None = None,
     ) -> None:
         self.gpt_client = gpt_client
         self.cfg = cfg
 
+        self.article_service = article_service
         self.workers: dict[
             int,
             DzenCommentResponderWorker,
         ] = {}
 
         self.tasks: dict[
+            int,
+            asyncio.Task,
+        ] = {}
+
+        self.popular_workers: dict[
+            int,
+            DzenPopularCommentWorker,
+        ] = {}
+
+        self.popular_tasks: dict[
             int,
             asyncio.Task,
         ] = {}
@@ -40,6 +82,9 @@ class TenantDzenManager:
 
     def stop(self) -> None:
         self._stop.set()
+
+        for worker in self.popular_workers.values():
+            worker.stop()
 
         for worker in self.workers.values():
             worker.stop()
@@ -197,6 +242,140 @@ class TenantDzenManager:
             name=f"tenant-dzen-{user_id}",
         )
 
+        # ========================================
+        # Popular comment worker
+        # ========================================
+
+        popular = None
+        popular_task = None
+
+        # Пока article_service не передан,
+        # старый responder продолжает работать
+        # без изменений.
+        if self.article_service is not None:
+
+            state_value = str(
+                state_file or ""
+            ).strip()
+
+            if state_value:
+                base_dir = Path(
+                    state_value
+                ).parent
+            else:
+                base_dir = (
+                    Path("data")
+                    / "tenant_dzen"
+                    / f"u{user_id}"
+                )
+
+            base_dir.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            popular_state = (
+                base_dir
+                / "popular_state.json"
+            )
+
+            popular_debug = (
+                base_dir
+                / "popular_debug"
+            )
+
+            popular_debug.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            adapter = (
+                _TenantPopularArticleAdapter(
+                    self.article_service,
+                    user_id,
+                )
+            )
+
+            popular = (
+                DzenPopularCommentWorker(
+                    article_service=adapter,
+                    gpt_client=self.gpt_client,
+                    cfg=self.cfg,
+                )
+            )
+
+            # Используем тот же Dzen-аккаунт,
+            # что и responder конкретного tenant.
+            popular.source.comments_url = (
+                comments_url
+            )
+
+            popular.source.profile_dir = (
+                profile_dir
+            )
+
+            popular.source.debug_dir = (
+                popular_debug
+            )
+
+            # Отдельный state для popular worker,
+            # чтобы tenant-пользователи
+            # не делили состояние между собой.
+            popular.state_path = (
+                popular_state
+            )
+
+            popular.enabled = True
+            popular.preview_enabled = False
+
+            state = popular._load_state()
+
+            state["enabled"] = True
+            state["preview_enabled"] = False
+
+            state.setdefault(
+                "used",
+                {},
+            )
+
+            state.setdefault(
+                "pending_previews",
+                {},
+            )
+
+            popular._migrate_state(
+                state
+            )
+
+            popular._save_state(
+                state
+            )
+
+            popular_task = (
+                asyncio.create_task(
+                    popular.run(),
+                    name=(
+                        f"tenant-dzen-popular-"
+                        f"{user_id}"
+                    ),
+                )
+            )
+
+            self.popular_workers[
+                user_id
+            ] = popular
+
+            self.popular_tasks[
+                user_id
+            ] = popular_task
+
+            log.info(
+                "Tenant popular-comment worker "
+                "запущен: user=%s",
+                user_id,
+            )
+
+
         self.workers[user_id] = worker
         self.tasks[user_id] = task
 
@@ -227,10 +406,24 @@ class TenantDzenManager:
             None,
         )
 
+        popular = self.popular_workers.pop(
+            user_id,
+            None,
+        )
+
+        popular_task = self.popular_tasks.pop(
+            user_id,
+            None,
+        )
+
+
         self.fingerprints.pop(
             user_id,
             None,
         )
+
+        if popular is not None:
+            popular.stop()
 
         if worker is not None:
             worker.stop()
@@ -255,3 +448,19 @@ class TenantDzenManager:
             "user=%s",
             user_id,
         )
+
+        if popular_task is not None:
+            popular_task.cancel()
+
+            try:
+                await popular_task
+
+            except asyncio.CancelledError:
+                pass
+
+            except Exception:
+                log.exception(
+                    "Tenant popular worker "
+                    "завершился с ошибкой: user=%s",
+                    user_id,
+                )

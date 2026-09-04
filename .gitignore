@@ -29,3 +29,7 @@ Thumbs.db
 .env.*
 !.env.example
 dzen_scan_debug*.zip
+
+# Local patch backups
+*.bak*
+.patch-backup-*.tar.gz

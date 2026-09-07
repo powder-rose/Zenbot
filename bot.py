@@ -681,10 +681,33 @@ async def cb_urgent(call: CallbackQuery):
 
 def result_text(result: dict) -> str:
     status = result.get("status")
+
     if status == "no_topics":
         return "⚠️ Нет активных тем для публикации."
+
     if status != "ok":
-        return "❌ Статья не создана.\nОшибка: " + str(result.get("error", "неизвестная ошибка"))
+        error = str(
+            result.get(
+                "error",
+                "неизвестная ошибка",
+            )
+        )
+
+        if (
+            "устаревшая новостная подача"
+            in error.lower()
+        ):
+            return (
+                "⚠️ Статья отклонена проверкой актуальности.\n\n"
+                "Обнаружена устаревшая новостная подача.\n"
+                "Публикация не выполнялась."
+            )
+
+        return (
+            "❌ Статья не создана.\n"
+            "Ошибка: " + error
+        )
+
     return (
         "✅ Статья обработана.\n\n"
         f"Тема: {result.get('topic')}\n"

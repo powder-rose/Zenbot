@@ -1179,6 +1179,28 @@ class TelegramWebPublisher:
            composer с классом `record`.
         """
         candidates = [
+            # Telegram Web K:
+            # media-preview в новых версиях использует
+            # simple-message-input-confirm вместо btn-send.
+            dialog.locator(
+                "button.simple-message-input-confirm"
+            ),
+            dialog.locator(
+                ".simple-message-input-confirm"
+            ),
+            page.locator(
+                ".popup-send-photo.active "
+                "button.simple-message-input-confirm"
+            ),
+            page.locator(
+                ".popup-new-media.active "
+                "button.simple-message-input-confirm"
+            ),
+            page.locator(
+                ".popup.active "
+                "button.simple-message-input-confirm"
+            ),
+
             dialog.locator(
                 "button.btn-send:not(.record)"
             ),

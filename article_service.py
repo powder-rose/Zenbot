@@ -5,6 +5,7 @@ from ai_usage import usage_context
 import asyncio
 import html
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,9 @@ from search import YandexSearchClient
 from telegram_web_publisher import (
     TelegramWebPublisher,
     WebPostRef,
+)
+from dzen_rich_formatter import (
+    DzenRichFormatter,
 )
 from yandex_gpt import (
     ARTICLE_SYSTEM_PROMPT,
@@ -1103,14 +1107,207 @@ class ArticleService:
 
             async def replace_after_dzen_sync() -> None:
                 try:
-                    await asyncio.sleep(
-                        180
-                    )
+                    # ----------------------------------------
+                    # WAIT FOR REAL DZEN SYNC
+                    # ----------------------------------------
+                    #
+                    # Больше не ждём фиксированные 180 секунд.
+                    # Проверяем Dzen Studio и продолжаем сразу,
+                    # как только статья реально появилась.
+                    #
+                    # 180 секунд остаются только максимальным
+                    # аварийным пределом ожидания.
+                    # ----------------------------------------
+
+                    wait_profile_dir = str(
+                        os.getenv(
+                            "DZEN_COMMENT_PROFILE_DIR",
+                            "",
+                        )
+                        or os.getenv(
+                            "DZEN_PROFILE_DIR",
+                            "",
+                        )
+                    ).strip()
+
+                    wait_studio_url = str(
+                        os.getenv(
+                            "DZEN_COMMENTS_URL",
+                            "",
+                        )
+                    ).strip()
+
+                    if (
+                        wait_profile_dir
+                        and wait_studio_url
+                    ):
+                        try:
+                            log.info(
+                                "Dzen formatter: "
+                                "жду фактического появления "
+                                "статьи в Dzen Studio: %s",
+                                title,
+                            )
+
+                            dzen_waiter = (
+                                DzenRichFormatter(
+                                    headless=True
+                                )
+                            )
+
+                            dzen_ready = (
+                                await dzen_waiter
+                                .wait_for_article(
+                                    profile_dir=(
+                                        wait_profile_dir
+                                    ),
+                                    studio_url=(
+                                        wait_studio_url
+                                    ),
+                                    article_title=title,
+                                    timeout_seconds=180,
+                                    poll_seconds=5,
+                                )
+                            )
+
+                            if dzen_ready:
+                                log.info(
+                                    "Dzen formatter: "
+                                    "статья обнаружена. "
+                                    "Запускаю оформление сразу."
+                                )
+                            else:
+                                log.warning(
+                                    "Dzen formatter: "
+                                    "статья не обнаружена "
+                                    "за 180 секунд. "
+                                    "Выполняю последнюю попытку "
+                                    "форматирования."
+                                )
+
+                        except Exception:
+                            log.exception(
+                                "Dzen formatter: "
+                                "ошибка ожидания статьи. "
+                                "Выполняю обычную попытку "
+                                "форматирования."
+                            )
+
+                    else:
+                        log.warning(
+                            "Dzen formatter: "
+                            "ожидание появления статьи "
+                            "пропущено — настройки Dzen "
+                            "не заданы."
+                        )
+
+                    # ----------------------------------------
+                    # DZEN RICH FORMAT
+                    # ----------------------------------------
+                    #
+                    # Telegram -> Dzen уже успел синхронизировать
+                    # LONG-публикацию. Теперь до удаления LONG:
+                    #
+                    # 1. находим соответствующую статью Dzen;
+                    # 2. убираем продублированный title из body;
+                    # 3. переносим rich-разметку;
+                    # 4. сохраняем изменения опубликованной статьи.
+                    #
+                    # Ошибка форматирования Dzen НЕ должна ломать
+                    # LONG -> DELETE -> SHORT цикл Telegram.
+                    # ----------------------------------------
+
+                    dzen_profile_dir = str(
+                        os.getenv(
+                            "DZEN_COMMENT_PROFILE_DIR",
+                            "",
+                        )
+                        or os.getenv(
+                            "DZEN_PROFILE_DIR",
+                            "",
+                        )
+                    ).strip()
+
+                    dzen_studio_url = str(
+                        os.getenv(
+                            "DZEN_COMMENTS_URL",
+                            "",
+                        )
+                    ).strip()
+
+                    if (
+                        dzen_profile_dir
+                        and dzen_studio_url
+                    ):
+                        try:
+                            log.info(
+                                "Dzen formatter: "
+                                "начинаю оформление статьи: %s",
+                                title,
+                            )
+
+                            dzen_formatter = (
+                                DzenRichFormatter(
+                                    headless=True
+                                )
+                            )
+
+                            dzen_result = (
+                                await dzen_formatter
+                                .format_article(
+                                    profile_dir=dzen_profile_dir,
+                                    studio_url=dzen_studio_url,
+                                    article_title=title,
+                                    source_body=full_body,
+                                    publish=True,
+                                )
+                            )
+
+                            log.info(
+                                "Dzen formatter: готово; "
+                                "published=%s applied=%s "
+                                "already_active=%s unsupported=%s",
+                                dzen_result.get(
+                                    "published"
+                                ),
+                                len(
+                                    dzen_result.get(
+                                        "applied",
+                                        [],
+                                    )
+                                ),
+                                len(
+                                    dzen_result.get(
+                                        "already_active",
+                                        [],
+                                    )
+                                ),
+                                len(
+                                    dzen_result.get(
+                                        "unsupported",
+                                        [],
+                                    )
+                                ),
+                            )
+
+                        except Exception:
+                            log.exception(
+                                "Dzen formatter: "
+                                "не удалось оформить статью. "
+                                "Продолжаю LONG -> DELETE -> SHORT."
+                            )
+
+                    else:
+                        log.warning(
+                            "Dzen formatter пропущен: "
+                            "не заданы DZEN_COMMENT_PROFILE_DIR/"
+                            "DZEN_PROFILE_DIR или DZEN_COMMENTS_URL"
+                        )
 
                     log.info(
-                        "Прошло 180 секунд. Удаляю long-post из Telegram "
-                        "без редактирования, чтобы статья в Дзене "
-                        "осталась полной."
+                        "Dzen-синхронизация и попытка "
+                        "rich-format завершены. "
+                        "Удаляю long-post из Telegram."
                     )
 
                     long_deleted = False

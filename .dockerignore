@@ -15,3 +15,12 @@ data
 
 telegram_login_qr.png
 telegram_setup_error.png
+
+# Local backups / caches
+*.bak*
+*.backup*
+*.old*
+.patch-backup-*.tar.gz
+.pytest_cache
+.mypy_cache
+.ruff_cache

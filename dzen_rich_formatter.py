@@ -36,6 +36,21 @@ _EXPLICIT_CLOSE = {
     "[[/S]]": "strike",
 }
 
+_HTML_OPEN = {
+    "<b>": "bold",
+    "<i>": "italic",
+    "<u>": "underline",
+    "<s>": "strike",
+}
+
+_HTML_CLOSE = {
+    "</b>": "bold",
+    "</i>": "italic",
+    "</u>": "underline",
+    "</s>": "strike",
+}
+
+
 _INLINE_MARKERS = {
     "==": "bold",
     "**": "bold",
@@ -117,6 +132,12 @@ def parse_dzen_markup(
 
         leading_quote = False
 
+        # Если [[Q]] открылся на предыдущей строке,
+        # текущая строка тоже является цитатой.
+        line_explicit_quote = bool(
+            explicit_quote
+        )
+
         match = re.match(
             r"^\s*>\s?",
             line,
@@ -137,6 +158,48 @@ def parse_dzen_markup(
             matched = False
 
             # -----------------------------
+            # HTML rich-теги.
+            #
+            # clean_short_article_text()
+            # преобразует [[B]] / [[I]] / ...
+            # именно в такой вид.
+            # -----------------------------
+
+            for token, style in _HTML_OPEN.items():
+                if (
+                    line[
+                        i:i + len(token)
+                    ].lower()
+                    == token
+                ):
+                    explicit_active.add(
+                        style
+                    )
+                    i += len(token)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            for token, style in _HTML_CLOSE.items():
+                if (
+                    line[
+                        i:i + len(token)
+                    ].lower()
+                    == token
+                ):
+                    explicit_active.discard(
+                        style
+                    )
+                    i += len(token)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            # -----------------------------
             # Явные SaaS-теги
             # -----------------------------
 
@@ -144,6 +207,7 @@ def parse_dzen_markup(
                 "[[Q]]",
                 i,
             ):
+                line_explicit_quote = True
                 explicit_quote = True
                 i += len("[[Q]]")
                 continue
@@ -267,7 +331,7 @@ def parse_dzen_markup(
 
         if (
             leading_quote
-            or explicit_quote
+            or line_explicit_quote
         ) and plain.strip():
             blockquotes.add(
                 line_index
@@ -441,9 +505,16 @@ class DzenRichFormatter:
             article_title
         )
 
-        # Синхронизация иногда появляется
-        # в Studio не мгновенно.
-        for attempt in range(1, 7):
+        # Dzen Studio может временно убрать только что
+        # импортированную публикацию из списка во время
+        # внутренней обработки. Поэтому после первого
+        # появления не считаем короткое исчезновение ошибкой.
+        max_attempts = 16
+
+        for attempt in range(
+            1,
+            max_attempts + 1,
+        ):
             links = page.locator(
                 'a[href*="/a/"]'
             )
@@ -474,12 +545,13 @@ class DzenRichFormatter:
                 ):
                     return link
 
-            if attempt < 6:
+            if attempt < max_attempts:
                 log.info(
                     "Dzen formatter: "
                     "статья ещё не найдена, "
-                    "попытка %s/6: %s",
+                    "попытка %s/%s: %s",
                     attempt,
+                    max_attempts,
                     article_title,
                 )
 
@@ -1370,238 +1442,66 @@ class DzenRichFormatter:
                                     args.style
                                     === 'strike'
                                 ) {
-                                    ok = (
-                                        css.textDecorationLine
-                                        || ''
-                                    ).includes(
-                                        'line-through'
-                                    );
-                                }
-                            }
+                                    // text-decoration в CSS ведёт себя
+                                    // не как обычное наследуемое свойство.
+                                    //
+                                    // Dzen/Draft.js может повесить
+                                    // line-through на wrapper выше
+                                    // непосредственного parentElement
+                                    // текстового узла.
+                                    let current =
+                                        node.parentElement;
 
-                            details.push({
-                                text: part,
-                                ok: ok,
-                                weight:
-                                    css
-                                    ? css.fontWeight
-                                    : '',
-                                fontStyle:
-                                    css
-                                    ? css.fontStyle
-                                    : '',
-                                decoration:
-                                    css
-                                    ? css.textDecorationLine
-                                    : ''
-                            });
+                                    while (current) {
+                                        const currentCss =
+                                            getComputedStyle(
+                                                current
+                                            );
 
-                            if (!ok) {
-                                active = false;
-                            }
-                        }
-                    }
+                                        const decorationLine =
+                                            (
+                                                currentCss
+                                                    .textDecorationLine
+                                                || ''
+                                            );
 
-                    absolute = next;
+                                        const decoration =
+                                            (
+                                                currentCss
+                                                    .textDecoration
+                                                || ''
+                                            );
 
-                    if (
-                        absolute
-                        >= endWanted
-                    ) {
-                        break;
-                    }
-                }
+                                        const tag =
+                                            (
+                                                current.tagName
+                                                || ''
+                                            ).toUpperCase();
 
-                return {
-                    active:
-                        checked > 0
-                        && active,
-                    checked,
-                    details
-                };
-            }
-            """,
-            {
-                "prefix": prefix,
-                "target": span.text,
-                "style": span.style,
-            },
-        )
+                                        if (
+                                            decorationLine.includes(
+                                                'line-through'
+                                            )
+                                            || decoration.includes(
+                                                'line-through'
+                                            )
+                                            || tag === 'S'
+                                            || tag === 'DEL'
+                                            || tag === 'STRIKE'
+                                        ) {
+                                            ok = true;
+                                            break;
+                                        }
 
-        log.debug(
-            "Dzen formatter DOM check: "
-            "style=%s text=%r result=%s",
-            span.style,
-            span.text[:100],
-            result,
-        )
+                                        if (
+                                            current === root
+                                        ) {
+                                            break;
+                                        }
 
-        return bool(
-            result.get(
-                "active"
-            )
-        )
-
-    async def _inline_style_active_in_dom(
-        self,
-        *,
-        page: Page,
-        body,
-        parsed: DzenParsedMarkup,
-        mapping: dict[int, int],
-        span: DzenFormatSpan,
-    ) -> bool:
-        """
-        Проверяет реальный CSS нужного диапазона Draft.js.
-
-        Это надёжнее active-класса toolbar:
-        toolbar может перерисовываться после изменения
-        Draft.js и временно не отражать состояние selection.
-        """
-
-        block_index = mapping[
-            span.line
-        ]
-
-        block = body.locator(
-            '[data-block="true"]'
-        ).nth(
-            block_index
-        )
-
-        line = parsed.lines[
-            span.line
-        ]
-
-        prefix = line[
-            :span.start
-        ]
-
-        result = await block.evaluate(
-            """
-            (root, args) => {
-                const startWanted =
-                    args.prefix.length;
-
-                const endWanted =
-                    startWanted
-                    + args.target.length;
-
-                const walker =
-                    document.createTreeWalker(
-                        root,
-                        NodeFilter.SHOW_TEXT
-                    );
-
-                let absolute = 0;
-                let checked = 0;
-                let active = true;
-
-                const details = [];
-
-                while (
-                    walker.nextNode()
-                ) {
-                    const node =
-                        walker.currentNode;
-
-                    const value =
-                        node.nodeValue || '';
-
-                    const next =
-                        absolute
-                        + value.length;
-
-                    const overlapStart =
-                        Math.max(
-                            startWanted,
-                            absolute
-                        );
-
-                    const overlapEnd =
-                        Math.min(
-                            endWanted,
-                            next
-                        );
-
-                    if (
-                        overlapEnd
-                        > overlapStart
-                    ) {
-                        const localStart =
-                            overlapStart
-                            - absolute;
-
-                        const localEnd =
-                            overlapEnd
-                            - absolute;
-
-                        const part =
-                            value.slice(
-                                localStart,
-                                localEnd
-                            );
-
-                        if (
-                            part.trim()
-                        ) {
-                            checked += 1;
-
-                            const el =
-                                node.parentElement;
-
-                            const css =
-                                el
-                                ? getComputedStyle(el)
-                                : null;
-
-                            let ok = false;
-
-                            if (css) {
-                                if (
-                                    args.style
-                                    === 'bold'
-                                ) {
-                                    const weight =
-                                        parseInt(
-                                            css.fontWeight,
-                                            10
-                                        );
-
-                                    ok = (
-                                        Number.isFinite(
-                                            weight
-                                        )
-                                        && weight >= 600
-                                    )
-                                    || css.fontWeight
-                                        === 'bold'
-                                    || css.fontWeight
-                                        === 'bolder';
-                                }
-
-                                else if (
-                                    args.style
-                                    === 'italic'
-                                ) {
-                                    ok = (
-                                        css.fontStyle
-                                            === 'italic'
-                                        || css.fontStyle
-                                            === 'oblique'
-                                    );
-                                }
-
-                                else if (
-                                    args.style
-                                    === 'strike'
-                                ) {
-                                    ok = (
-                                        css.textDecorationLine
-                                        || ''
-                                    ).includes(
-                                        'line-through'
-                                    );
+                                        current =
+                                            current.parentElement;
+                                    }
                                 }
                             }
 
@@ -2039,6 +1939,350 @@ class DzenRichFormatter:
             "«Есть неопубликованные правки». "
             f"Текущий статус: {last_status!r}"
         )
+
+    async def replace_article_body(
+        self,
+        *,
+        profile_dir: str,
+        studio_url: str,
+        article_title: str,
+        source_body: str,
+        publish: bool = True,
+    ) -> dict:
+        """
+        Полностью заменяет импортированное тело статьи Dzen
+        исходным LONG-текстом.
+
+        Служебная rich-разметка [[B]], [[I]], [[U]],
+        [[S]], [[Q]] и Markdown-маркеры в редактор
+        не вставляются.
+
+        Форматирование применяется отдельно через
+        format_article().
+        """
+
+        parsed = parse_dzen_markup(
+            source_body
+        )
+
+        if not any(
+            line.strip()
+            for line in parsed.lines
+        ):
+            raise RuntimeError(
+                "Dzen formatter: "
+                "пустой source_body для замены"
+            )
+
+        result = {
+            "published": False,
+            "old_body_chars": 0,
+            "new_body_chars": 0,
+            "mapped_lines": 0,
+        }
+
+        async with DZEN_BROWSER_LOCK:
+            async with async_playwright() as pw:
+                context = (
+                    await pw.chromium
+                    .launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        headless=self.headless,
+                        viewport={
+                            "width": 1440,
+                            "height": 1200,
+                        },
+                        locale="ru-RU",
+                    )
+                )
+
+                try:
+                    page = (
+                        context.pages[0]
+                        if context.pages
+                        else await context.new_page()
+                    )
+
+                    await self._goto_publications(
+                        page,
+                        studio_url,
+                    )
+
+                    body = await self._open_editor(
+                        page,
+                        article_title,
+                    )
+
+                    old_text = (
+                        await body.inner_text()
+                    )
+
+                    result[
+                        "old_body_chars"
+                    ] = len(old_text)
+
+                    # ----------------------------------------
+                    # УДАЛЯЕМ ТОЛЬКО ТЕКСТ, СОХРАНЯЯ MEDIA
+                    # ----------------------------------------
+                    #
+                    # Telegram -> Dzen импортирует изображение
+                    # отдельным Draft.js-блоком:
+                    #
+                    # figure.zen-editor-block-image
+                    #
+                    # Раньше selectNodeContents(root) выделял
+                    # также этот figure, поэтому Backspace
+                    # удалял картинку вместе с SHORT.
+                    #
+                    # Теперь выделяем только всё содержимое
+                    # ДО первого image-блока.
+                    # ----------------------------------------
+
+                    image_blocks_before = await body.locator(
+                        "figure.zen-editor-block-image"
+                    ).count()
+
+                    result[
+                        "image_blocks_before"
+                    ] = image_blocks_before
+
+                    image_was_present = await body.evaluate(
+                        """
+                        root => {
+                            root.focus();
+
+                            const image = root.querySelector(
+                                "figure.zen-editor-block-image"
+                            );
+
+                            const range =
+                                document.createRange();
+
+                            if (image) {
+                                range.setStart(
+                                    root,
+                                    0
+                                );
+
+                                range.setEndBefore(
+                                    image
+                                );
+                            } else {
+                                range.selectNodeContents(
+                                    root
+                                );
+                            }
+
+                            const selection =
+                                window.getSelection();
+
+                            selection.removeAllRanges();
+                            selection.addRange(
+                                range
+                            );
+
+                            return Boolean(
+                                image
+                            );
+                        }
+                        """
+                    )
+
+                    await page.keyboard.press(
+                        "Backspace"
+                    )
+
+                    await page.wait_for_timeout(
+                        700
+                    )
+
+                    # Draft.js после удаления
+                    # перерисовывает редактор.
+                    body = page.locator(
+                        '[contenteditable="true"]'
+                        '.public-DraftEditor-content'
+                    ).nth(1)
+
+                    image_blocks_after_delete = (
+                        await body.locator(
+                            "figure.zen-editor-block-image"
+                        ).count()
+                    )
+
+                    if (
+                        image_was_present
+                        and image_blocks_after_delete == 0
+                    ):
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "изображение исчезло при очистке body"
+                        )
+
+                    # После Backspace Draft.js обычно оставляет
+                    # пустой paragraph непосредственно перед
+                    # media-блоком. Ставим caret именно в первый
+                    # текстовый Draft-блок, не кликая по картинке.
+                    caret_ready = await body.evaluate(
+                        """
+                        root => {
+                            root.focus();
+
+                            const blocks = Array.from(
+                                root.querySelectorAll(
+                                    '[data-block="true"]'
+                                )
+                            );
+
+                            const textBlock = blocks.find(
+                                block =>
+                                    !block.matches(
+                                        "figure.zen-editor-block-image"
+                                    )
+                                    && !block.closest(
+                                        "figure.zen-editor-block-image"
+                                    )
+                            );
+
+                            if (!textBlock) {
+                                return false;
+                            }
+
+                            const range =
+                                document.createRange();
+
+                            range.selectNodeContents(
+                                textBlock
+                            );
+
+                            range.collapse(
+                                true
+                            );
+
+                            const selection =
+                                window.getSelection();
+
+                            selection.removeAllRanges();
+                            selection.addRange(
+                                range
+                            );
+
+                            return true;
+                        }
+                        """
+                    )
+
+                    if not caret_ready:
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "после очистки body не найден "
+                            "текстовый Draft.js-блок "
+                            "для вставки LONG"
+                        )
+
+                    # Вставляем уже очищенные от
+                    # служебной разметки строки.
+                    for index, line in enumerate(
+                        parsed.lines
+                    ):
+                        if line:
+                            await page.keyboard.insert_text(
+                                line
+                            )
+
+                        if index < len(
+                            parsed.lines
+                        ) - 1:
+                            await page.keyboard.press(
+                                "Enter"
+                            )
+
+                    await page.wait_for_timeout(
+                        1000
+                    )
+
+                    body = page.locator(
+                        '[contenteditable="true"]'
+                        '.public-DraftEditor-content'
+                    ).nth(1)
+
+                    new_text = (
+                        await body.inner_text()
+                    )
+
+                    result[
+                        "new_body_chars"
+                    ] = len(new_text)
+
+                    image_blocks_after = await body.locator(
+                        "figure.zen-editor-block-image"
+                    ).count()
+
+                    result[
+                        "image_blocks_after"
+                    ] = image_blocks_after
+
+                    result[
+                        "image_preserved"
+                    ] = (
+                        image_blocks_before == 0
+                        or image_blocks_after > 0
+                    )
+
+                    if (
+                        image_blocks_before > 0
+                        and image_blocks_after == 0
+                    ):
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "изображение потеряно "
+                            "после вставки LONG"
+                        )
+
+                    # Главная проверка целостности:
+                    # каждая непустая строка source_body
+                    # должна существовать в Draft.js
+                    # в правильном порядке.
+                    mapping = (
+                        await self._map_lines_to_blocks(
+                            body,
+                            parsed,
+                        )
+                    )
+
+                    result[
+                        "mapped_lines"
+                    ] = len(mapping)
+
+                    if publish:
+                        await self._publish_editor_changes(
+                            page
+                        )
+
+                        result[
+                            "published"
+                        ] = True
+
+                    result[
+                        "editor_url"
+                    ] = page.url
+
+                    log.info(
+                        "Dzen formatter: body заменён "
+                        "title=%r old_chars=%s "
+                        "new_chars=%s mapped=%s "
+                        "published=%s",
+                        article_title,
+                        result["old_body_chars"],
+                        result["new_body_chars"],
+                        result["mapped_lines"],
+                        result["published"],
+                    )
+
+                    return result
+
+                finally:
+                    await context.close()
+
 
     async def format_article(
         self,

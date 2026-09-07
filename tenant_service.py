@@ -12,13 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
 
 import tenant_db
+from tenant_publish_pipeline import TenantPublishPipeline
 from article_service import (
     DEFAULT_IMAGE_PROMPT_TEMPLATE,
     build_image_prompt,
-    build_short_rich_message,
     clean_article_text,
     clean_short_article_text,
 )
@@ -221,6 +220,12 @@ class TenantArticleService:
         self.image_dir = cfg.db_path.parent / "tenant_images"
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self._locks: dict[int, asyncio.Lock] = {}
+
+        self.publish_pipeline = (
+            TenantPublishPipeline(
+                bot=self.bot,
+            )
+        )
 
     def _lock(self, user_id: int) -> asyncio.Lock:
         lock = self._locks.get(user_id)
@@ -571,54 +576,145 @@ class TenantArticleService:
             raise RuntimeError("YandexART вернул пустое изображение")
         return title, body, short_body, image_bytes
 
-    async def _publish_one(self, chat_id: int, title: str, body: str, image_bytes: bytes) -> int:
-        # Основной формат v49: Rich Message с изображением и длинной статьёй.
-        try:
-            rich = build_short_rich_message(title, body, image_bytes)
-            msg = await self.bot.send_rich_message(chat_id=chat_id, rich_message=rich)
-            return int(msg.message_id)
-        except Exception as rich_exc:
-            log.warning("Rich Message недоступен для %s: %s. Использую fallback.", chat_id, rich_exc)
+    async def _publish_one(
+        self,
+        user_id: int,
+        chat_id: int,
+        title: str,
+        full_body: str,
+        short_body: str,
+        image_bytes: bytes,
+    ) -> dict[str, Any]:
+        """
+        Публикация одного tenant-канала
+        через единый SaaS pipeline.
+        """
 
-        # Fallback: картинка отдельно + полный текст отдельным сообщением.
-        image = BufferedInputFile(image_bytes, filename="article.jpg")
-        photo = await self.bot.send_photo(
+        return await self.publish_pipeline.publish_one(
+            user_id=user_id,
             chat_id=chat_id,
-            photo=image,
-            caption=title[:1024] if title else None,
+            title=title,
+            full_body=full_body,
+            short_body=short_body,
+            image_bytes=image_bytes,
         )
-        text = body.strip()
-        if text:
-            # Статья в проекте ~3200 символов, но режем безопасно на случай длинного кастомного промпта.
-            while text:
-                chunk = text[:4000]
-                if len(text) > 4000 and "\n" in chunk:
-                    cut = chunk.rfind("\n")
-                    if cut > 2500:
-                        chunk = chunk[:cut]
-                await self.bot.send_message(chat_id=chat_id, text=chunk)
-                text = text[len(chunk):].lstrip()
-        return int(photo.message_id)
+
 
     async def _publish_channels(
         self,
         user_id: int,
         title: str,
-        body: str,
+        full_body: str,
+        short_body: str,
         image_bytes: bytes,
     ) -> tuple[int, list[str]]:
-        channels = await tenant_db.list_channels(user_id)
+        """
+        Публикует статью во все активные
+        Telegram-каналы tenant-пользователя.
+
+        Успехом считается успешная итоговая
+        SHORT-публикация в Telegram.
+
+        Ошибка Dzen сама по себе не переводит
+        Telegram-публикацию в error.
+        """
+
+        channels = await tenant_db.list_channels(
+            user_id
+        )
+
         published = 0
         errors: list[str] = []
+
         for channel in channels:
-            chat_id = int(channel["chat_id"])
+            chat_id = int(
+                channel["chat_id"]
+            )
+
             try:
-                await self._publish_one(chat_id, title, body, image_bytes)
+                result = await self._publish_one(
+                    user_id,
+                    chat_id,
+                    title,
+                    full_body,
+                    short_body,
+                    image_bytes,
+                )
+
+                short_message_id = result.get(
+                    "short_message_id"
+                )
+
+                if short_message_id is None:
+                    raise RuntimeError(
+                        "Tenant pipeline "
+                        "не вернул short_message_id"
+                    )
+
                 published += 1
+
+                dzen_result = (
+                    result.get(
+                        "dzen"
+                    )
+                    or {}
+                )
+
+                if dzen_result.get(
+                    "attempted"
+                ):
+                    if dzen_result.get(
+                        "error"
+                    ):
+                        log.warning(
+                            "Tenant Telegram опубликован, "
+                            "но Dzen завершился ошибкой: "
+                            "user=%s channel=%s error=%s",
+                            user_id,
+                            chat_id,
+                            dzen_result.get(
+                                "error"
+                            ),
+                        )
+                    else:
+                        log.info(
+                            "Tenant Dzen pipeline complete: "
+                            "user=%s channel=%s "
+                            "synced=%s replaced=%s "
+                            "formatted=%s seed_deleted=%s",
+                            user_id,
+                            chat_id,
+                            dzen_result.get(
+                                "synced"
+                            ),
+                            dzen_result.get(
+                                "body_replaced"
+                            ),
+                            dzen_result.get(
+                                "formatted"
+                            ),
+                            dzen_result.get(
+                                "seed_deleted"
+                            ),
+                        )
+
             except Exception as exc:
-                log.exception("Ошибка публикации tenant user=%s channel=%s", user_id, chat_id)
-                errors.append(f"{chat_id}: {exc}")
-        return published, errors
+                log.exception(
+                    "Ошибка публикации tenant "
+                    "user=%s channel=%s",
+                    user_id,
+                    chat_id,
+                )
+
+                errors.append(
+                    f"{chat_id}: {exc}"
+                )
+
+        return (
+            published,
+            errors,
+        )
+
 
     async def _do_publish(
         self,
@@ -822,6 +918,7 @@ class TenantArticleService:
         published, errors = await self._publish_channels(
             user_id,
             title,
+            body,
             short_body,
             image_bytes,
         )

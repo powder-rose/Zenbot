@@ -1057,10 +1057,7 @@ class ArticleService:
         image_bytes: bytes | None,
         image_path: str | None,
     ) -> dict[str, Any]:
-        result: dict[
-            str,
-            Any,
-        ] = {
+        result: dict[str, Any] = {
             "publication_id": publication_id,
             "telegram": "pending",
         }
@@ -1071,152 +1068,75 @@ class ArticleService:
                     "Нет изображения: публикация отменена"
                 )
 
-            full_caption = compose_caption(
+            # -------------------------------------------------
+            # BOT API SEED FOR DZEN
+            # -------------------------------------------------
+            #
+            # Dzen стабильно импортирует обычный send_photo.
+            # Telegram Web long-post больше не используем.
+            #
+            # В seed кладём короткий законченный текст.
+            # Если последующее редактирование Dzen не сработает,
+            # в статье не останется обрезанный LONG.
+            # -------------------------------------------------
+
+            seed_body = clean_short_article_text(
+                short_body
+            )
+
+            # Для обычного Telegram caption убираем HTML-теги:
+            # seed нужен только как источник импорта для Dzen.
+            seed_body_plain = html.unescape(
+                re.sub(
+                    r"<[^>]+>",
+                    "",
+                    seed_body,
+                )
+            ).strip()
+
+            seed_caption = compose_caption(
                 title,
-                full_body,
-                max_chars=4096,
+                seed_body_plain,
+                max_chars=1024,
             )
 
             log.info(
-                "Telegram Web: публикую long standard media post "
-                "для Синхробота Дзена, chars=%s",
-                len(full_caption),
+                "Bot API: публикую Dzen seed-photo, chars=%s",
+                len(seed_caption),
             )
 
-            post_ref = await self.telegram_web.send_media_post(
-                image_bytes,
-                full_caption,
-                silent=True,
+            seed_message = await self.bot.send_photo(
+                chat_id=self.cfg.telegram_channel_id,
+                photo=BufferedInputFile(
+                    image_bytes,
+                    filename="article.jpg",
+                ),
+                caption=seed_caption,
+                disable_notification=True,
             )
 
-            serialized_ref = (
-                post_ref.serialize()
+            seed_message_id = (
+                seed_message.message_id
             )
 
             log.info(
-                "Telegram Web: long-post опубликован. "
-                "Через 180 сек он будет удалён; "
-                "short Rich Message будет опубликован отдельно."
+                "Bot API: Dzen seed опубликован, "
+                "message_id=%s. Жду импорт в Dzen.",
+                seed_message_id,
             )
 
             await db.set_telegram_result(
                 publication_id,
                 "published",
-                message_id=serialized_ref[:255],
+                message_id=str(
+                    seed_message_id
+                ),
             )
 
             async def replace_after_dzen_sync() -> None:
+                dzen_ready = False
+
                 try:
-                    # ----------------------------------------
-                    # WAIT FOR REAL DZEN SYNC
-                    # ----------------------------------------
-                    #
-                    # Больше не ждём фиксированные 180 секунд.
-                    # Проверяем Dzen Studio и продолжаем сразу,
-                    # как только статья реально появилась.
-                    #
-                    # 180 секунд остаются только максимальным
-                    # аварийным пределом ожидания.
-                    # ----------------------------------------
-
-                    wait_profile_dir = str(
-                        os.getenv(
-                            "DZEN_COMMENT_PROFILE_DIR",
-                            "",
-                        )
-                        or os.getenv(
-                            "DZEN_PROFILE_DIR",
-                            "",
-                        )
-                    ).strip()
-
-                    wait_studio_url = str(
-                        os.getenv(
-                            "DZEN_COMMENTS_URL",
-                            "",
-                        )
-                    ).strip()
-
-                    if (
-                        wait_profile_dir
-                        and wait_studio_url
-                    ):
-                        try:
-                            log.info(
-                                "Dzen formatter: "
-                                "жду фактического появления "
-                                "статьи в Dzen Studio: %s",
-                                title,
-                            )
-
-                            dzen_waiter = (
-                                DzenRichFormatter(
-                                    headless=True
-                                )
-                            )
-
-                            dzen_ready = (
-                                await dzen_waiter
-                                .wait_for_article(
-                                    profile_dir=(
-                                        wait_profile_dir
-                                    ),
-                                    studio_url=(
-                                        wait_studio_url
-                                    ),
-                                    article_title=title,
-                                    timeout_seconds=180,
-                                    poll_seconds=5,
-                                )
-                            )
-
-                            if dzen_ready:
-                                log.info(
-                                    "Dzen formatter: "
-                                    "статья обнаружена. "
-                                    "Запускаю оформление сразу."
-                                )
-                            else:
-                                log.warning(
-                                    "Dzen formatter: "
-                                    "статья не обнаружена "
-                                    "за 180 секунд. "
-                                    "Выполняю последнюю попытку "
-                                    "форматирования."
-                                )
-
-                        except Exception:
-                            log.exception(
-                                "Dzen formatter: "
-                                "ошибка ожидания статьи. "
-                                "Выполняю обычную попытку "
-                                "форматирования."
-                            )
-
-                    else:
-                        log.warning(
-                            "Dzen formatter: "
-                            "ожидание появления статьи "
-                            "пропущено — настройки Dzen "
-                            "не заданы."
-                        )
-
-                    # ----------------------------------------
-                    # DZEN RICH FORMAT
-                    # ----------------------------------------
-                    #
-                    # Telegram -> Dzen уже успел синхронизировать
-                    # LONG-публикацию. Теперь до удаления LONG:
-                    #
-                    # 1. находим соответствующую статью Dzen;
-                    # 2. убираем продублированный title из body;
-                    # 3. переносим rich-разметку;
-                    # 4. сохраняем изменения опубликованной статьи.
-                    #
-                    # Ошибка форматирования Dzen НЕ должна ломать
-                    # LONG -> DELETE -> SHORT цикл Telegram.
-                    # ----------------------------------------
-
                     dzen_profile_dir = str(
                         os.getenv(
                             "DZEN_COMMENT_PROFILE_DIR",
@@ -1239,140 +1159,216 @@ class ArticleService:
                         dzen_profile_dir
                         and dzen_studio_url
                     ):
+                        formatter = DzenRichFormatter(
+                            headless=True
+                        )
+
+                        log.info(
+                            "Dzen: жду импорт seed-статьи: %s",
+                            title,
+                        )
+
                         try:
-                            log.info(
-                                "Dzen formatter: "
-                                "начинаю оформление статьи: %s",
-                                title,
-                            )
-
-                            dzen_formatter = (
-                                DzenRichFormatter(
-                                    headless=True
-                                )
-                            )
-
-                            dzen_result = (
-                                await dzen_formatter
-                                .format_article(
+                            dzen_ready = (
+                                await formatter.wait_for_article(
                                     profile_dir=dzen_profile_dir,
                                     studio_url=dzen_studio_url,
                                     article_title=title,
-                                    source_body=full_body,
-                                    publish=True,
+                                    timeout_seconds=180,
+                                    poll_seconds=5,
                                 )
                             )
-
-                            log.info(
-                                "Dzen formatter: готово; "
-                                "published=%s applied=%s "
-                                "already_active=%s unsupported=%s",
-                                dzen_result.get(
-                                    "published"
-                                ),
-                                len(
-                                    dzen_result.get(
-                                        "applied",
-                                        [],
-                                    )
-                                ),
-                                len(
-                                    dzen_result.get(
-                                        "already_active",
-                                        [],
-                                    )
-                                ),
-                                len(
-                                    dzen_result.get(
-                                        "unsupported",
-                                        [],
-                                    )
-                                ),
-                            )
-
                         except Exception:
                             log.exception(
-                                "Dzen formatter: "
-                                "не удалось оформить статью. "
-                                "Продолжаю LONG -> DELETE -> SHORT."
+                                "Dzen: ошибка ожидания seed-статьи"
+                            )
+
+                        if dzen_ready:
+                            log.info(
+                                "Dzen: seed найден. "
+                                "Заменяю body на полный LONG."
+                            )
+
+                            try:
+                                replace_result = (
+                                    await formatter
+                                    .replace_article_body(
+                                        profile_dir=dzen_profile_dir,
+                                        studio_url=dzen_studio_url,
+                                        article_title=title,
+                                        source_body=full_body,
+                                        publish=True,
+                                    )
+                                )
+
+                                log.info(
+                                    "Dzen: body заменён; "
+                                    "old_chars=%s new_chars=%s "
+                                    "mapped_lines=%s",
+                                    replace_result.get(
+                                        "old_body_chars"
+                                    ),
+                                    replace_result.get(
+                                        "new_body_chars"
+                                    ),
+                                    replace_result.get(
+                                        "mapped_lines"
+                                    ),
+                                )
+
+                                log.info(
+                                    "Dzen: применяю rich-format."
+                                )
+
+                                format_result = (
+                                    await formatter
+                                    .format_article(
+                                        profile_dir=dzen_profile_dir,
+                                        studio_url=dzen_studio_url,
+                                        article_title=title,
+                                        source_body=full_body,
+                                        publish=True,
+                                    )
+                                )
+
+                                log.info(
+                                    "Dzen: оформление готово; "
+                                    "published=%s applied=%s "
+                                    "already_active=%s "
+                                    "unsupported=%s",
+                                    format_result.get(
+                                        "published"
+                                    ),
+                                    len(
+                                        format_result.get(
+                                            "applied",
+                                            [],
+                                        )
+                                    ),
+                                    len(
+                                        format_result.get(
+                                            "already_active",
+                                            [],
+                                        )
+                                    ),
+                                    len(
+                                        format_result.get(
+                                            "unsupported",
+                                            [],
+                                        )
+                                    ),
+                                )
+
+                            except Exception:
+                                log.exception(
+                                    "Dzen: не удалось заменить/"
+                                    "оформить body. "
+                                    "Seed остаётся законченной "
+                                    "короткой статьёй."
+                                )
+
+                        else:
+                            log.warning(
+                                "Dzen: seed-статья не появилась "
+                                "за 180 секунд."
                             )
 
                     else:
                         log.warning(
-                            "Dzen formatter пропущен: "
-                            "не заданы DZEN_COMMENT_PROFILE_DIR/"
-                            "DZEN_PROFILE_DIR или DZEN_COMMENTS_URL"
+                            "Dzen: настройки не заданы; "
+                            "обработка Dzen пропущена."
                         )
 
-                    log.info(
-                        "Dzen-синхронизация и попытка "
-                        "rich-format завершены. "
-                        "Удаляю long-post из Telegram."
-                    )
-
-                    long_deleted = False
+                finally:
+                    # -----------------------------------------
+                    # DELETE TELEGRAM SEED
+                    # -----------------------------------------
                     try:
-                        await self.telegram_web.delete_post(
-                            post_ref,
-                            full_caption,
+                        await self.bot.delete_message(
+                            chat_id=(
+                                self.cfg.telegram_channel_id
+                            ),
+                            message_id=seed_message_id,
                         )
-                        long_deleted = True
+
+                        log.info(
+                            "Bot API: Dzen seed удалён "
+                            "из Telegram."
+                        )
+
                     except Exception:
-                        # Не обрываем весь LONG -> SHORT цикл из-за изменения DOM
-                        # Telegram Web. Иначе пользователь остаётся без SHORT-поста.
                         log.exception(
-                            "Не удалось удалить long-post. "
-                            "Продолжаю и публикую short Rich Message; "
-                            "long-post потребуется удалить вручную, если он остался."
+                            "Не удалось удалить Dzen seed "
+                            "из Telegram."
                         )
 
                     await asyncio.sleep(
                         1.5
                     )
 
-                    short_body_clean = clean_short_article_text(
-                        short_body
-                    )
+                    # -----------------------------------------
+                    # FINAL SHORT RICH MESSAGE
+                    # -----------------------------------------
+                    try:
+                        short_body_clean = (
+                            clean_short_article_text(
+                                short_body
+                            )
+                        )
 
-                    log.info(
-                        "Bot API: публикую short Rich Message, chars=%s",
-                        len(short_body_clean),
-                    )
+                        log.info(
+                            "Bot API: публикую финальный "
+                            "short Rich Message, chars=%s",
+                            len(short_body_clean),
+                        )
 
-                    short_message_id = await send_short_rich_message(
-                        self.bot,
-                        self.cfg.telegram_channel_id,
-                        short_title,
-                        short_body_clean,
-                        image_bytes,
-                    )
+                        short_message_id = (
+                            await send_short_rich_message(
+                                self.bot,
+                                self.cfg.telegram_channel_id,
+                                short_title,
+                                short_body_clean,
+                                image_bytes,
+                            )
+                        )
 
-                    await db.set_telegram_result(
-                        publication_id,
-                        "published",
-                        message_id=str(
-                            short_message_id
-                        ),
-                    )
+                        await db.set_telegram_result(
+                            publication_id,
+                            "published",
+                            message_id=str(
+                                short_message_id
+                            ),
+                        )
 
-                    log.info(
-                        "Готово: long_deleted=%s; "
-                        "short Rich Message опубликован, message_id=%s.",
-                        long_deleted,
-                        short_message_id,
-                    )
+                        log.info(
+                            "Готово: Dzen ready=%s; "
+                            "seed удалён; "
+                            "short Rich Message опубликован, "
+                            "message_id=%s.",
+                            dzen_ready,
+                            short_message_id,
+                        )
 
-                except Exception:
-                    log.exception(
-                        "Ошибка цикла LONG -> DELETE -> SHORT"
-                    )
+                    except Exception as exc:
+                        log.exception(
+                            "Не удалось опубликовать "
+                            "финальный short Rich Message"
+                        )
+
+                        await db.set_telegram_result(
+                            publication_id,
+                            "error",
+                            error=str(exc)[:1000],
+                        )
 
             task = asyncio.create_task(
                 replace_after_dzen_sync()
             )
+
             self.background_tasks.add(
                 task
             )
+
             task.add_done_callback(
                 self.background_tasks.discard
             )
@@ -1381,16 +1377,19 @@ class ArticleService:
             result[
                 "telegram_replace_scheduled"
             ] = True
+
             result[
                 "telegram_long_format"
-            ] = "telegram_web_media_caption"
+            ] = "bot_api_dzen_seed"
+
             result[
                 "telegram_short_format"
             ] = "rich_message"
 
         except Exception as exc:
             log.exception(
-                "Ошибка публикации long-post через Telegram Web"
+                "Ошибка публикации Dzen seed "
+                "через Bot API"
             )
 
             await db.set_telegram_result(

@@ -1113,6 +1113,7 @@ class ArticleService:
                 ),
                 caption=seed_caption,
                 disable_notification=True,
+                request_timeout=90,
             )
 
             seed_message_id = (

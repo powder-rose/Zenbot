@@ -251,6 +251,7 @@ class TenantPublishPipeline:
             photo=image,
             caption=caption,
             disable_notification=True,
+            request_timeout=90,
         )
 
         log.info(
@@ -461,8 +462,24 @@ class TenantPublishPipeline:
                     "в Dzen за время ожидания"
                 )
 
-            replace_result = (
-                await formatter.replace_article_body(
+            # ----------------------------------------
+            # ONE DZEN EDITOR SESSION
+            # ----------------------------------------
+            #
+            # Раньше SaaS делал:
+            #
+            # replace_article_body()
+            # → save
+            # → новый Chromium/editor
+            # → format_article()
+            # → save
+            #
+            # Теперь весь finalize выполняется
+            # за одну editor-сессию и один save.
+            # ----------------------------------------
+
+            finalize_result = (
+                await formatter.finalize_article(
                     profile_dir=dzen[
                         "profile_dir"
                     ],
@@ -479,45 +496,104 @@ class TenantPublishPipeline:
             result[
                 "body_replaced"
             ] = bool(
-                replace_result.get(
-                    "published"
-                )
-            )
-
-            # Сохраняем диагностику сразу.
-            # Если последующее форматирование
-            # упадёт, данные успешной замены body
-            # всё равно останутся в result.
-            result[
-                "replace_result"
-            ] = replace_result
-
-            format_result = (
-                await formatter.format_article(
-                    profile_dir=dzen[
-                        "profile_dir"
-                    ],
-                    studio_url=dzen[
-                        "studio_url"
-                    ],
-                    article_title=title,
-                    source_body=full_body,
-                    article_href=article_href,
-                    publish=True,
+                finalize_result.get(
+                    "body_replaced"
                 )
             )
 
             result[
                 "formatted"
             ] = bool(
-                format_result.get(
-                    "published"
+                finalize_result.get(
+                    "formatted"
                 )
             )
 
             result[
+                "finalize_result"
+            ] = finalize_result
+
+            # Сохраняем совместимость с диагностикой
+            # старого pipeline. Внешний код пока может
+            # читать эти поля.
+            result[
+                "replace_result"
+            ] = {
+                "published": (
+                    finalize_result.get(
+                        "published"
+                    )
+                ),
+                "old_body_chars": (
+                    finalize_result.get(
+                        "old_body_chars"
+                    )
+                ),
+                "new_body_chars": (
+                    finalize_result.get(
+                        "new_body_chars"
+                    )
+                ),
+                "mapped_lines": (
+                    finalize_result.get(
+                        "mapped_lines"
+                    )
+                ),
+                "image_preserved": (
+                    finalize_result.get(
+                        "image_preserved"
+                    )
+                ),
+            }
+
+            result[
                 "format_result"
-            ] = format_result
+            ] = {
+                "published": (
+                    finalize_result.get(
+                        "published"
+                    )
+                ),
+                "applied": (
+                    finalize_result.get(
+                        "applied",
+                        [],
+                    )
+                ),
+                "already_active": (
+                    finalize_result.get(
+                        "already_active",
+                        [],
+                    )
+                ),
+                "unsupported": (
+                    finalize_result.get(
+                        "unsupported",
+                        [],
+                    )
+                ),
+            }
+
+            log.info(
+                "Tenant Dzen finalize complete: "
+                "user=%s channel=%s "
+                "published=%s replaced=%s "
+                "formatted=%s image_preserved=%s",
+                user_id,
+                chat_id,
+                finalize_result.get(
+                    "published"
+                ),
+                result.get(
+                    "body_replaced"
+                ),
+                result.get(
+                    "formatted"
+                ),
+                finalize_result.get(
+                    "image_preserved"
+                ),
+            )
 
             log.info(
                 "Tenant Dzen publication ready: "

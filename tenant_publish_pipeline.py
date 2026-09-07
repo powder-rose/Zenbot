@@ -429,7 +429,7 @@ class TenantPublishPipeline:
                 headless=self.headless
             )
 
-            found = await formatter.wait_for_article(
+            article_href = await formatter.wait_for_article(
                 profile_dir=dzen[
                     "profile_dir"
                 ],
@@ -448,10 +448,14 @@ class TenantPublishPipeline:
             result[
                 "synced"
             ] = bool(
-                found
+                article_href
             )
 
-            if not found:
+            result[
+                "article_href"
+            ] = article_href
+
+            if not article_href:
                 raise RuntimeError(
                     "Статья не появилась "
                     "в Dzen за время ожидания"
@@ -467,6 +471,7 @@ class TenantPublishPipeline:
                     ],
                     article_title=title,
                     source_body=full_body,
+                    article_href=article_href,
                     publish=True,
                 )
             )
@@ -497,6 +502,7 @@ class TenantPublishPipeline:
                     ],
                     article_title=title,
                     source_body=full_body,
+                    article_href=article_href,
                     publish=True,
                 )
             )

@@ -1135,6 +1135,7 @@ class ArticleService:
 
             async def replace_after_dzen_sync() -> None:
                 dzen_ready = False
+                dzen_article_href: str | None = None
 
                 try:
                     dzen_profile_dir = str(
@@ -1169,7 +1170,7 @@ class ArticleService:
                         )
 
                         try:
-                            dzen_ready = (
+                            dzen_article_href = (
                                 await formatter.wait_for_article(
                                     profile_dir=dzen_profile_dir,
                                     studio_url=dzen_studio_url,
@@ -1177,6 +1178,10 @@ class ArticleService:
                                     timeout_seconds=180,
                                     poll_seconds=5,
                                 )
+                            )
+
+                            dzen_ready = bool(
+                                dzen_article_href
                             )
                         except Exception:
                             log.exception(
@@ -1197,6 +1202,7 @@ class ArticleService:
                                         studio_url=dzen_studio_url,
                                         article_title=title,
                                         source_body=full_body,
+                                        article_href=dzen_article_href,
                                         publish=True,
                                     )
                                 )
@@ -1227,6 +1233,7 @@ class ArticleService:
                                         studio_url=dzen_studio_url,
                                         article_title=title,
                                         source_body=full_body,
+                                        article_href=dzen_article_href,
                                         publish=True,
                                     )
                                 )

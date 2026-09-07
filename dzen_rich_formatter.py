@@ -500,10 +500,29 @@ class DzenRichFormatter:
         self,
         page: Page,
         article_title: str,
+        article_href: str | None = None,
     ):
         target = _normalize_dzen_text(
             article_title
         )
+
+        target_href = str(
+            article_href or ""
+        ).strip()
+
+        target_href_path = ""
+
+        if target_href:
+            target_href_path = (
+                urlparse(
+                    urljoin(
+                        page.url,
+                        target_href,
+                    )
+                )
+                .path
+                .rstrip("/")
+            )
 
         # Dzen Studio может временно убрать только что
         # импортированную публикацию из списка во время
@@ -529,11 +548,42 @@ class DzenRichFormatter:
                 )
 
                 try:
+                    current_href = str(
+                        await link.get_attribute(
+                            "href"
+                        )
+                        or ""
+                    ).strip()
+
+                    # Если статья уже была однажды
+                    # идентифицирована, заголовок больше
+                    # не используем как идентификатор.
+                    if target_href:
+                        current_href_path = (
+                            urlparse(
+                                urljoin(
+                                    page.url,
+                                    current_href,
+                                )
+                            )
+                            .path
+                            .rstrip("/")
+                        )
+
+                        if (
+                            current_href_path
+                            == target_href_path
+                        ):
+                            return link
+
+                        continue
+
                     text = (
                         _normalize_dzen_text(
                             await link.inner_text()
                         )
                     )
+
                 except Exception:
                     continue
 
@@ -578,11 +628,13 @@ class DzenRichFormatter:
         self,
         page: Page,
         article_title: str,
+        article_href: str | None = None,
     ):
         article = (
             await self._find_article_link(
                 page,
                 article_title,
+                article_href=article_href,
             )
         )
 
@@ -1947,6 +1999,7 @@ class DzenRichFormatter:
         studio_url: str,
         article_title: str,
         source_body: str,
+        article_href: str | None = None,
         publish: bool = True,
     ) -> dict:
         """
@@ -2011,6 +2064,7 @@ class DzenRichFormatter:
                     body = await self._open_editor(
                         page,
                         article_title,
+                        article_href=article_href,
                     )
 
                     old_text = (
@@ -2291,6 +2345,7 @@ class DzenRichFormatter:
         studio_url: str,
         article_title: str,
         source_body: str,
+        article_href: str | None = None,
         publish: bool = True,
     ) -> dict:
         """
@@ -2349,6 +2404,7 @@ class DzenRichFormatter:
                     body = await self._open_editor(
                         page,
                         article_title,
+                        article_href=article_href,
                     )
 
                     await self._remove_synced_duplicate_title(
@@ -2791,12 +2847,15 @@ class DzenRichFormatter:
         article_title: str,
         timeout_seconds: int = 180,
         poll_seconds: int = 5,
-    ) -> bool:
+    ) -> str | None:
         """
         Ждёт появления статьи в Dzen Studio.
 
-        Возвращает True сразу после того,
+        Возвращает href статьи сразу после того,
         как публикация появилась в списке.
+
+        Если статья не появилась за timeout —
+        возвращает None.
 
         Не редактирует и не публикует статью.
         """
@@ -2850,15 +2909,31 @@ class DzenRichFormatter:
                                 article is not None
                                 and await article.count() > 0
                             ):
+                                article_href = str(
+                                    await article.get_attribute(
+                                        "href"
+                                    )
+                                    or ""
+                                ).strip()
+
+                                if not article_href:
+                                    raise RuntimeError(
+                                        "Dzen formatter: "
+                                        "у найденной статьи "
+                                        "отсутствует href"
+                                    )
+
                                 log.info(
                                     "Dzen formatter: "
                                     "статья появилась в Dzen "
-                                    "после попытки %s: %s",
+                                    "после попытки %s: %s; "
+                                    "href=%s",
                                     attempt,
                                     article_title,
+                                    article_href,
                                 )
 
-                                return True
+                                return article_href
 
                         except RuntimeError as exc:
                             # Нормальная ситуация:
@@ -2902,7 +2977,7 @@ class DzenRichFormatter:
                         article_title,
                     )
 
-                    return False
+                    return None
 
                 finally:
                     await context.close()

@@ -2338,6 +2338,499 @@ class DzenRichFormatter:
                     await context.close()
 
 
+
+    async def finalize_article(
+        self,
+        *,
+        profile_dir: str,
+        studio_url: str,
+        article_title: str,
+        source_body: str,
+        article_href: str | None = None,
+        publish: bool = True,
+    ) -> dict:
+        """
+        Финализирует импортированную Dzen-статью
+        за одну браузерную/editor-сессию:
+
+        1. открывает статью;
+        2. сохраняет импортированные media-блоки;
+        3. заменяет seed-текст на полный LONG;
+        4. применяет rich-format;
+        5. проверяет текст и изображения;
+        6. сохраняет изменения один раз.
+        """
+
+        parsed = parse_dzen_markup(
+            source_body
+        )
+
+        if not any(
+            line.strip()
+            for line in parsed.lines
+        ):
+            raise RuntimeError(
+                "Dzen formatter: "
+                "пустой source_body для finalize"
+            )
+
+        result = {
+            "body_replaced": False,
+            "formatted": False,
+            "published": False,
+            "old_body_chars": 0,
+            "new_body_chars": 0,
+            "mapped_lines": 0,
+            "image_blocks_before": 0,
+            "image_blocks_after": 0,
+            "image_preserved": True,
+            "applied": [],
+            "already_active": [],
+            "unsupported": [],
+        }
+
+        async with DZEN_BROWSER_LOCK:
+            async with async_playwright() as pw:
+                context = (
+                    await pw.chromium
+                    .launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        headless=self.headless,
+                        viewport={
+                            "width": 1440,
+                            "height": 1200,
+                        },
+                        locale="ru-RU",
+                    )
+                )
+
+                try:
+                    page = (
+                        context.pages[0]
+                        if context.pages
+                        else await context.new_page()
+                    )
+
+                    await self._goto_publications(
+                        page,
+                        studio_url,
+                    )
+
+                    body = await self._open_editor(
+                        page,
+                        article_title,
+                        article_href=article_href,
+                    )
+
+                    # ======================================
+                    # 1. REPLACE BODY, PRESERVE MEDIA
+                    # ======================================
+
+                    old_text = await body.inner_text()
+
+                    result[
+                        "old_body_chars"
+                    ] = len(old_text)
+
+                    image_blocks_before = (
+                        await body.locator(
+                            "figure.zen-editor-block-image"
+                        ).count()
+                    )
+
+                    result[
+                        "image_blocks_before"
+                    ] = image_blocks_before
+
+                    image_was_present = (
+                        await body.evaluate(
+                            """
+                            root => {
+                                root.focus();
+
+                                const image =
+                                    root.querySelector(
+                                        "figure.zen-editor-block-image"
+                                    );
+
+                                const range =
+                                    document.createRange();
+
+                                if (image) {
+                                    range.setStart(
+                                        root,
+                                        0
+                                    );
+
+                                    range.setEndBefore(
+                                        image
+                                    );
+                                } else {
+                                    range.selectNodeContents(
+                                        root
+                                    );
+                                }
+
+                                const selection =
+                                    window.getSelection();
+
+                                selection.removeAllRanges();
+                                selection.addRange(
+                                    range
+                                );
+
+                                return Boolean(
+                                    image
+                                );
+                            }
+                            """
+                        )
+                    )
+
+                    await page.keyboard.press(
+                        "Backspace"
+                    )
+
+                    await page.wait_for_timeout(
+                        700
+                    )
+
+                    body = page.locator(
+                        '[contenteditable="true"]'
+                        '.public-DraftEditor-content'
+                    ).nth(1)
+
+                    image_blocks_after_delete = (
+                        await body.locator(
+                            "figure.zen-editor-block-image"
+                        ).count()
+                    )
+
+                    if (
+                        image_was_present
+                        and image_blocks_after_delete == 0
+                    ):
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "изображение исчезло "
+                            "при очистке body"
+                        )
+
+                    caret_ready = await body.evaluate(
+                        """
+                        root => {
+                            root.focus();
+
+                            const blocks = Array.from(
+                                root.querySelectorAll(
+                                    '[data-block="true"]'
+                                )
+                            );
+
+                            const textBlock = blocks.find(
+                                block =>
+                                    !block.matches(
+                                        "figure.zen-editor-block-image"
+                                    )
+                                    && !block.closest(
+                                        "figure.zen-editor-block-image"
+                                    )
+                            );
+
+                            if (!textBlock) {
+                                return false;
+                            }
+
+                            const range =
+                                document.createRange();
+
+                            range.selectNodeContents(
+                                textBlock
+                            );
+
+                            range.collapse(
+                                true
+                            );
+
+                            const selection =
+                                window.getSelection();
+
+                            selection.removeAllRanges();
+                            selection.addRange(
+                                range
+                            );
+
+                            return true;
+                        }
+                        """
+                    )
+
+                    if not caret_ready:
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "после очистки body "
+                            "не найден текстовый блок"
+                        )
+
+                    for index, line in enumerate(
+                        parsed.lines
+                    ):
+                        if line:
+                            await page.keyboard.insert_text(
+                                line
+                            )
+
+                        if index < (
+                            len(parsed.lines) - 1
+                        ):
+                            await page.keyboard.press(
+                                "Enter"
+                            )
+
+                    await page.wait_for_timeout(
+                        1000
+                    )
+
+                    body = page.locator(
+                        '[contenteditable="true"]'
+                        '.public-DraftEditor-content'
+                    ).nth(1)
+
+                    new_text = await body.inner_text()
+
+                    result[
+                        "new_body_chars"
+                    ] = len(new_text)
+
+                    image_blocks_after = (
+                        await body.locator(
+                            "figure.zen-editor-block-image"
+                        ).count()
+                    )
+
+                    result[
+                        "image_blocks_after"
+                    ] = image_blocks_after
+
+                    result[
+                        "image_preserved"
+                    ] = (
+                        image_blocks_before == 0
+                        or image_blocks_after > 0
+                    )
+
+                    if (
+                        image_blocks_before > 0
+                        and image_blocks_after == 0
+                    ):
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "изображение потеряно "
+                            "после вставки LONG"
+                        )
+
+                    mapping = (
+                        await self._map_lines_to_blocks(
+                            body,
+                            parsed,
+                        )
+                    )
+
+                    result[
+                        "mapped_lines"
+                    ] = len(mapping)
+
+                    result[
+                        "body_replaced"
+                    ] = True
+
+                    log.info(
+                        "Dzen formatter: finalize "
+                        "body готов; old_chars=%s "
+                        "new_chars=%s mapped=%s "
+                        "images=%s→%s",
+                        result["old_body_chars"],
+                        result["new_body_chars"],
+                        result["mapped_lines"],
+                        image_blocks_before,
+                        image_blocks_after,
+                    )
+
+                    # ======================================
+                    # 2. INLINE FORMAT
+                    # ======================================
+
+                    for span in parsed.spans:
+                        if (
+                            span.style
+                            not in _DZEN_TOOLBAR_LABELS
+                        ):
+                            result[
+                                "unsupported"
+                            ].append({
+                                "style": span.style,
+                                "text": span.text,
+                            })
+
+                            continue
+
+                        body = page.locator(
+                            '[contenteditable="true"]'
+                            '.public-DraftEditor-content'
+                        ).nth(1)
+
+                        mapping = (
+                            await self._map_lines_to_blocks(
+                                body,
+                                parsed,
+                            )
+                        )
+
+                        status = (
+                            await self._ensure_inline_style(
+                                page=page,
+                                body=body,
+                                parsed=parsed,
+                                mapping=mapping,
+                                span=span,
+                            )
+                        )
+
+                        result[
+                            status
+                        ].append({
+                            "style": span.style,
+                            "text": span.text,
+                        })
+
+                    # ======================================
+                    # 3. BLOCKQUOTES
+                    # ======================================
+
+                    for line_index in sorted(
+                        parsed.blockquotes
+                    ):
+                        body = page.locator(
+                            '[contenteditable="true"]'
+                            '.public-DraftEditor-content'
+                        ).nth(1)
+
+                        mapping = (
+                            await self._map_lines_to_blocks(
+                                body,
+                                parsed,
+                            )
+                        )
+
+                        status = (
+                            await self._ensure_blockquote(
+                                page=page,
+                                body=body,
+                                parsed=parsed,
+                                mapping=mapping,
+                                line_index=line_index,
+                            )
+                        )
+
+                        result[
+                            status
+                        ].append({
+                            "style": "blockquote",
+                            "text": parsed.lines[
+                                line_index
+                            ],
+                        })
+
+                    # ======================================
+                    # 4. FINAL INTEGRITY CHECK
+                    # ======================================
+
+                    body = page.locator(
+                        '[contenteditable="true"]'
+                        '.public-DraftEditor-content'
+                    ).nth(1)
+
+                    mapping = (
+                        await self._map_lines_to_blocks(
+                            body,
+                            parsed,
+                        )
+                    )
+
+                    result[
+                        "mapped_lines"
+                    ] = len(mapping)
+
+                    final_image_count = (
+                        await body.locator(
+                            "figure.zen-editor-block-image"
+                        ).count()
+                    )
+
+                    result[
+                        "image_blocks_after"
+                    ] = final_image_count
+
+                    result[
+                        "image_preserved"
+                    ] = (
+                        image_blocks_before == 0
+                        or final_image_count > 0
+                    )
+
+                    if (
+                        image_blocks_before > 0
+                        and final_image_count == 0
+                    ):
+                        raise RuntimeError(
+                            "Dzen formatter: "
+                            "изображение потеряно "
+                            "во время форматирования"
+                        )
+
+                    result[
+                        "formatted"
+                    ] = True
+
+                    # ======================================
+                    # 5. ONE FINAL SAVE
+                    # ======================================
+
+                    if publish:
+                        await self._publish_editor_changes(
+                            page
+                        )
+
+                        result[
+                            "published"
+                        ] = True
+
+                    result[
+                        "editor_url"
+                    ] = page.url
+
+                    log.info(
+                        "Dzen formatter: finalize готов; "
+                        "published=%s applied=%s "
+                        "already_active=%s unsupported=%s "
+                        "image_preserved=%s",
+                        result["published"],
+                        len(result["applied"]),
+                        len(
+                            result[
+                                "already_active"
+                            ]
+                        ),
+                        len(result["unsupported"]),
+                        result["image_preserved"],
+                    )
+
+                    return result
+
+                finally:
+                    await context.close()
+
+
     async def format_article(
         self,
         *,

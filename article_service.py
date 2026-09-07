@@ -1191,13 +1191,14 @@ class ArticleService:
                         if dzen_ready:
                             log.info(
                                 "Dzen: seed найден. "
-                                "Заменяю body на полный LONG."
+                                "Финализирую статью "
+                                "за одну editor-сессию."
                             )
 
                             try:
-                                replace_result = (
+                                finalize_result = (
                                     await formatter
-                                    .replace_article_body(
+                                    .finalize_article(
                                         profile_dir=dzen_profile_dir,
                                         studio_url=dzen_studio_url,
                                         article_title=title,
@@ -1208,68 +1209,61 @@ class ArticleService:
                                 )
 
                                 log.info(
-                                    "Dzen: body заменён; "
-                                    "old_chars=%s new_chars=%s "
-                                    "mapped_lines=%s",
-                                    replace_result.get(
-                                        "old_body_chars"
-                                    ),
-                                    replace_result.get(
-                                        "new_body_chars"
-                                    ),
-                                    replace_result.get(
-                                        "mapped_lines"
-                                    ),
-                                )
-
-                                log.info(
-                                    "Dzen: применяю rich-format."
-                                )
-
-                                format_result = (
-                                    await formatter
-                                    .format_article(
-                                        profile_dir=dzen_profile_dir,
-                                        studio_url=dzen_studio_url,
-                                        article_title=title,
-                                        source_body=full_body,
-                                        article_href=dzen_article_href,
-                                        publish=True,
-                                    )
-                                )
-
-                                log.info(
-                                    "Dzen: оформление готово; "
-                                    "published=%s applied=%s "
+                                    "Dzen: finalize готов; "
+                                    "published=%s "
+                                    "body_replaced=%s "
+                                    "formatted=%s "
+                                    "old_chars=%s "
+                                    "new_chars=%s "
+                                    "mapped=%s "
+                                    "applied=%s "
                                     "already_active=%s "
-                                    "unsupported=%s",
-                                    format_result.get(
+                                    "unsupported=%s "
+                                    "image_preserved=%s",
+                                    finalize_result.get(
                                         "published"
                                     ),
+                                    finalize_result.get(
+                                        "body_replaced"
+                                    ),
+                                    finalize_result.get(
+                                        "formatted"
+                                    ),
+                                    finalize_result.get(
+                                        "old_body_chars"
+                                    ),
+                                    finalize_result.get(
+                                        "new_body_chars"
+                                    ),
+                                    finalize_result.get(
+                                        "mapped_lines"
+                                    ),
                                     len(
-                                        format_result.get(
+                                        finalize_result.get(
                                             "applied",
                                             [],
                                         )
                                     ),
                                     len(
-                                        format_result.get(
+                                        finalize_result.get(
                                             "already_active",
                                             [],
                                         )
                                     ),
                                     len(
-                                        format_result.get(
+                                        finalize_result.get(
                                             "unsupported",
                                             [],
                                         )
+                                    ),
+                                    finalize_result.get(
+                                        "image_preserved"
                                     ),
                                 )
 
                             except Exception:
                                 log.exception(
-                                    "Dzen: не удалось заменить/"
-                                    "оформить body. "
+                                    "Dzen: finalize не удался. "
                                     "Seed остаётся законченной "
                                     "короткой статьёй."
                                 )

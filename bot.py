@@ -1984,6 +1984,20 @@ def _format_ai_usage_report(
             f"<b>{report['requests']}</b>"
         ),
         "",
+        "📰 <b>Статьи</b>",
+        (
+            "Опубликовано: "
+            f"<b>{report['published_articles']}</b>"
+        ),
+        (
+            "Расходы на статьи: "
+            f"<b>{report['article_cost_rub']:.2f} ₽</b>"
+        ),
+        (
+            "Средняя стоимость: "
+            f"<b>{report['average_article_cost_rub']:.2f} ₽ / статья</b>"
+        ),
+        "",
         "🧠 <b>Токены YandexGPT</b>",
         (
             "Входящие: "

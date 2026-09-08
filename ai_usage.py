@@ -377,6 +377,24 @@ def record_search(
 
 
 # =========================================================
+# СЕБЕСТОИМОСТЬ СТАТЬИ
+# =========================================================
+
+_ARTICLE_COST_ACTIONS = {
+    "search_subtopic",
+    "subtopic_select",
+    "search_article",
+    "search_article_fresh_retry",
+    "article_full",
+    "article_short",
+    "image_generation",
+    "popular_comment_topic",
+}
+
+
+
+
+# =========================================================
 # INSERT
 # =========================================================
 
@@ -751,6 +769,144 @@ def period_report(
             tuple(params),
         ).fetchall()
 
+
+        # -----------------------------------------
+        # Средняя себестоимость опубликованной
+        # статьи за выбранный период.
+        # -----------------------------------------
+
+        article_actions = sorted(
+            _ARTICLE_COST_ACTIONS
+        )
+
+        placeholders = ",".join(
+            "?"
+            for _ in article_actions
+        )
+
+        if start_utc:
+            article_cost_row = conn.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(cost_rub), 0)
+                FROM ai_usage
+                WHERE created_at >= ?
+                  AND action IN ({placeholders})
+                """,
+                (
+                    start_utc,
+                    *article_actions,
+                ),
+            ).fetchone()
+        else:
+            article_cost_row = conn.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(cost_rub), 0)
+                FROM ai_usage
+                WHERE action IN ({placeholders})
+                """,
+                tuple(article_actions),
+            ).fetchone()
+
+        article_cost_rub = float(
+            article_cost_row[0] or 0
+        )
+
+
+        def table_exists(
+            table_name: str,
+        ) -> bool:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name=?
+                LIMIT 1
+                """,
+                (
+                    table_name,
+                ),
+            ).fetchone()
+
+            return row is not None
+
+
+        global_articles = 0
+
+        if table_exists(
+            "publications"
+        ):
+            if start_utc:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publications
+                    WHERE telegram_status='published'
+                      AND created_at >= ?
+                    """,
+                    (
+                        start_utc,
+                    ),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM publications
+                    WHERE telegram_status='published'
+                    """
+                ).fetchone()
+
+            global_articles = int(
+                row[0] or 0
+            )
+
+
+        tenant_articles = 0
+
+        if table_exists(
+            "tenant_publications"
+        ):
+            if start_utc:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM tenant_publications
+                    WHERE status='published'
+                      AND created_at >= ?
+                    """,
+                    (
+                        start_utc,
+                    ),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM tenant_publications
+                    WHERE status='published'
+                    """
+                ).fetchone()
+
+            tenant_articles = int(
+                row[0] or 0
+            )
+
+
+        published_articles = (
+            global_articles
+            + tenant_articles
+        )
+
+        average_article_cost_rub = (
+            article_cost_rub
+            / published_articles
+            if published_articles
+            else 0.0
+        )
+
     return {
         "period": period,
         "start_utc": start_utc,
@@ -769,6 +925,19 @@ def period_report(
 
         "cost_rub": round(
             float(total[5] or 0),
+            4,
+        ),
+
+        "published_articles":
+            published_articles,
+
+        "article_cost_rub": round(
+            article_cost_rub,
+            4,
+        ),
+
+        "average_article_cost_rub": round(
+            average_article_cost_rub,
             4,
         ),
 

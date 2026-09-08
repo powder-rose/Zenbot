@@ -7,6 +7,7 @@ import html
 import logging
 import os
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -905,6 +906,159 @@ async def send_short_rich_message(
     )
 
 
+_GLOBAL_TITLE_STOPWORDS = {
+    "как",
+    "что",
+    "это",
+    "этот",
+    "эта",
+    "эти",
+    "того",
+    "для",
+    "при",
+    "или",
+    "если",
+    "после",
+    "перед",
+    "через",
+    "между",
+    "также",
+    "нужно",
+    "можно",
+    "правильно",
+    "актуальные",
+    "важные",
+    "новые",
+}
+
+
+def _normalize_global_article_title(
+    value: str,
+) -> list[str]:
+
+    value = (
+        str(value or "")
+        .lower()
+        .replace("ё", "е")
+    )
+
+    words = re.findall(
+        r"[a-zа-я0-9]+",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    return [
+        word
+        for word in words
+        if len(word) >= 4
+        and word not in _GLOBAL_TITLE_STOPWORDS
+    ]
+
+
+def _global_article_title_similarity(
+    first: str,
+    second: str,
+) -> float:
+
+    first_words = (
+        _normalize_global_article_title(
+            first
+        )
+    )
+
+    second_words = (
+        _normalize_global_article_title(
+            second
+        )
+    )
+
+    if not first_words or not second_words:
+        return 0.0
+
+    first_text = " ".join(
+        first_words
+    )
+
+    second_text = " ".join(
+        second_words
+    )
+
+    sequence_score = SequenceMatcher(
+        None,
+        first_text,
+        second_text,
+    ).ratio()
+
+    first_set = set(
+        first_words
+    )
+
+    second_set = set(
+        second_words
+    )
+
+    common = len(
+        first_set & second_set
+    )
+
+    smallest = min(
+        len(first_set),
+        len(second_set),
+    )
+
+    containment_score = (
+        common / smallest
+        if smallest
+        else 0.0
+    )
+
+    if common < 3:
+        containment_score = 0.0
+
+    return max(
+        sequence_score,
+        containment_score,
+    )
+
+
+def _find_similar_global_article_title(
+    candidate: str,
+    recent_titles: list[str],
+    *,
+    threshold: float = 0.58,
+) -> tuple[str | None, float]:
+
+    best_title = None
+    best_score = 0.0
+
+    for old_title in recent_titles:
+
+        score = (
+            _global_article_title_similarity(
+                candidate,
+                old_title,
+            )
+        )
+
+        if score > best_score:
+            best_score = score
+            best_title = old_title
+
+    if best_score >= threshold:
+        return (
+            best_title,
+            best_score,
+        )
+
+    return (
+        None,
+        best_score,
+    )
+
+
+
+
 class ArticleService:
     def __init__(
         self,
@@ -944,6 +1098,7 @@ class ArticleService:
         self,
         topic_id: int,
         topic_title: str,
+        extra_used_titles: list[str] | None = None,
     ) -> str | None:
         """
         Используется ТОЛЬКО для обычной
@@ -1018,11 +1173,20 @@ class ArticleService:
                 )
             )
 
+            comparison_titles = list(
+                dict.fromkeys(
+                    [
+                        *recent_titles,
+                        *(extra_used_titles or []),
+                    ]
+                )
+            )
+
             used_for_gpt = list(
                 dict.fromkeys(
                     [
                         *used,
-                        *recent_titles,
+                        *comparison_titles,
                     ]
                 )
             )
@@ -1096,12 +1260,49 @@ class ArticleService:
 
                     continue
 
+                # Дополнительная локальная защита
+                # от смысловых дублей последних статей.
+                #
+                # GPT уже видит recent_titles в prompt,
+                # но всё равно может предложить тот же
+                # сюжет другими словами.
+                similar_title, similarity = (
+                    _find_similar_global_article_title(
+                        subtopic,
+                        comparison_titles,
+                        threshold=0.58,
+                    )
+                )
+
+                if similar_title is not None:
+                    log.warning(
+                        "Global similar subtopic rejected: "
+                        "parent=%r attempt=%s "
+                        "score=%.3f candidate=%r "
+                        "previous=%r",
+                        topic_title,
+                        attempt,
+                        similarity,
+                        subtopic,
+                        similar_title,
+                    )
+
+                    # На следующей попытке GPT
+                    # явно увидит и этот отклонённый
+                    # вариант как уже использованный.
+                    used_for_gpt.append(
+                        subtopic
+                    )
+
+                    continue
+
                 log.info(
                     "Плановая подтема: "
                     "parent=%s subtopic=%s "
-                    "attempt=%s",
+                    "similarity=%.3f attempt=%s",
                     topic_title,
                     subtopic,
+                    similarity,
                     attempt,
                 )
 
@@ -1703,12 +1904,10 @@ class ArticleService:
 
             selected_subtopic = None
 
-            # Автоподбор подтемы работает
-            # ТОЛЬКО для обычной плановой статьи.
-            #
-            # urgent_random -> без подбора
-            # priority=1   -> без подбора
-            if (
+            # Жёсткая проверка смыслового дубля
+            # применяется только к обычной
+            # автоматической плановой статье.
+            auto_planned = (
                 trigger == "auto"
                 and int(
                     topic.get(
@@ -1717,54 +1916,191 @@ class ArticleService:
                     )
                     or 0
                 ) == 0
+            )
+
+            recent_titles_for_final = (
+                await db.list_recent_article_titles(
+                    limit=15,
+                )
+                if auto_planned
+                else []
+            )
+
+            rejected_generation_titles: list[str] = []
+            generation_result = None
+
+            # Обычная статья получает максимум
+            # две полноценные попытки.
+            #
+            # Если первая статья оказалась смысловым
+            # дублем, второй раз выбирается другой
+            # акцент с учётом отклонённого результата.
+            generation_attempts = (
+                2
+                if auto_planned
+                else 1
+            )
+
+            for generation_attempt in range(
+                1,
+                generation_attempts + 1,
             ):
-                selected_subtopic = (
-                    await self._select_auto_subtopic(
-                        topic_id,
+
+                if auto_planned:
+                    selected_subtopic = (
+                        await self._select_auto_subtopic(
+                            topic_id,
+                            topic_title,
+                            extra_used_titles=(
+                                rejected_generation_titles
+                            ),
+                        )
+                    )
+                else:
+                    selected_subtopic = None
+
+                try:
+                    generation_result = (
+                        await self._generate(
+                            topic_title,
+                            subtopic=selected_subtopic,
+                        )
+                    )
+
+                except ContentBlockedError as exc:
+                    await db.mark_topic_used(
+                        topic_id
+                    )
+
+                    log.warning(
+                        "Тема заблокирована YandexGPT: %s",
                         topic_title,
                     )
-                )
 
-            try:
+                    return {
+                        "status": "content_blocked",
+                        "topic": topic_title,
+                        "error": str(exc),
+                    }
+
+                except Exception as exc:
+                    await db.release_topic(
+                        topic_id
+                    )
+
+                    log.exception(
+                        "Ошибка генерации статьи"
+                    )
+
+                    return {
+                        "status": "generation_error",
+                        "topic": topic_title,
+                        "error": str(exc),
+                    }
+
                 (
                     title,
                     full_body,
                     short_title,
                     short_body,
                     image_bytes,
-                ) = await self._generate(
-                    topic_title,
-                    subtopic=selected_subtopic,
+                ) = generation_result
+
+                if not auto_planned:
+                    break
+
+                comparison_titles = list(
+                    dict.fromkeys(
+                        [
+                            *recent_titles_for_final,
+                            *rejected_generation_titles,
+                        ]
+                    )
                 )
-            except ContentBlockedError as exc:
-                await db.mark_topic_used(
-                    topic_id
+
+                similar_title, similarity = (
+                    _find_similar_global_article_title(
+                        title,
+                        comparison_titles,
+                        threshold=0.58,
+                    )
                 )
+
+                if similar_title is None:
+                    log.info(
+                        "Final article duplicate check OK: "
+                        "title=%r similarity=%.3f",
+                        title,
+                        similarity,
+                    )
+
+                    break
 
                 log.warning(
-                    "Тема заблокирована YandexGPT: %s",
-                    topic_title,
+                    "Final article duplicate rejected: "
+                    "attempt=%s score=%.3f "
+                    "title=%r previous=%r",
+                    generation_attempt,
+                    similarity,
+                    title,
+                    similar_title,
                 )
 
-                return {
-                    "status": "content_blocked",
-                    "topic": topic_title,
-                    "error": str(exc),
-                }
+                rejected_generation_titles.append(
+                    title
+                )
 
-            except Exception as exc:
+                if selected_subtopic:
+                    rejected_generation_titles.append(
+                        selected_subtopic
+                    )
+
+                if (
+                    generation_attempt
+                    < generation_attempts
+                ):
+                    log.info(
+                        "Перегенерирую статью "
+                        "с другим акцентом: parent=%r",
+                        topic_title,
+                    )
+
+                    continue
+
+                # Даже после второй попытки получили
+                # смысловой дубль — лучше не публиковать
+                # его вообще.
                 await db.release_topic(
                     topic_id
                 )
 
-                log.exception(
-                    "Ошибка генерации статьи"
+                log.warning(
+                    "Публикация отменена: "
+                    "две похожие статьи подряд "
+                    "для parent=%r",
+                    topic_title,
+                )
+
+                return {
+                    "status": "duplicate_rejected",
+                    "topic": topic_title,
+                    "article_title": title,
+                    "similar_to": similar_title,
+                    "similarity": similarity,
+                }
+
+            if generation_result is None:
+                await db.release_topic(
+                    topic_id
                 )
 
                 return {
                     "status": "generation_error",
                     "topic": topic_title,
-                    "error": str(exc),
+                    "error": (
+                        "Не удалось получить "
+                        "уникальную статью"
+                    ),
                 }
 
             image_path = None

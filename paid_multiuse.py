@@ -51,6 +51,10 @@ from tenant_dzen_qr_auth import authorize_tenant_dzen_by_qr
 from article_service import DEFAULT_IMAGE_PROMPT_TEMPLATE
 from config import Config
 from tenant_service import TenantArticleService
+from telegram_safe import (
+    safe_callback_answer,
+    spawn_background_task,
+)
 from topics_seed import DEFAULT_TOPICS
 from yandex_gpt import ARTICLE_SYSTEM_PROMPT
 
@@ -2143,11 +2147,58 @@ async def cb_tenant_priority_remove(
 async def cb_urgent_random(call: CallbackQuery):
     if not await require_paid(call):
         return
+
     _, _, service = _deps()
-    await call.answer()
-    status = await call.message.answer("⚡ Создаю статью…")
-    result = await service.publish_random_topic(call.from_user.id, trigger="urgent_random")
-    await status.edit_text(result_text(result))
+
+    await safe_callback_answer(
+        call,
+        "Запускаю публикацию…",
+    )
+
+    status = await call.message.answer(
+        "⚡ Создаю статью…"
+    )
+
+    user_id = int(
+        call.from_user.id
+    )
+
+    async def run_publication() -> None:
+        try:
+            result = await service.publish_random_topic(
+                user_id,
+                trigger="urgent_random",
+            )
+
+            await status.edit_text(
+                result_text(result)
+            )
+
+        except Exception as exc:
+            log.exception(
+                "Фоновая tenant-публикация "
+                "завершилась ошибкой: user=%s",
+                user_id,
+            )
+
+            try:
+                await status.edit_text(
+                    "❌ Не удалось создать статью.\n"
+                    f"Ошибка: {exc}"
+                )
+            except Exception:
+                log.exception(
+                    "Не удалось обновить tenant "
+                    "статус: user=%s",
+                    user_id,
+                )
+
+    spawn_background_task(
+        run_publication(),
+        name=(
+            f"tenant-urgent-random-{user_id}"
+        ),
+    )
 
 
 @router.callback_query(F.data == "tenant:urgent:manual")

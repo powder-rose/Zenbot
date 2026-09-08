@@ -45,6 +45,10 @@ from keyboards import (
 from scheduler import AutoPublisher
 from tenant_scheduler import TenantScheduler
 from tenant_service import TenantArticleService
+from telegram_safe import (
+    safe_callback_answer,
+    spawn_background_task,
+)
 from dzen_popular_comments import DzenPopularCommentWorker
 from dzen_comment_responder import DzenCommentResponderWorker
 from tenant_dzen_manager import TenantDzenManager
@@ -877,15 +881,56 @@ async def cb_priority_topic_remove(
 async def cb_urgent_random(call: CallbackQuery):
     if await deny(call):
         return
+
     if service is None:
-        await call.answer("Сервис ещё не запущен", show_alert=True)
+        await safe_callback_answer(
+            call,
+            "Сервис ещё не запущен",
+            show_alert=True,
+        )
         return
-    await call.answer()
-    status = await call.message.answer(
-        "⚡ Выбираю случайную неиспользованную тему и начинаю публикацию…"
+
+    await safe_callback_answer(
+        call,
+        "Запускаю публикацию…",
     )
-    result = await service.publish_random_topic(trigger="urgent_random")
-    await status.edit_text(result_text(result))
+
+    status = await call.message.answer(
+        "⚡ Выбираю случайную неиспользованную тему "
+        "и начинаю публикацию…"
+    )
+
+    async def run_publication() -> None:
+        try:
+            result = await service.publish_random_topic(
+                trigger="urgent_random"
+            )
+
+            await status.edit_text(
+                result_text(result)
+            )
+
+        except Exception as exc:
+            log.exception(
+                "Фоновая срочная публикация "
+                "завершилась ошибкой"
+            )
+
+            try:
+                await status.edit_text(
+                    "❌ Не удалось создать статью.\n"
+                    f"Ошибка: {exc}"
+                )
+            except Exception:
+                log.exception(
+                    "Не удалось обновить статус "
+                    "срочной публикации"
+                )
+
+    spawn_background_task(
+        run_publication(),
+        name="global-urgent-random",
+    )
 
 @dp.callback_query(F.data == "urgent:manual")
 async def cb_urgent_manual(call: CallbackQuery, state: FSMContext):

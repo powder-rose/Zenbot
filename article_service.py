@@ -28,6 +28,7 @@ from telegram_web_publisher import (
 )
 from dzen_rich_formatter import (
     DzenRichFormatter,
+    parse_dzen_markup,
 )
 from yandex_gpt import (
     ARTICLE_SYSTEM_PROMPT,
@@ -312,6 +313,265 @@ def build_image_prompt(
         ].rstrip()
 
     return result
+
+
+
+def build_public_short_caption_html(
+    title: str,
+    short_body: str,
+) -> str:
+    """
+    Финальный Telegram photo caption.
+
+    Это одновременно:
+    1. окончательный SHORT для Telegram;
+    2. transport-пост для импорта в Dzen.
+
+    Пользовательское rich-formatting сохраняется.
+    Видимый размер Telegram caption <= 1024 символов.
+    """
+
+    clean_title = " ".join(
+        str(title or "").split()
+    )
+
+    if not clean_title:
+        raise RuntimeError(
+            "Пустой заголовок SHORT"
+        )
+
+    parsed = parse_dzen_markup(
+        short_body
+    )
+
+    max_visible = 1024
+
+    available = (
+        max_visible
+        - len(clean_title)
+        - 2
+    )
+
+    if available <= 0:
+        raise RuntimeError(
+            "Заголовок слишком длинный "
+            "для Telegram caption"
+        )
+
+    selected = []
+    remaining = available
+
+    for line_index, line in enumerate(
+        parsed.lines
+    ):
+        separator = (
+            1
+            if selected
+            else 0
+        )
+
+        if remaining < separator:
+            break
+
+        remaining -= separator
+
+        piece = line[
+            :max(0, remaining)
+        ]
+
+        was_truncated = (
+            len(piece)
+            < len(line)
+        )
+
+        if was_truncated and piece:
+            cut = piece.rfind(
+                " "
+            )
+
+            if cut >= max(
+                0,
+                len(piece) - 120,
+            ):
+                piece = (
+                    piece[:cut]
+                    .rstrip()
+                )
+
+        selected.append(
+            (
+                line_index,
+                piece,
+            )
+        )
+
+        remaining -= len(
+            piece
+        )
+
+        if was_truncated:
+            break
+
+        if remaining <= 0:
+            break
+
+    spans_by_line = {}
+
+    for span in parsed.spans:
+        spans_by_line.setdefault(
+            span.line,
+            [],
+        ).append(
+            span
+        )
+
+    order = (
+        "bold",
+        "italic",
+        "underline",
+        "strike",
+    )
+
+    open_tag = {
+        "bold": "<b>",
+        "italic": "<i>",
+        "underline": "<u>",
+        "strike": "<s>",
+    }
+
+    close_tag = {
+        "bold": "</b>",
+        "italic": "</i>",
+        "underline": "</u>",
+        "strike": "</s>",
+    }
+
+    def render_line(
+        line_index: int,
+        value: str,
+    ) -> str:
+
+        if not value:
+            return ""
+
+        styles = [
+            set()
+            for _ in value
+        ]
+
+        for span in spans_by_line.get(
+            line_index,
+            [],
+        ):
+            start = max(
+                0,
+                int(span.start),
+            )
+
+            end = min(
+                len(value),
+                int(span.end),
+            )
+
+            for pos in range(
+                start,
+                end,
+            ):
+                styles[pos].add(
+                    span.style
+                )
+
+        result = []
+        current = set()
+
+        for pos, char in enumerate(
+            value
+        ):
+            target = styles[pos]
+
+            if target != current:
+
+                for style in reversed(
+                    order
+                ):
+                    if style in current:
+                        result.append(
+                            close_tag[
+                                style
+                            ]
+                        )
+
+                for style in order:
+                    if style in target:
+                        result.append(
+                            open_tag[
+                                style
+                            ]
+                        )
+
+                current = set(
+                    target
+                )
+
+            result.append(
+                html.escape(
+                    char,
+                    quote=False,
+                )
+            )
+
+        for style in reversed(
+            order
+        ):
+            if style in current:
+                result.append(
+                    close_tag[
+                        style
+                    ]
+                )
+
+        rendered = "".join(
+            result
+        )
+
+        if (
+            line_index in parsed.blockquotes
+            and value.strip()
+        ):
+            rendered = (
+                "<blockquote>"
+                + rendered
+                + "</blockquote>"
+            )
+
+        return rendered
+
+    body_html = "\n".join(
+        render_line(
+            line_index,
+            value,
+        )
+        for line_index, value
+        in selected
+    ).strip()
+
+    caption = (
+        "<b>"
+        + html.escape(
+            clean_title,
+            quote=False,
+        )
+        + "</b>"
+    )
+
+    if body_html:
+        caption += (
+            "\n\n"
+            + body_html
+        )
+
+    return caption
+
 
 
 def enforce_single_blog_link(text: str) -> str:
@@ -1080,57 +1340,57 @@ class ArticleService:
             # в статье не останется обрезанный LONG.
             # -------------------------------------------------
 
-            seed_body = clean_short_article_text(
-                short_body
-            )
-
-            # Для обычного Telegram caption убираем HTML-теги:
-            # seed нужен только как источник импорта для Dzen.
-            seed_body_plain = html.unescape(
-                re.sub(
-                    r"<[^>]+>",
-                    "",
-                    seed_body,
+            short_body_clean = (
+                clean_short_article_text(
+                    short_body
                 )
-            ).strip()
+            )
 
-            seed_caption = compose_caption(
-                title,
-                seed_body_plain,
-                max_chars=1024,
+            public_caption = (
+                build_public_short_caption_html(
+                    title,
+                    short_body_clean,
+                )
             )
 
             log.info(
-                "Bot API: публикую Dzen seed-photo, chars=%s",
-                len(seed_caption),
+                "Bot API: публикую финальный "
+                "Telegram SHORT, chars=%s",
+                len(public_caption),
             )
 
-            seed_message = await self.bot.send_photo(
-                chat_id=self.cfg.telegram_channel_id,
-                photo=BufferedInputFile(
-                    image_bytes,
-                    filename="article.jpg",
-                ),
-                caption=seed_caption,
-                disable_notification=True,
-                request_timeout=90,
+            public_message = (
+                await self.bot.send_photo(
+                    chat_id=(
+                        self.cfg.telegram_channel_id
+                    ),
+                    photo=BufferedInputFile(
+                        image_bytes,
+                        filename="article.jpg",
+                    ),
+                    caption=public_caption,
+                    parse_mode="HTML",
+                    disable_notification=True,
+                    request_timeout=180,
+                )
             )
 
-            seed_message_id = (
-                seed_message.message_id
+            public_message_id = (
+                public_message.message_id
             )
 
             log.info(
-                "Bot API: Dzen seed опубликован, "
-                "message_id=%s. Жду импорт в Dzen.",
-                seed_message_id,
+                "Bot API: финальный Telegram SHORT "
+                "опубликован, message_id=%s. "
+                "Жду импорт в Dzen.",
+                public_message_id,
             )
 
             await db.set_telegram_result(
                 publication_id,
                 "published",
                 message_id=str(
-                    seed_message_id
+                    public_message_id
                 ),
             )
 
@@ -1166,7 +1426,7 @@ class ArticleService:
                         )
 
                         log.info(
-                            "Dzen: жду импорт seed-статьи: %s",
+                            "Dzen: жду импорт Telegram SHORT: %s",
                             title,
                         )
 
@@ -1191,7 +1451,7 @@ class ArticleService:
 
                         if dzen_ready:
                             log.info(
-                                "Dzen: seed найден. "
+                                "Dzen: Telegram SHORT импортирован. "
                                 "Финализирую статью "
                                 "за одну editor-сессию."
                             )
@@ -1282,86 +1542,18 @@ class ArticleService:
                         )
 
                 finally:
-                    # -----------------------------------------
-                    # DELETE TELEGRAM SEED
-                    # -----------------------------------------
-                    try:
-                        await self.bot.delete_message(
-                            chat_id=(
-                                self.cfg.telegram_channel_id
-                            ),
-                            message_id=seed_message_id,
-                        )
-
-                        log.info(
-                            "Bot API: Dzen seed удалён "
-                            "из Telegram."
-                        )
-
-                    except Exception:
-                        log.exception(
-                            "Не удалось удалить Dzen seed "
-                            "из Telegram."
-                        )
-
-                    await asyncio.sleep(
-                        1.5
+                    # Telegram SHORT уже является
+                    # окончательной публикацией.
+                    #
+                    # НИЧЕГО не удаляем и повторно
+                    # в Telegram не публикуем.
+                    log.info(
+                        "Готово: Dzen ready=%s; "
+                        "Telegram SHORT сохранён, "
+                        "message_id=%s.",
+                        dzen_ready,
+                        public_message_id,
                     )
-
-                    # -----------------------------------------
-                    # FINAL SHORT RICH MESSAGE
-                    # -----------------------------------------
-                    try:
-                        short_body_clean = (
-                            clean_short_article_text(
-                                short_body
-                            )
-                        )
-
-                        log.info(
-                            "Bot API: публикую финальный "
-                            "short Rich Message, chars=%s",
-                            len(short_body_clean),
-                        )
-
-                        short_message_id = (
-                            await send_short_rich_message(
-                                self.bot,
-                                self.cfg.telegram_channel_id,
-                                short_title,
-                                short_body_clean,
-                                image_bytes,
-                            )
-                        )
-
-                        await db.set_telegram_result(
-                            publication_id,
-                            "published",
-                            message_id=str(
-                                short_message_id
-                            ),
-                        )
-
-                        log.info(
-                            "Готово: Dzen ready=%s; "
-                            "seed удалён; "
-                            "short Rich Message опубликован, "
-                            "message_id=%s.",
-                            dzen_ready,
-                            short_message_id,
-                        )
-
-                    except Exception as exc:
-                        log.exception(
-                            "Не удалось опубликовать "
-                            "финальный short Rich Message"
-                        )
-
-                        await db.set_telegram_result(
-                            publication_id,
-                            "error",
-                            error=str(exc)[:1000],
-                        )
 
             task = asyncio.create_task(
                 replace_after_dzen_sync()
@@ -1378,15 +1570,19 @@ class ArticleService:
             result["telegram"] = "published"
             result[
                 "telegram_replace_scheduled"
+            ] = False
+
+            result[
+                "dzen_finalize_scheduled"
             ] = True
 
             result[
                 "telegram_long_format"
-            ] = "bot_api_dzen_seed"
+            ] = "bot_api_final_short_dzen_transport"
 
             result[
                 "telegram_short_format"
-            ] = "rich_message"
+            ] = "photo_caption_html"
 
         except Exception as exc:
             log.exception(

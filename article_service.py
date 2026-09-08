@@ -1499,30 +1499,52 @@ class ArticleService:
                 )
             )
 
-            # До четырёх попыток:
-            # если GPT сначала выбрал очередной
-            # news-first сюжет, просим другой угол,
-            # а не откатываемся сразу к широкой теме.
-            for attempt in range(1, 5):
+            # ----------------------------------------
+            # ОДИН GPT-ВЫЗОВ -> НЕСКОЛЬКО КАНДИДАТОВ
+            #
+            # Раньше при отклонении одного варианта
+            # запускался новый GPT-запрос.
+            #
+            # Теперь модель сразу предлагает несколько
+            # разных вариантов, а локальный код бесплатно
+            # выбирает первый подходящий.
+            # ----------------------------------------
 
-                with usage_context(
-                    "subtopic_select",
-                    metadata={
-                        "topic": topic_title,
-                        "attempt": attempt,
-                    },
-                ):
-                    subtopic = (
-                        await self.gpt.select_article_subtopic(
-                            topic=topic_title,
-                            sources=sources,
-                            used_subtopics=used_for_gpt,
-                        )
+            with usage_context(
+                "subtopic_select",
+                metadata={
+                    "topic": topic_title,
+                    "candidate_count": 6,
+                },
+            ):
+                candidates = (
+                    await self.gpt.select_article_subtopic(
+                        topic=topic_title,
+                        sources=sources,
+                        used_subtopics=used_for_gpt,
+                        candidate_count=6,
                     )
+                )
+
+            if isinstance(
+                candidates,
+                str,
+            ):
+                candidates = [
+                    candidates
+                ]
+
+            for candidate_index, subtopic in enumerate(
+                candidates,
+                1,
+            ):
 
                 subtopic = " ".join(
                     str(subtopic or "").split()
                 )
+
+                if not subtopic:
+                    continue
 
                 if (
                     subtopic.casefold()
@@ -1531,18 +1553,12 @@ class ArticleService:
                         "no_relevant_subtopic",
                     }
                 ):
-                    return None
-
-                if not subtopic:
                     continue
 
                 if (
                     subtopic.casefold()
                     == topic_title.casefold()
                 ):
-                    used_for_gpt.append(
-                        subtopic
-                    )
                     continue
 
                 if (
@@ -1555,25 +1571,15 @@ class ArticleService:
                 ):
                     log.info(
                         "Плановая news-first подтема "
-                        "отклонена: parent=%r "
-                        "subtopic=%r attempt=%s",
+                        "отклонена локально: "
+                        "parent=%r candidate=%r index=%s",
                         topic_title,
                         subtopic,
-                        attempt,
-                    )
-
-                    used_for_gpt.append(
-                        subtopic
+                        candidate_index,
                     )
 
                     continue
 
-                # Дополнительная локальная защита
-                # от смысловых дублей последних статей.
-                #
-                # GPT уже видит recent_titles в prompt,
-                # но всё равно может предложить тот же
-                # сюжет другими словами.
                 similar_title, similarity = (
                     _find_similar_global_article_title(
                         subtopic,
@@ -1584,42 +1590,40 @@ class ArticleService:
 
                 if similar_title is not None:
                     log.warning(
-                        "Global similar subtopic rejected: "
-                        "parent=%r attempt=%s "
+                        "Global similar subtopic rejected "
+                        "locally: parent=%r index=%s "
                         "score=%.3f candidate=%r "
                         "previous=%r",
                         topic_title,
-                        attempt,
+                        candidate_index,
                         similarity,
                         subtopic,
                         similar_title,
                     )
 
-                    # На следующей попытке GPT
-                    # явно увидит и этот отклонённый
-                    # вариант как уже использованный.
-                    used_for_gpt.append(
-                        subtopic
-                    )
-
                     continue
 
                 log.info(
-                    "Плановая подтема: "
+                    "Плановая подтема выбрана "
+                    "из одного GPT-пакета: "
                     "parent=%s subtopic=%s "
-                    "similarity=%.3f attempt=%s",
+                    "similarity=%.3f index=%s "
+                    "candidates=%s",
                     topic_title,
                     subtopic,
                     similarity,
-                    attempt,
+                    candidate_index,
+                    len(candidates),
                 )
 
                 return subtopic
 
             log.warning(
-                "Не удалось подобрать практическую "
-                "подтему за 4 попытки: parent=%r",
+                "Все подтемы одного GPT-пакета "
+                "отклонены локальными проверками: "
+                "parent=%r candidates=%s",
                 topic_title,
+                len(candidates),
             )
 
             return None

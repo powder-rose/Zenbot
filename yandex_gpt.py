@@ -1504,7 +1504,8 @@ class YandexGPTClient:
         topic: str,
         sources: list[dict[str, Any]],
         used_subtopics: list[str],
-    ) -> str:
+        candidate_count: int = 1,
+    ) -> str | list[str]:
         """
         Выбирает одну конкретную подтему
         для обычной плановой статьи.
@@ -1549,7 +1550,34 @@ class YandexGPTClient:
             else "Нет."
         )
 
-        system_prompt = """
+        candidate_count = max(
+            1,
+            min(
+                int(candidate_count or 1),
+                8,
+            ),
+        )
+
+        if candidate_count == 1:
+            output_rule = (
+                "Ответь ТОЛЬКО названием одной подтемы.\n"
+                "Без пояснений, нумерации, кавычек, "
+                "меток «ПОДТЕМА» и дополнительного текста."
+            )
+        else:
+            output_rule = (
+                f"Предложи до {candidate_count} РАЗНЫХ "
+                "подтем в порядке от наиболее полезной "
+                "к менее приоритетной.\n"
+                "Каждая подтема — строго с новой строки.\n"
+                "Без пояснений и комментариев.\n"
+                "Не нумеруй варианты.\n"
+                "Не повторяй один сюжет разными словами.\n"
+                "Если подходящих подтем нет, ответь только: "
+                "__NO_RELEVANT_SUBTOPIC__"
+            )
+
+        system_prompt = f"""
 Ты редактор экспертного информационного канала.
 
 Тебе дана широкая тема и актуальная поисковая
@@ -1789,9 +1817,7 @@ __NO_RELEVANT_SUBTOPIC__
 Если ранее уже была раскрыта конкретная проблема,
 выбирай другую практическую сторону вопроса.
 
-Ответь ТОЛЬКО названием одной подтемы.
-Без пояснений, нумерации, кавычек,
-меток «ПОДТЕМА» и дополнительного текста.
+{output_rule}
 """
 
         from datetime import datetime
@@ -1816,9 +1842,78 @@ __NO_RELEVANT_SUBTOPIC__
             user_prompt,
         )
 
-        candidate = self._cleanup(
+        cleaned = self._cleanup(
             raw
         )
+
+        if candidate_count > 1:
+
+            if (
+                "__no_relevant_subtopic__"
+                in cleaned.casefold()
+            ):
+                return []
+
+            candidates: list[str] = []
+            seen: set[str] = set()
+
+            for line in cleaned.splitlines():
+
+                candidate = re.sub(
+                    r"^\s*(?:\d+[.)]\s*|[•\-*]\s*)",
+                    "",
+                    line,
+                )
+
+                candidate = re.sub(
+                    r"(?i)^\s*(?:подтема|тема)"
+                    r"\s*:\s*",
+                    "",
+                    candidate,
+                )
+
+                candidate = candidate.strip(
+                    ' "\'«».,;:-'
+                )
+
+                candidate = " ".join(
+                    candidate.split()
+                )
+
+                if not candidate:
+                    continue
+
+                key = candidate.casefold()
+
+                if key in seen:
+                    continue
+
+                seen.add(
+                    key
+                )
+
+                candidates.append(
+                    candidate[:220].rstrip(
+                        " ,;:-"
+                    )
+                )
+
+                if (
+                    len(candidates)
+                    >= candidate_count
+                ):
+                    break
+
+            if not candidates:
+                raise RuntimeError(
+                    "YandexGPT не предложил "
+                    "подтемы-кандидаты"
+                )
+
+            return candidates
+
+
+        candidate = cleaned
 
         if candidate:
             candidate = (

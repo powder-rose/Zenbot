@@ -1206,127 +1206,165 @@ class YandexGPTClient:
             raw
         )
 
-        # Если у клиента задан собственный SHORT-промпт,
-        # выполняем отдельный финальный self-review.
+        # ----------------------------------------
+        # CONDITIONAL CUSTOM SHORT VALIDATION
         #
-        # Никаких правил конкретного клиента здесь нет:
-        # модель сверяет результат именно с тем system_prompt,
-        # который настроил пользователь.
+        # Пользовательский SHORT prompt уже используется
+        # как system prompt при основной генерации.
+        #
+        # Поэтому второй безусловный GPT self-review
+        # каждой короткой статьи не нужен.
+        #
+        # Дополнительный GPT-вызов делаем только при
+        # объективно обнаруженной технической проблеме:
+        #
+        # 1. превышен лимит;
+        # 2. prompt требует rich-разметку,
+        #    но модель её не вернула.
+        # ----------------------------------------
+
         if custom_system_prompt:
-            review_prompt = (
-                "ЭТАП ФИНАЛЬНОЙ ПРОВЕРКИ.\n\n"
-                "Системный промпт выше имеет абсолютный приоритет.\n"
-                "Ниже находятся исходная полная статья и уже созданный "
-                "черновик короткой публикации.\n\n"
-                "Молча проверь КАЖДОЕ требование системного промпта: "
-                "структуру, порядок блоков, обязательные точные фразы, "
-                "форматирование, служебные маркеры, переносы строк, "
-                "списки, количество элементов, эмодзи и ограничения "
-                "объёма.\n\n"
-                "Исправь ВСЕ обнаруженные нарушения. "
-                "Не добавляй новых фактов и не меняй факты исходной "
-                "статьи. Не заменяй требования системного промпта "
-                "собственными предпочтениями.\n\n"
-                f"ИСХОДНЫЙ ЗАГОЛОВОК:\n{clean_title}\n\n"
-                f"ИСХОДНАЯ ПОЛНАЯ СТАТЬЯ:\n{clean_body}\n\n"
-                "ЧЕРНОВИК, КОТОРЫЙ НУЖНО ПРОВЕРИТЬ:\n"
-                f"ЗАГОЛОВОК: {title}\n"
-                "ТЕКСТ:\n"
-                f"{body}\n\n"
-                "Верни только окончательную исправленную публикацию "
-                "в формате, требуемом системным промптом. "
-                "Никаких комментариев о проверке не добавляй."
+
+            short_over_limit = (
+                len(
+                    str(body or "")
+                )
+                > max_chars
             )
 
-            try:
-                reviewed_raw = await asyncio.to_thread(
+            rich_markup_required = (
+                _prompt_requests_rich_markup(
+                    custom_system_prompt
+                )
+            )
+
+            rich_markup_missing = (
+                rich_markup_required
+                and not _has_supported_rich_markup(
+                    body
+                )
+            )
+
+            repair_needed = (
+                short_over_limit
+                or rich_markup_missing
+            )
+
+            if repair_needed:
+
+                repair_reasons = []
+
+                if short_over_limit:
+                    repair_reasons.append(
+                        f"- текст превышает лимит "
+                        f"{max_chars} символов"
+                    )
+
+                if rich_markup_missing:
+                    repair_reasons.append(
+                        "- отсутствует rich-разметка, "
+                        "явно требуемая системным prompt"
+                    )
+
+                log.info(
+                    "SHORT custom prompt: "
+                    "запускаю точечный repair: %s",
+                    "; ".join(
+                        repair_reasons
+                    ),
+                )
+
+                repair_prompt = (
+                    "ЭТАП ТОЧЕЧНОГО ИСПРАВЛЕНИЯ "
+                    "КОРОТКОЙ ПУБЛИКАЦИИ.\n\n"
+                    "Системный prompt пользователя имеет "
+                    "абсолютный приоритет.\n\n"
+                    "Основная генерация уже выполнена. "
+                    "Не переписывай публикацию заново "
+                    "без необходимости.\n\n"
+                    "Исправь ТОЛЬКО следующие "
+                    "объективно обнаруженные нарушения:\n"
+                    + "\n".join(
+                        repair_reasons
+                    )
+                    + "\n\n"
+                    "Не добавляй новых фактов, дат, "
+                    "законов, требований или выводов.\n"
+                    "Сохрани основной смысл, стиль, "
+                    "структуру и требования системного "
+                    "prompt.\n\n"
+                    f"ИСХОДНЫЙ ЗАГОЛОВОК:\n"
+                    f"{clean_title}\n\n"
+                    "ИСХОДНАЯ ПОЛНАЯ СТАТЬЯ:\n"
+                    f"{clean_body}\n\n"
+                    "ТЕКУЩИЙ SHORT:\n"
+                    f"ЗАГОЛОВОК: {title}\n"
+                    "ТЕКСТ:\n"
+                    f"{body}\n\n"
+                    f"Максимальный объём текста: "
+                    f"{max_chars} символов с пробелами.\n\n"
+                    "Верни только окончательный вариант "
+                    "в формате:\n"
+                    "ЗАГОЛОВОК: ...\n"
+                    "ТЕКСТ:\n"
+                    "..."
+                )
+
+                repaired_raw = await asyncio.to_thread(
                     self._complete_sync,
                     auth,
                     effective_system_prompt,
-                    review_prompt,
+                    repair_prompt,
                 )
 
-                reviewed_title, reviewed_body = self._parse(
-                    reviewed_raw
+                repaired_title, repaired_body = (
+                    self._parse(
+                        repaired_raw
+                    )
                 )
 
                 if (
-                    str(reviewed_title or "").strip()
-                    and str(reviewed_body or "").strip()
+                    str(
+                        repaired_title or ""
+                    ).strip()
+                    and str(
+                        repaired_body or ""
+                    ).strip()
                 ):
-                    title = reviewed_title
-                    body = reviewed_body
+                    title = repaired_title
+                    body = repaired_body
 
-            except Exception:
-                # Если второй проход временно не удался,
-                # используем первоначальный результат.
-                pass
+                if (
+                    len(
+                        str(body or "")
+                    )
+                    > max_chars
+                ):
+                    raise RuntimeError(
+                        "SHORT prompt: после repair "
+                        "текст всё ещё превышает "
+                        f"{max_chars} символов"
+                    )
 
-        # ----------------------------------------
-        # STRICT CUSTOM FORMAT CHECK
-        #
-        # Если пользователь сам указал rich-маркеры
-        # в SHORT prompt, plain text не считается
-        # выполнением его prompt.
-        # ----------------------------------------
+                if (
+                    rich_markup_required
+                    and not _has_supported_rich_markup(
+                        body
+                    )
+                ):
+                    raise RuntimeError(
+                        "SHORT prompt требует "
+                        "форматирование, но YandexGPT "
+                        "не вернул rich-разметку"
+                    )
 
-        if (
-            custom_system_prompt
-            and _prompt_requests_rich_markup(
-                custom_system_prompt
-            )
-            and not _has_supported_rich_markup(
-                body
-            )
-        ):
-            formatting_prompt = (
-                "ЭТАП ОБЯЗАТЕЛЬНОГО ФОРМАТИРОВАНИЯ.\n\n"
-                "В системном промпте пользователя явно "
-                "задано rich-formatting, но текущий "
-                "черновик не содержит ни одного "
-                "поддерживаемого rich-элемента.\n\n"
-                "Переформатируй ТОЛЬКО оформление "
-                "текущего текста строго по системному "
-                "промпту. Используй именно тот синтаксис "
-                "маркеров, который задан в системном "
-                "промпте.\n"
-                "Не добавляй новых фактов, дат, законов, "
-                "требований или выводов.\n\n"
-                f"ЗАГОЛОВОК: {title}\n"
-                "ТЕКСТ:\n"
-                f"{body}\n\n"
-                "Верни только окончательный вариант "
-                "в формате ЗАГОЛОВОК: ... и ТЕКСТ: ..."
-            )
-
-            formatted_raw = await asyncio.to_thread(
-                self._complete_sync,
-                auth,
-                effective_system_prompt,
-                formatting_prompt,
-            )
-
-            formatted_title, formatted_body = (
-                self._parse(
-                    formatted_raw
+            else:
+                log.info(
+                    "SHORT custom prompt: "
+                    "дополнительный GPT-review "
+                    "не требуется"
                 )
-            )
 
-            if (
-                str(formatted_title or "").strip()
-                and str(formatted_body or "").strip()
-            ):
-                title = formatted_title
-                body = formatted_body
-
-            if not _has_supported_rich_markup(
-                body
-            ):
-                raise RuntimeError(
-                    "SHORT prompt требует "
-                    "форматирование, но YandexGPT "
-                    "не вернул rich-разметку"
-                )
 
         title = " ".join(
             title.split()

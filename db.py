@@ -808,6 +808,52 @@ async def list_recent_article_titles(
 
 
 
+async def list_recent_articles(
+    limit: int = 15,
+) -> list[dict[str, str]]:
+    """
+    Последние реально опубликованные статьи.
+
+    Нужны для защиты не только от одинаковых
+    заголовков, но и от повторения одного сюжета.
+    """
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            """
+            SELECT
+                topic_title,
+                article_title,
+                article_body
+            FROM publications
+            WHERE article_title IS NOT NULL
+              AND trim(article_title) != ''
+              AND article_body IS NOT NULL
+              AND trim(article_body) != ''
+              AND telegram_status='published'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                int(limit),
+            ),
+        )
+
+        rows = await cur.fetchall()
+
+    return [
+        {
+            "topic_title": str(row[0] or ""),
+            "article_title": str(row[1] or ""),
+            "article_body": str(row[2] or ""),
+        }
+        for row in rows
+    ]
+
+
+
+
 async def record_used_subtopic(
     topic_id: int | None,
     parent_topic: str,

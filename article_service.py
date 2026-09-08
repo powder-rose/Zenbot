@@ -1059,6 +1059,314 @@ def _find_similar_global_article_title(
 
 
 
+def _first_article_paragraph(
+    body: str,
+) -> str:
+    """
+    Первый содержательный абзац статьи.
+
+    Игнорируем служебные заголовки, цитату автора
+    и CTA, потому что они одинаковы по шаблону
+    и не должны влиять на оценку сюжета.
+    """
+    blocks = [
+        block.strip()
+        for block in re.split(
+            r"\n\s*\n",
+            str(body or ""),
+        )
+        if block.strip()
+    ]
+
+    for block in blocks:
+
+        plain = re.sub(
+            r"\[\[/?[BIUSQ]\]\]",
+            "",
+            block,
+            flags=re.I,
+        )
+
+        plain = re.sub(
+            r"<[^>]+>",
+            "",
+            plain,
+        )
+
+        plain = plain.strip()
+
+        lowered = (
+            plain
+            .casefold()
+            .replace("ё", "е")
+        )
+
+        if not plain:
+            continue
+
+        if (
+            plain.startswith("==")
+            and plain.endswith("==")
+        ):
+            continue
+
+        if "мое почтение" in lowered:
+            continue
+
+        if "николай бойков" in lowered:
+            continue
+
+        if "больше практических материалов" in lowered:
+            continue
+
+        if len(plain) < 70:
+            continue
+
+        return plain[:900]
+
+    return ""
+
+
+def _story_roots(
+    value: str,
+) -> list[str]:
+
+    value = (
+        str(value or "")
+        .casefold()
+        .replace("ё", "е")
+    )
+
+    words = re.findall(
+        r"[a-zа-я0-9]+",
+        value,
+        flags=re.I,
+    )
+
+    stopwords = {
+        "которые",
+        "который",
+        "которая",
+        "этого",
+        "этими",
+        "также",
+        "более",
+        "после",
+        "перед",
+        "будут",
+        "нужно",
+        "можно",
+        "своих",
+        "своей",
+        "свою",
+    }
+
+    result = []
+
+    for word in words:
+
+        if (
+            len(word) < 4
+            or word in stopwords
+        ):
+            continue
+
+        result.append(
+            word[:6]
+        )
+
+    return result
+
+
+def _story_dates(
+    value: str,
+) -> set[str]:
+
+    text = (
+        str(value or "")
+        .casefold()
+        .replace("ё", "е")
+    )
+
+    months = (
+        "января|февраля|марта|апреля|мая|июня|"
+        "июля|августа|сентября|октября|ноября|декабря"
+    )
+
+    result = set(
+        re.findall(
+            rf"\b\d{{1,2}}\s+(?:{months})\s+20\d{{2}}\b",
+            text,
+            flags=re.I,
+        )
+    )
+
+    result.update(
+        re.findall(
+            r"\b\d{1,2}[./-]\d{1,2}[./-]20\d{2}\b",
+            text,
+        )
+    )
+
+    return result
+
+
+def _global_article_story_similarity(
+    candidate_title: str,
+    candidate_body: str,
+    previous_title: str,
+    previous_body: str,
+) -> float:
+
+    title_score = (
+        _global_article_title_similarity(
+            candidate_title,
+            previous_title,
+        )
+    )
+
+    candidate_lead = (
+        _first_article_paragraph(
+            candidate_body
+        )
+    )
+
+    previous_lead = (
+        _first_article_paragraph(
+            previous_body
+        )
+    )
+
+    if not candidate_lead or not previous_lead:
+        return title_score
+
+    first_roots = _story_roots(
+        candidate_lead
+    )
+
+    second_roots = _story_roots(
+        previous_lead
+    )
+
+    if not first_roots or not second_roots:
+        return title_score
+
+    first_text = " ".join(
+        first_roots
+    )
+
+    second_text = " ".join(
+        second_roots
+    )
+
+    sequence_score = SequenceMatcher(
+        None,
+        first_text,
+        second_text,
+    ).ratio()
+
+    first_set = set(
+        first_roots
+    )
+
+    second_set = set(
+        second_roots
+    )
+
+    common = len(
+        first_set & second_set
+    )
+
+    smallest = min(
+        len(first_set),
+        len(second_set),
+    )
+
+    containment_score = (
+        common / smallest
+        if smallest
+        else 0.0
+    )
+
+    candidate_dates = _story_dates(
+        candidate_lead
+    )
+
+    previous_dates = _story_dates(
+        previous_lead
+    )
+
+    same_date = bool(
+        candidate_dates
+        & previous_dates
+    )
+
+    score = max(
+        title_score,
+        sequence_score,
+        containment_score,
+    )
+
+    # Одинаковая конкретная дата +
+    # заметное совпадение содержания —
+    # очень сильный признак одного инфоповода.
+    if (
+        same_date
+        and containment_score >= 0.35
+    ):
+        score = max(
+            score,
+            0.90,
+        )
+
+    return score
+
+
+def _find_similar_global_article_story(
+    candidate_title: str,
+    candidate_body: str,
+    recent_articles: list[dict],
+    *,
+    threshold: float = 0.66,
+):
+    best_article = None
+    best_score = 0.0
+
+    for article in recent_articles:
+
+        score = (
+            _global_article_story_similarity(
+                candidate_title,
+                candidate_body,
+                article.get(
+                    "article_title",
+                    "",
+                ),
+                article.get(
+                    "article_body",
+                    "",
+                ),
+            )
+        )
+
+        if score > best_score:
+            best_score = score
+            best_article = article
+
+    if best_score >= threshold:
+        return (
+            best_article,
+            best_score,
+        )
+
+    return (
+        None,
+        best_score,
+    )
+
+
+
+
 class ArticleService:
     def __init__(
         self,
@@ -1918,13 +2226,25 @@ class ArticleService:
                 ) == 0
             )
 
-            recent_titles_for_final = (
-                await db.list_recent_article_titles(
+            recent_articles_for_final = (
+                await db.list_recent_articles(
                     limit=15,
                 )
                 if auto_planned
                 else []
             )
+
+            recent_titles_for_final = [
+                article.get(
+                    "article_title",
+                    ""
+                )
+                for article
+                in recent_articles_for_final
+                if article.get(
+                    "article_title"
+                )
+            ]
 
             rejected_generation_titles: list[str] = []
             generation_result = None
@@ -2009,26 +2329,18 @@ class ArticleService:
                 if not auto_planned:
                     break
 
-                comparison_titles = list(
-                    dict.fromkeys(
-                        [
-                            *recent_titles_for_final,
-                            *rejected_generation_titles,
-                        ]
-                    )
-                )
-
-                similar_title, similarity = (
-                    _find_similar_global_article_title(
+                similar_article, similarity = (
+                    _find_similar_global_article_story(
                         title,
-                        comparison_titles,
-                        threshold=0.58,
+                        full_body,
+                        recent_articles_for_final,
+                        threshold=0.66,
                     )
                 )
 
-                if similar_title is None:
+                if similar_article is None:
                     log.info(
-                        "Final article duplicate check OK: "
+                        "Final article story check OK: "
                         "title=%r similarity=%.3f",
                         title,
                         similarity,
@@ -2036,14 +2348,40 @@ class ArticleService:
 
                     break
 
+                similar_title = (
+                    similar_article.get(
+                        "article_title",
+                        ""
+                    )
+                )
+
+                similar_lead = (
+                    _first_article_paragraph(
+                        similar_article.get(
+                            "article_body",
+                            "",
+                        )
+                    )
+                )
+
                 log.warning(
-                    "Final article duplicate rejected: "
+                    "Final article story rejected: "
                     "attempt=%s score=%.3f "
                     "title=%r previous=%r",
                     generation_attempt,
                     similarity,
                     title,
                     similar_title,
+                )
+
+                # Второй подбор подтемы должен увидеть
+                # не только старый заголовок, но и сам
+                # запрещённый сюжет.
+                rejected_generation_titles.append(
+                    "НЕ ПОВТОРЯТЬ СЮЖЕТ: "
+                    + similar_title
+                    + " | "
+                    + similar_lead[:350]
                 )
 
                 rejected_generation_titles.append(

@@ -636,33 +636,115 @@ def _temporal_review_needed(
     today,
 ) -> bool:
     """
-    Любая новостная/временная подача проходит
-    дополнительную проверку актуальности.
+    Дополнительный GPT-review актуальности
+    запускается только при реальном временном риске.
+
+    Обычные слова вроде "новый", "изменения"
+    или "актуальный" сами по себе больше
+    НЕ являются причиной второго GPT-вызова.
     """
     import re
 
-    value = f"{title}\n{body}"
+    # Если локальные проверки уже нашли
+    # потенциально устаревший сюжет —
+    # даём модели возможность его исправить.
+    if (
+        _has_stale_news_claim(
+            title,
+            body,
+            today,
+        )
+        or _has_stale_lead_event(
+            title,
+            body,
+            today,
+        )
+    ):
+        return True
 
-    return bool(
-        re.search(
+    value = (
+        f"{title}\n{body}"
+    )
+
+    # Настоящие утверждения о текущем или
+    # будущем вступлении нормы в силу.
+    #
+    # Их стоит отдельно проверить относительно
+    # сегодняшней даты.
+    temporal_event_pattern = re.compile(
+        (
+            r"\b(?:"
+            r"вступ(?:ает|ают|ит)\s+в\s+силу|"
+            r"начн(?:ет|ут)\s+действовать|"
+            r"начина(?:ет|ют)\s+действовать|"
+            r"будет\s+действовать|"
+            r"будут\s+действовать"
+            r")\b"
+        ),
+        flags=re.I,
+    )
+
+    if temporal_event_pattern.search(
+        value
+    ):
+        return True
+
+    # Новостная формулировка требует отдельного
+    # review только если рядом действительно
+    # присутствует конкретная дата/год.
+    novelty_pattern = re.compile(
+        (
+            r"\b(?:"
+            r"нов(?:ый|ая|ое|ые|ого|ых)|"
+            r"недавно|"
+            r"свеж(?:ий|ая|ее|ие)|"
+            r"изменения|"
+            r"изменилось|"
+            r"изменились"
+            r")\b"
+        ),
+        flags=re.I,
+    )
+
+    parts = re.split(
+        r"(?<=[.!?])\s+|\n+",
+        value,
+    )
+
+    for part in parts:
+
+        if not novelty_pattern.search(
+            part
+        ):
+            continue
+
+        # Полная конкретная дата.
+        if _extract_temporal_dates(
+            part
+        ):
+            return True
+
+        # Явный календарный год в контексте
+        # новизны/изменений.
+        #
+        # Номер нормативного документа вида
+        # ГОСТ ...-2021 здесь сам по себе
+        # review не вызывает: старый "новый ГОСТ"
+        # уже ловит _has_stale_news_claim().
+        if re.search(
             (
                 r"\b(?:"
-                r"нов(?:ый|ая|ое|ые|ого|ых)|"
-                r"недавно|"
-                r"свеж(?:ий|ая|ее|ие)|"
-                r"изменения|"
-                r"изменилось|"
-                r"вступил(?:а|о|и)?\s+в\s+силу|"
-                r"вступает\s+в\s+силу|"
-                r"вступит\s+в\s+силу|"
-                r"начнет\s+действовать|"
-                r"начинает\s+действовать"
+                r"с\s+20\d{2}\s+года|"
+                r"в\s+20\d{2}\s+году|"
+                r"с\s+\d{1,2}\s+[а-яё]+\s+20\d{2}"
                 r")\b"
             ),
-            value,
+            part,
             flags=re.I,
-        )
-    )
+        ):
+            return True
+
+    return False
 
 
 def _has_stale_news_claim(
@@ -1924,14 +2006,21 @@ __NO_RELEVANT_SUBTOPIC__
             )
         )
 
-        if (
+        temporal_review_required = (
             _temporal_review_needed(
                 title,
                 body,
                 today,
             )
             or stale_lead_event
-        ):
+        )
+
+        if temporal_review_required:
+            log.info(
+                "LONG temporal review: запускаю "
+                "проверку актуальности"
+            )
+
             review_prompt = (
                 "ЭТАП ПРОВЕРКИ АКТУАЛЬНОСТИ.\n\n"
                 f"Сегодня: {today.strftime('%d.%m.%Y')}.\n\n"
@@ -2028,6 +2117,12 @@ __NO_RELEVANT_SUBTOPIC__
                     "обнаружена устаревшая "
                     "новостная подача"
                 )
+
+        if not temporal_review_required:
+            log.info(
+                "LONG temporal review: "
+                "дополнительный GPT-review не требуется"
+            )
 
         # ----------------------------------------
         # CUSTOM LONG VALIDATION

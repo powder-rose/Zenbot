@@ -2212,25 +2212,43 @@ class ArticleService:
 
             selected_subtopic = None
 
-            # Жёсткая проверка смыслового дубля
-            # применяется только к обычной
-            # автоматической плановой статье.
-            auto_planned = (
+            priority = int(
+                topic.get(
+                    "priority",
+                    0,
+                )
+                or 0
+            )
+
+            # Автоподбор подтемы на ПЕРВОЙ попытке
+            # сохраняет прежнюю логику:
+            #
+            # auto + обычная тема -> да
+            # urgent_random      -> нет
+            # priority           -> нет
+            discover_subtopic_initially = (
                 trigger == "auto"
-                and int(
-                    topic.get(
-                        "priority",
-                        0,
-                    )
-                    or 0
-                ) == 0
+                and priority == 0
+            )
+
+            # Но защита от смысловых дублей нужна
+            # для ЛЮБОЙ случайной публикации.
+            #
+            # Иначе кнопка urgent_random может
+            # публиковать почти одинаковые статьи
+            # подряд, обходя весь story-guard.
+            duplicate_guard_enabled = (
+                trigger in {
+                    "auto",
+                    "urgent_random",
+                }
             )
 
             recent_articles_for_final = (
                 await db.list_recent_articles(
                     limit=15,
                 )
-                if auto_planned
+                if duplicate_guard_enabled
                 else []
             )
 
@@ -2257,7 +2275,7 @@ class ArticleService:
             # акцент с учётом отклонённого результата.
             generation_attempts = (
                 2
-                if auto_planned
+                if duplicate_guard_enabled
                 else 1
             )
 
@@ -2266,7 +2284,23 @@ class ArticleService:
                 generation_attempts + 1,
             ):
 
-                if auto_planned:
+                # На первой попытке сохраняем
+                # старую семантику режима.
+                #
+                # Но если первая готовая статья
+                # оказалась дублем, вторая попытка
+                # ОБЯЗАТЕЛЬНО ищет другой конкретный
+                # аспект даже для urgent_random
+                # или priority topic.
+                discover_subtopic_now = (
+                    discover_subtopic_initially
+                    or (
+                        duplicate_guard_enabled
+                        and generation_attempt > 1
+                    )
+                )
+
+                if discover_subtopic_now:
                     selected_subtopic = (
                         await self._select_auto_subtopic(
                             topic_id,
@@ -2326,7 +2360,7 @@ class ArticleService:
                     image_bytes,
                 ) = generation_result
 
-                if not auto_planned:
+                if not duplicate_guard_enabled:
                     break
 
                 similar_article, similarity = (

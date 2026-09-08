@@ -198,6 +198,108 @@ def _find_similar_article_title(
 
 
 
+
+def _topic_relevance_roots(
+    topic: str,
+) -> list[str]:
+    """
+    Короткие корни значимых слов parent topic.
+
+    Нужны только как грубая защита от совершенно
+    посторонней поисковой выдачи.
+
+    Например:
+      тепловизор -> теплов
+      тепловизионный -> содержит теплов
+
+    Если тема состоит только из коротких сокращений
+    вроде ГО / ЧС, фильтр не применяется.
+    """
+    value = (
+        str(topic or "")
+        .casefold()
+        .replace("ё", "е")
+    )
+
+    words = re.findall(
+        r"[a-zа-я0-9]+",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    stopwords = {
+        "для",
+        "при",
+        "или",
+        "как",
+        "что",
+        "это",
+        "про",
+        "без",
+        "под",
+        "над",
+    }
+
+    roots = []
+
+    for word in words:
+        if (
+            len(word) < 5
+            or word in stopwords
+        ):
+            continue
+
+        roots.append(
+            word[:5]
+        )
+
+    return list(
+        dict.fromkeys(roots)
+    )
+
+
+def _filter_sources_for_topic(
+    topic: str,
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Убирает результаты поиска, в которых вообще
+    отсутствует смысловой якорь parent topic.
+
+    Это не полноценная семантическая классификация,
+    а первая защита от очевидного topic drift.
+    """
+    roots = _topic_relevance_roots(
+        topic
+    )
+
+    if not roots:
+        return list(sources)
+
+    result = []
+
+    for source in sources:
+        haystack = (
+            f"{source.get('title', '')} "
+            f"{source.get('snippet', '')}"
+        )
+
+        haystack = (
+            haystack
+            .casefold()
+            .replace("ё", "е")
+        )
+
+        if any(
+            root in haystack
+            for root in roots
+        ):
+            result.append(source)
+
+    return result
+
+
+
 def _stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
 
@@ -251,10 +353,18 @@ class TenantArticleService:
         - при совпадении просим GPT выбрать другую тему.
         """
         try:
+            from zoneinfo import ZoneInfo
+
+            now_local = datetime.now(
+                ZoneInfo(self.cfg.timezone)
+            )
+
             search_query = (
                 f"{topic_title} "
-                "актуальные изменения "
-                "новые требования практика"
+                f"{now_local.year} "
+                "актуальная практика "
+                "применение требования "
+                "проверка рекомендации"
             )
 
             with usage_context(
@@ -269,7 +379,35 @@ class TenantArticleService:
                     max_results=12,
                 )
 
+            raw_source_count = len(
+                sources
+            )
+
+            sources = (
+                _filter_sources_for_topic(
+                    topic_title,
+                    sources,
+                )
+            )
+
+            log.info(
+                "Tenant subtopic relevance: "
+                "user=%s topic=%r raw=%s relevant=%s",
+                user_id,
+                topic_title,
+                raw_source_count,
+                len(sources),
+            )
+
             if not sources:
+                log.warning(
+                    "Tenant: нет релевантных "
+                    "источников для подтемы "
+                    "user=%s topic=%r; "
+                    "использую parent topic",
+                    user_id,
+                    topic_title,
+                )
                 return None
 
 
@@ -340,6 +478,22 @@ class TenantArticleService:
                 subtopic = " ".join(
                     str(subtopic or "").split()
                 )
+
+                if (
+                    subtopic.casefold()
+                    in {
+                        "__no_relevant_subtopic__",
+                        "no_relevant_subtopic",
+                    }
+                ):
+                    log.warning(
+                        "Tenant: GPT не нашёл "
+                        "релевантную подтему "
+                        "user=%s parent=%r",
+                        user_id,
+                        topic_title,
+                    )
+                    return None
 
                 if not subtopic:
                     log.info(

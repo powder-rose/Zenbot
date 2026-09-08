@@ -1,9 +1,12 @@
 from __future__ import annotations
 import asyncio, json, re, ssl, time
+import logging
 from pathlib import Path
 from typing import Any
 import httpx, jwt, truststore
 from ai_usage import record_gpt
+
+log = logging.getLogger(__name__)
 
 IAM_TOKEN_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"

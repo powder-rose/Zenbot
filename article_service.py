@@ -1635,17 +1635,19 @@ class ArticleService:
             return None
 
 
-    async def _generate(
+    async def _generate_long_candidate(
         self,
         topic_title: str,
         subtopic: str | None = None,
-    ) -> tuple[
-        str,
-        str,
-        str,
-        str,
-        bytes,
-    ]:
+    ) -> tuple[str, str]:
+        """
+        Генерирует только LONG.
+
+        Важно:
+        SHORT и изображение здесь намеренно
+        НЕ создаются. Сначала LONG должен пройти
+        проверку на смысловой дубль.
+        """
         focus_topic = (
             subtopic or topic_title
         ).strip()
@@ -1705,6 +1707,91 @@ class ArticleService:
             )
         ).strip()
 
+        article_system_prompt = (
+            custom_article_prompt
+            if custom_article_prompt
+            else ARTICLE_SYSTEM_PROMPT
+        )
+
+        log.info(
+            "Генерация LONG: prompt=%s (%s chars)",
+            (
+                "CUSTOM"
+                if custom_article_prompt
+                else "DEFAULT"
+            ),
+            len(article_system_prompt),
+        )
+
+        with usage_context(
+            "article_full",
+            metadata={
+                "topic": topic_title,
+                "subtopic": subtopic,
+            },
+        ):
+            title, full_body = (
+                await self.gpt
+                .generate_article_from_sources(
+                    topic=topic_title,
+                    sources=sources,
+                    subtopic=subtopic,
+                    max_chars=3200,
+                    system_prompt=article_system_prompt,
+                )
+            )
+
+        title = clean_article_text(
+            title
+        )
+
+        if custom_article_prompt:
+            full_body = (
+                clean_short_article_text(
+                    full_body
+                )
+            )
+        else:
+            full_body = clean_article_text(
+                full_body
+            )
+
+        if not custom_article_prompt:
+            full_body = enforce_single_blog_link(
+                full_body
+            )
+
+        log.info(
+            "LONG готов: title=%r chars=%s",
+            title,
+            len(full_body),
+        )
+
+        return (
+            title,
+            full_body,
+        )
+
+
+    async def _complete_generated_article(
+        self,
+        topic_title: str,
+        subtopic: str | None,
+        title: str,
+        full_body: str,
+    ) -> tuple[
+        str,
+        str,
+        bytes,
+    ]:
+        """
+        Создаёт SHORT + изображение только после того,
+        как LONG уже признан пригодным к публикации.
+        """
+        focus_topic = (
+            subtopic or topic_title
+        ).strip()
+
         custom_short_prompt = (
             await db.get_setting(
                 "prompt_short_system",
@@ -1712,34 +1799,10 @@ class ArticleService:
             )
         ).strip()
 
-        article_system_prompt = (
-            custom_article_prompt
-            if custom_article_prompt
-            else ARTICLE_SYSTEM_PROMPT
-        )
-
         short_system_prompt = (
             custom_short_prompt
             if custom_short_prompt
             else SYNCBOT_SYSTEM_PROMPT
-        )
-
-        log.info(
-            "Промпты статьи: "
-            "LONG=%s (%s chars), "
-            "SHORT=%s (%s chars)",
-            (
-                "CUSTOM"
-                if custom_article_prompt
-                else "DEFAULT"
-            ),
-            len(article_system_prompt),
-            (
-                "CUSTOM"
-                if custom_short_prompt
-                else "DEFAULT"
-            ),
-            len(short_system_prompt),
         )
 
         image_prompt_template = (
@@ -1749,61 +1812,31 @@ class ArticleService:
             )
         ).strip() or DEFAULT_IMAGE_PROMPT_TEMPLATE
 
-        # Long-версия: около 3000 символов с пробелами.
         with usage_context(
-            "article_full",
+            "article_short",
             metadata={
                 "topic": topic_title,
                 "subtopic": subtopic,
             },
         ):
-            title, full_body = await self.gpt.generate_article_from_sources(
-                topic=topic_title,
-                sources=sources,
-                subtopic=subtopic,
-                max_chars=3200,
-                system_prompt=article_system_prompt,
+            short_title, short_body = (
+                await self.gpt
+                .generate_syncbot_article_from_article(
+                    topic=topic_title,
+                    article_title=title,
+                    article_body=full_body,
+                    max_chars=820,
+                    system_prompt=short_system_prompt,
+                )
             )
-
-        # Short-версия: остаётся в Telegram после удаления long-post.
-        with usage_context(
-            "article_short",
-            metadata={"topic": topic_title},
-        ):
-            short_title, short_body = await self.gpt.generate_syncbot_article_from_article(
-                topic=topic_title,
-                article_title=title,
-                article_body=full_body,
-                max_chars=820,
-                system_prompt=short_system_prompt,
-            )
-
-        title = clean_article_text(
-            title
-        )
 
         short_title = clean_article_text(
             short_title
         ) or title
-        if custom_article_prompt:
-            full_body = clean_short_article_text(
-                full_body
-            )
-        else:
-            full_body = clean_article_text(
-                full_body
-            )
-        short_body = clean_short_article_text(short_body)
 
-        # Содержательная постобработка допустима только
-        # для стандартных промптов.
-        #
-        # Пользовательский prompt имеет абсолютный приоритет:
-        # не добавляем, не удаляем и не заменяем его CTA/URL.
-        if not custom_article_prompt:
-            full_body = enforce_single_blog_link(
-                full_body
-            )
+        short_body = clean_short_article_text(
+            short_body
+        )
 
         if not custom_short_prompt:
             short_body = enforce_single_blog_link(
@@ -1811,8 +1844,7 @@ class ArticleService:
             )
 
         log.info(
-            "Тексты готовы: long=%s chars, short=%s chars",
-            len(full_body),
+            "SHORT готов: chars=%s",
             len(short_body),
         )
 
@@ -1835,7 +1867,8 @@ class ArticleService:
         ):
             try:
                 log.info(
-                    "YandexART: генерация изображения, попытка %s/2",
+                    "YandexART: генерация изображения, "
+                    "попытка %s/2",
                     attempt,
                 )
 
@@ -1846,8 +1879,10 @@ class ArticleService:
                         "subtopic": subtopic,
                     },
                 ):
-                    image_bytes = await self.art.generate_image(
-                        prompt
+                    image_bytes = (
+                        await self.art.generate_image(
+                            prompt
+                        )
                     )
 
                 if not image_bytes:
@@ -1857,20 +1892,25 @@ class ArticleService:
 
                 if len(image_bytes) < 10_000:
                     raise RuntimeError(
-                        "YandexART вернул слишком маленький файл: "
+                        "YandexART вернул слишком "
+                        "маленький файл: "
                         f"{len(image_bytes)} bytes"
                     )
 
                 log.info(
-                    "YandexART: изображение готово, size=%s bytes",
+                    "YandexART: изображение готово, "
+                    "size=%s bytes",
                     len(image_bytes),
                 )
+
                 break
 
             except Exception as exc:
                 last_error = exc
+
                 log.exception(
-                    "YandexART: ошибка генерации, попытка %s/2",
+                    "YandexART: ошибка генерации, "
+                    "попытка %s/2",
                     attempt,
                 )
 
@@ -1881,10 +1921,53 @@ class ArticleService:
 
         if not image_bytes:
             raise RuntimeError(
-                "Не удалось получить изображение YandexART "
-                "после 2 попыток. "
+                "Не удалось получить изображение "
+                "YandexART после 2 попыток. "
                 f"Последняя ошибка: {last_error}"
             )
+
+        return (
+            short_title,
+            short_body,
+            image_bytes,
+        )
+
+
+    async def _generate(
+        self,
+        topic_title: str,
+        subtopic: str | None = None,
+    ) -> tuple[
+        str,
+        str,
+        str,
+        str,
+        bytes,
+    ]:
+        """
+        Полный wrapper для старых вызовов.
+
+        Поведение не меняется:
+        LONG + SHORT + IMAGE.
+        """
+
+        title, full_body = (
+            await self._generate_long_candidate(
+                topic_title,
+                subtopic=subtopic,
+            )
+        )
+
+        (
+            short_title,
+            short_body,
+            image_bytes,
+        ) = await self._complete_generated_article(
+            topic_title,
+            subtopic,
+            title,
+            full_body,
+        )
 
         return (
             title,
@@ -1893,6 +1976,7 @@ class ArticleService:
             short_body,
             image_bytes,
         )
+
 
     async def _publish_destinations(
         self,
@@ -2284,14 +2368,6 @@ class ArticleService:
                 generation_attempts + 1,
             ):
 
-                # На первой попытке сохраняем
-                # старую семантику режима.
-                #
-                # Но если первая готовая статья
-                # оказалась дублем, вторая попытка
-                # ОБЯЗАТЕЛЬНО ищет другой конкретный
-                # аспект даже для urgent_random
-                # или priority topic.
                 discover_subtopic_now = (
                     discover_subtopic_initially
                     or (
@@ -2313,12 +2389,18 @@ class ArticleService:
                 else:
                     selected_subtopic = None
 
+
+                # =====================================
+                # 1. СНАЧАЛА ТОЛЬКО LONG
+                # =====================================
+
                 try:
-                    generation_result = (
-                        await self._generate(
-                            topic_title,
-                            subtopic=selected_subtopic,
-                        )
+                    (
+                        title,
+                        full_body,
+                    ) = await self._generate_long_candidate(
+                        topic_title,
+                        subtopic=selected_subtopic,
                     )
 
                 except ContentBlockedError as exc:
@@ -2343,7 +2425,7 @@ class ArticleService:
                     )
 
                     log.exception(
-                        "Ошибка генерации статьи"
+                        "Ошибка генерации LONG"
                     )
 
                     return {
@@ -2352,114 +2434,143 @@ class ArticleService:
                         "error": str(exc),
                     }
 
-                (
-                    title,
-                    full_body,
-                    short_title,
-                    short_body,
-                    image_bytes,
-                ) = generation_result
 
-                if not duplicate_guard_enabled:
-                    break
+                # =====================================
+                # 2. ПРОВЕРКА ДУБЛЯ ДО SHORT И IMAGE
+                # =====================================
 
-                similar_article, similarity = (
-                    _find_similar_global_article_story(
-                        title,
-                        full_body,
-                        recent_articles_for_final,
-                        threshold=0.66,
+                if duplicate_guard_enabled:
+
+                    similar_article, similarity = (
+                        _find_similar_global_article_story(
+                            title,
+                            full_body,
+                            recent_articles_for_final,
+                            threshold=0.66,
+                        )
                     )
-                )
 
-                if similar_article is None:
+                    if similar_article is not None:
+
+                        similar_title = (
+                            similar_article.get(
+                                "article_title",
+                                "",
+                            )
+                        )
+
+                        similar_lead = (
+                            _first_article_paragraph(
+                                similar_article.get(
+                                    "article_body",
+                                    "",
+                                )
+                            )
+                        )
+
+                        log.warning(
+                            "LONG story rejected BEFORE "
+                            "SHORT/IMAGE: "
+                            "attempt=%s score=%.3f "
+                            "title=%r previous=%r",
+                            generation_attempt,
+                            similarity,
+                            title,
+                            similar_title,
+                        )
+
+                        rejected_generation_titles.append(
+                            "НЕ ПОВТОРЯТЬ СЮЖЕТ: "
+                            + similar_title
+                            + " | "
+                            + similar_lead[:350]
+                        )
+
+                        rejected_generation_titles.append(
+                            title
+                        )
+
+                        if selected_subtopic:
+                            rejected_generation_titles.append(
+                                selected_subtopic
+                            )
+
+                        if (
+                            generation_attempt
+                            < generation_attempts
+                        ):
+                            log.info(
+                                "LONG отклонён. "
+                                "SHORT и изображение "
+                                "НЕ генерировались. "
+                                "Пробую другой акцент."
+                            )
+
+                            continue
+
+                        await db.release_topic(
+                            topic_id
+                        )
+
+                        return {
+                            "status": "duplicate_rejected",
+                            "topic": topic_title,
+                            "article_title": title,
+                            "similar_to": similar_title,
+                            "similarity": similarity,
+                        }
+
                     log.info(
-                        "Final article story check OK: "
+                        "LONG story check OK: "
                         "title=%r similarity=%.3f",
                         title,
                         similarity,
                     )
 
-                    break
 
-                similar_title = (
-                    similar_article.get(
-                        "article_title",
-                        ""
-                    )
-                )
+                # =====================================
+                # 3. ТОЛЬКО ПОСЛЕ ПРОВЕРКИ:
+                #    SHORT + IMAGE
+                # =====================================
 
-                similar_lead = (
-                    _first_article_paragraph(
-                        similar_article.get(
-                            "article_body",
-                            "",
-                        )
-                    )
-                )
-
-                log.warning(
-                    "Final article story rejected: "
-                    "attempt=%s score=%.3f "
-                    "title=%r previous=%r",
-                    generation_attempt,
-                    similarity,
-                    title,
-                    similar_title,
-                )
-
-                # Второй подбор подтемы должен увидеть
-                # не только старый заголовок, но и сам
-                # запрещённый сюжет.
-                rejected_generation_titles.append(
-                    "НЕ ПОВТОРЯТЬ СЮЖЕТ: "
-                    + similar_title
-                    + " | "
-                    + similar_lead[:350]
-                )
-
-                rejected_generation_titles.append(
-                    title
-                )
-
-                if selected_subtopic:
-                    rejected_generation_titles.append(
-                        selected_subtopic
-                    )
-
-                if (
-                    generation_attempt
-                    < generation_attempts
-                ):
-                    log.info(
-                        "Перегенерирую статью "
-                        "с другим акцентом: parent=%r",
+                try:
+                    (
+                        short_title,
+                        short_body,
+                        image_bytes,
+                    ) = await self._complete_generated_article(
                         topic_title,
+                        selected_subtopic,
+                        title,
+                        full_body,
                     )
 
-                    continue
+                except Exception as exc:
+                    await db.release_topic(
+                        topic_id
+                    )
 
-                # Даже после второй попытки получили
-                # смысловой дубль — лучше не публиковать
-                # его вообще.
-                await db.release_topic(
-                    topic_id
+                    log.exception(
+                        "Ошибка генерации SHORT/IMAGE"
+                    )
+
+                    return {
+                        "status": "generation_error",
+                        "topic": topic_title,
+                        "error": str(exc),
+                    }
+
+
+                generation_result = (
+                    title,
+                    full_body,
+                    short_title,
+                    short_body,
+                    image_bytes,
                 )
 
-                log.warning(
-                    "Публикация отменена: "
-                    "две похожие статьи подряд "
-                    "для parent=%r",
-                    topic_title,
-                )
+                break
 
-                return {
-                    "status": "duplicate_rejected",
-                    "topic": topic_title,
-                    "article_title": title,
-                    "similar_to": similar_title,
-                    "similarity": similarity,
-                }
 
             if generation_result is None:
                 await db.release_topic(

@@ -1936,6 +1936,33 @@ _AI_ACTION_NAMES = {
 }
 
 
+_AI_ARTICLE_STAGE_NAMES = {
+    "article_full":
+        "📝 LONG",
+
+    "article_short":
+        "✂️ SHORT",
+
+    "subtopic_select":
+        "🧭 Выбор подтемы",
+
+    "search_subtopic":
+        "🔎 Поиск подтемы",
+
+    "search_article":
+        "🔎 Поиск для статьи",
+
+    "search_article_fresh_retry":
+        "🔄 Повторный поиск",
+
+    "image_generation":
+        "🖼 Изображение",
+
+    "popular_comment_topic":
+        "🔥 Выбор темы из комментария",
+}
+
+
 _AI_SERVICE_NAMES = {
     "yandexgpt":
         "YandexGPT",
@@ -1997,6 +2024,55 @@ def _format_ai_usage_report(
             "Средняя стоимость: "
             f"<b>{report['average_article_cost_rub']:.2f} ₽ / статья</b>"
         ),
+    ]
+
+
+    if (
+        report["published_articles"] > 0
+        and report.get(
+            "article_stages"
+        )
+    ):
+        lines.extend([
+            "",
+            "🧾 <b>В среднем на 1 статью</b>",
+        ])
+
+        for row in report[
+            "article_stages"
+        ]:
+
+            name = (
+                _AI_ARTICLE_STAGE_NAMES.get(
+                    row["action"],
+                    row["action"],
+                )
+            )
+
+            unit = (
+                "выз."
+                if row["service"]
+                == "yandexgpt"
+                else "запр."
+            )
+
+            lines.append(
+                f"• {html.escape(name)}: "
+                f"<b>{row['cost_per_article']:.2f} ₽</b> "
+                f"· {row['operations_per_article']:.2f} "
+                f"{unit}/ст."
+            )
+
+        lines.extend([
+            (
+                "🧠 GPT-вызовов: "
+                f"<b>{report['article_gpt_calls_per_article']:.2f} "
+                "/ статья</b>"
+            ),
+        ])
+
+
+    lines.extend([
         "",
         "🧠 <b>Токены YandexGPT</b>",
         (
@@ -2011,7 +2087,7 @@ def _format_ai_usage_report(
             "Исходящие: "
             f"{report['output_tokens']:,}"
         ).replace(",", " "),
-    ]
+    ])
 
     if report["services"]:
         lines.extend([

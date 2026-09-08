@@ -814,6 +814,50 @@ def period_report(
         )
 
 
+        # -----------------------------------------
+        # Расходы и количество вызовов
+        # по каждому этапу производства статьи.
+        # -----------------------------------------
+
+        if start_utc:
+            article_stage_rows = conn.execute(
+                f"""
+                SELECT
+                    action,
+                    service,
+                    COUNT(*),
+                    COALESCE(SUM(requests), 0),
+                    COALESCE(SUM(cost_rub), 0)
+                FROM ai_usage
+                WHERE created_at >= ?
+                  AND action IN ({placeholders})
+                GROUP BY action, service
+                ORDER BY SUM(cost_rub) DESC
+                """,
+                (
+                    start_utc,
+                    *article_actions,
+                ),
+            ).fetchall()
+
+        else:
+            article_stage_rows = conn.execute(
+                f"""
+                SELECT
+                    action,
+                    service,
+                    COUNT(*),
+                    COALESCE(SUM(requests), 0),
+                    COALESCE(SUM(cost_rub), 0)
+                FROM ai_usage
+                WHERE action IN ({placeholders})
+                GROUP BY action, service
+                ORDER BY SUM(cost_rub) DESC
+                """,
+                tuple(article_actions),
+            ).fetchall()
+
+
         def table_exists(
             table_name: str,
         ) -> bool:
@@ -907,6 +951,88 @@ def period_report(
             else 0.0
         )
 
+
+        article_stages = []
+
+        for row in article_stage_rows:
+
+            operations = int(
+                row[2] or 0
+            )
+
+            requests = int(
+                row[3] or 0
+            )
+
+            cost = float(
+                row[4] or 0
+            )
+
+            article_stages.append(
+                {
+                    "action": str(
+                        row[0] or "unknown"
+                    ),
+                    "service": str(
+                        row[1] or ""
+                    ),
+                    "operations": operations,
+                    "requests": requests,
+                    "cost_rub": round(
+                        cost,
+                        4,
+                    ),
+                    "cost_per_article": round(
+                        (
+                            cost
+                            / published_articles
+                        )
+                        if published_articles
+                        else 0.0,
+                        4,
+                    ),
+                    "operations_per_article": round(
+                        (
+                            operations
+                            / published_articles
+                        )
+                        if published_articles
+                        else 0.0,
+                        3,
+                    ),
+                    "requests_per_article": round(
+                        (
+                            requests
+                            / published_articles
+                        )
+                        if published_articles
+                        else 0.0,
+                        3,
+                    ),
+                }
+            )
+
+
+        article_gpt_operations = sum(
+            int(
+                row.get(
+                    "operations",
+                    0,
+                )
+            )
+            for row in article_stages
+            if row.get(
+                "service"
+            ) == "yandexgpt"
+        )
+
+        article_gpt_calls_per_article = (
+            article_gpt_operations
+            / published_articles
+            if published_articles
+            else 0.0
+        )
+
     return {
         "period": period,
         "start_utc": start_utc,
@@ -940,6 +1066,14 @@ def period_report(
             average_article_cost_rub,
             4,
         ),
+
+        "article_gpt_calls_per_article": round(
+            article_gpt_calls_per_article,
+            3,
+        ),
+
+        "article_stages":
+            article_stages,
 
         "services": [
             {

@@ -2072,6 +2072,55 @@ def _format_ai_usage_report(
         ])
 
 
+    trigger_names = {
+        "auto":
+            "🤖 Автоматические",
+
+        "urgent_random":
+            "⚡ Срочные случайные",
+    }
+
+    if report.get(
+        "article_trigger_breakdown"
+    ):
+        lines.extend([
+            "",
+            "📊 <b>По типу публикации</b>",
+        ])
+
+        for row in report[
+            "article_trigger_breakdown"
+        ]:
+
+            if (
+                row["published_articles"]
+                <= 0
+            ):
+                continue
+
+            name = trigger_names.get(
+                row["trigger"],
+                row["trigger"],
+            )
+
+            lines.extend([
+                (
+                    f"{html.escape(name)}:"
+                ),
+                (
+                    "• опубликовано: "
+                    f"<b>{row['published_articles']}</b>"
+                ),
+                (
+                    "• расходы: "
+                    f"<b>{row['cost_rub']:.2f} ₽</b>"
+                ),
+                (
+                    "• средняя: "
+                    f"<b>{row['average_cost_rub']:.2f} ₽ / статья</b>"
+                ),
+            ])
+
     lines.extend([
         "",
         "🧠 <b>Токены YandexGPT</b>",

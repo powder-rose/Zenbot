@@ -1033,6 +1033,242 @@ def period_report(
             else 0.0
         )
 
+
+        # -----------------------------------------
+        # Себестоимость GLOBAL-статей по trigger.
+        #
+        # Берём только AI-операции:
+        # - относящиеся к производству статьи;
+        # - GLOBAL (user_id IS NULL);
+        # - где trigger уже записан в metadata_json.
+        #
+        # Старые публикации до начала trigger-tracking
+        # в знаменатель не попадают.
+        # -----------------------------------------
+
+        trigger_usage_params: list[Any] = [
+            *article_actions,
+        ]
+
+        trigger_usage_where = f"""
+            action IN ({placeholders})
+            AND user_id IS NULL
+        """
+
+        if start_utc:
+            trigger_usage_where += """
+                AND created_at >= ?
+            """
+            trigger_usage_params.append(
+                start_utc
+            )
+
+        trigger_usage_rows = conn.execute(
+            f"""
+            SELECT
+                created_at,
+                action,
+                service,
+                requests,
+                cost_rub,
+                metadata_json
+            FROM ai_usage
+            WHERE {trigger_usage_where}
+            ORDER BY created_at
+            """,
+            tuple(trigger_usage_params),
+        ).fetchall()
+
+        trigger_stats: dict[
+            str,
+            dict[str, Any],
+        ] = {}
+
+        trigger_tracking_start: str | None = None
+
+        for usage_row in trigger_usage_rows:
+
+            try:
+                metadata = json.loads(
+                    usage_row[5] or "{}"
+                )
+            except Exception:
+                metadata = {}
+
+            trigger = str(
+                metadata.get(
+                    "trigger"
+                )
+                or ""
+            ).strip()
+
+            if trigger not in {
+                "auto",
+                "urgent_random",
+            }:
+                continue
+
+            created_at = str(
+                usage_row[0] or ""
+            )
+
+            if (
+                created_at
+                and (
+                    trigger_tracking_start is None
+                    or created_at
+                    < trigger_tracking_start
+                )
+            ):
+                trigger_tracking_start = (
+                    created_at
+                )
+
+            stat = trigger_stats.setdefault(
+                trigger,
+                {
+                    "trigger": trigger,
+                    "operations": 0,
+                    "requests": 0,
+                    "cost_rub": 0.0,
+                    "published_articles": 0,
+                },
+            )
+
+            stat["operations"] += 1
+            stat["requests"] += int(
+                usage_row[3] or 0
+            )
+            stat["cost_rub"] += float(
+                usage_row[4] or 0
+            )
+
+
+        # Считаем только публикации GLOBAL,
+        # созданные уже после начала trigger-tracking.
+        if (
+            trigger_tracking_start
+            and table_exists(
+                "publications"
+            )
+        ):
+
+            publication_start = (
+                trigger_tracking_start
+            )
+
+            if (
+                start_utc
+                and start_utc
+                > publication_start
+            ):
+                publication_start = (
+                    start_utc
+                )
+
+            trigger_publication_rows = (
+                conn.execute(
+                    """
+                    SELECT
+                        trigger_type,
+                        COUNT(*)
+                    FROM publications
+                    WHERE telegram_status='published'
+                      AND created_at >= ?
+                      AND trigger_type IN (
+                          'auto',
+                          'urgent_random'
+                      )
+                    GROUP BY trigger_type
+                    """,
+                    (
+                        publication_start,
+                    ),
+                ).fetchall()
+            )
+
+            for publication_row in (
+                trigger_publication_rows
+            ):
+                trigger = str(
+                    publication_row[0]
+                    or ""
+                )
+
+                stat = (
+                    trigger_stats.setdefault(
+                        trigger,
+                        {
+                            "trigger": trigger,
+                            "operations": 0,
+                            "requests": 0,
+                            "cost_rub": 0.0,
+                            "published_articles": 0,
+                        },
+                    )
+                )
+
+                stat[
+                    "published_articles"
+                ] = int(
+                    publication_row[1]
+                    or 0
+                )
+
+
+        article_trigger_breakdown = []
+
+        for trigger in (
+            "auto",
+            "urgent_random",
+        ):
+
+            stat = trigger_stats.get(
+                trigger
+            )
+
+            if not stat:
+                continue
+
+            cost = float(
+                stat["cost_rub"]
+                or 0
+            )
+
+            published = int(
+                stat["published_articles"]
+                or 0
+            )
+
+            article_trigger_breakdown.append(
+                {
+                    "trigger": trigger,
+                    "operations": int(
+                        stat["operations"]
+                        or 0
+                    ),
+                    "requests": int(
+                        stat["requests"]
+                        or 0
+                    ),
+                    "cost_rub": round(
+                        cost,
+                        4,
+                    ),
+                    "published_articles":
+                        published,
+                    "average_cost_rub": round(
+                        (
+                            cost
+                            / published
+                        )
+                        if published
+                        else 0.0,
+                        4,
+                    ),
+                }
+            )
+
     return {
         "period": period,
         "start_utc": start_utc,
@@ -1074,6 +1310,9 @@ def period_report(
 
         "article_stages":
             article_stages,
+
+        "article_trigger_breakdown":
+            article_trigger_breakdown,
 
         "services": [
             {

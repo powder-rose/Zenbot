@@ -1407,6 +1407,7 @@ class ArticleService:
         topic_id: int,
         topic_title: str,
         extra_used_titles: list[str] | None = None,
+        trigger: str | None = None,
     ) -> str | None:
         """
         Используется ТОЛЬКО для обычной
@@ -1453,6 +1454,7 @@ class ArticleService:
                 "search_subtopic",
                 metadata={
                     "topic": topic_title,
+                    "trigger": trigger,
                 },
             ):
                 sources = await self.search.search(
@@ -1515,6 +1517,7 @@ class ArticleService:
                 metadata={
                     "topic": topic_title,
                     "candidate_count": 6,
+                    "trigger": trigger,
                 },
             ):
                 candidates = (
@@ -1643,6 +1646,7 @@ class ArticleService:
         self,
         topic_title: str,
         subtopic: str | None = None,
+        trigger: str | None = None,
     ) -> tuple[str, str]:
         """
         Генерирует только LONG.
@@ -1697,6 +1701,7 @@ class ArticleService:
             metadata={
                 "topic": topic_title,
                 "subtopic": subtopic,
+                "trigger": trigger,
             },
         ):
             sources = await self.search.search(
@@ -1732,6 +1737,7 @@ class ArticleService:
             metadata={
                 "topic": topic_title,
                 "subtopic": subtopic,
+                "trigger": trigger,
             },
         ):
             title, full_body = (
@@ -1783,6 +1789,7 @@ class ArticleService:
         subtopic: str | None,
         title: str,
         full_body: str,
+        trigger: str | None = None,
     ) -> tuple[
         str,
         str,
@@ -1821,6 +1828,7 @@ class ArticleService:
             metadata={
                 "topic": topic_title,
                 "subtopic": subtopic,
+                "trigger": trigger,
             },
         ):
             short_title, short_body = (
@@ -1881,6 +1889,7 @@ class ArticleService:
                     metadata={
                         "topic": topic_title,
                         "subtopic": subtopic,
+                        "trigger": trigger,
                     },
                 ):
                     image_bytes = (
@@ -2388,6 +2397,7 @@ class ArticleService:
                             extra_used_titles=(
                                 rejected_generation_titles
                             ),
+                            trigger=trigger,
                         )
                     )
                 else:
@@ -2405,6 +2415,7 @@ class ArticleService:
                     ) = await self._generate_long_candidate(
                         topic_title,
                         subtopic=selected_subtopic,
+                        trigger=trigger,
                     )
 
                 except ContentBlockedError as exc:
@@ -2547,6 +2558,7 @@ class ArticleService:
                         selected_subtopic,
                         title,
                         full_body,
+                        trigger=trigger,
                     )
 
                 except Exception as exc:

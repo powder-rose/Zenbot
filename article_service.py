@@ -35,6 +35,8 @@ from yandex_gpt import (
     SYNCBOT_SYSTEM_PROMPT,
     YandexGPTClient,
     ContentBlockedError,
+    looks_like_news_first_subtopic,
+    topic_explicitly_requests_news,
 )
 
 log = logging.getLogger(__name__)
@@ -977,12 +979,11 @@ class ArticleService:
 
             search_query = (
                 f"{topic_title} "
-                f"актуально на {today_text} "
                 f"{now_local.year} "
-                "сегодня актуальные изменения "
-                "новые требования "
-                "будущие изменения "
-                "вступит в силу практика"
+                "актуальная практика "
+                "применение типичные ошибки "
+                "проверка документы требования "
+                "рекомендации"
             )
 
             with usage_context(
@@ -1004,39 +1005,115 @@ class ArticleService:
                 limit=80,
             )
 
-            with usage_context(
-                "subtopic_select",
-                metadata={"topic": topic_title},
-            ):
-                subtopic = (
-                    await self.gpt.select_article_subtopic(
-                        topic=topic_title,
-                        sources=sources,
-                        used_subtopics=used,
+            # Учитываем ещё и последние публикации
+            # всего канала независимо от parent-topic.
+            #
+            # Например, после статьи про изменения
+            # "с 1 сентября" по одной теме следующая
+            # статья по другой теме не должна
+            # автоматически строиться вокруг той же даты.
+            recent_titles = (
+                await db.list_recent_article_titles(
+                    limit=15,
+                )
+            )
+
+            used_for_gpt = list(
+                dict.fromkeys(
+                    [
+                        *used,
+                        *recent_titles,
+                    ]
+                )
+            )
+
+            # До четырёх попыток:
+            # если GPT сначала выбрал очередной
+            # news-first сюжет, просим другой угол,
+            # а не откатываемся сразу к широкой теме.
+            for attempt in range(1, 5):
+
+                with usage_context(
+                    "subtopic_select",
+                    metadata={
+                        "topic": topic_title,
+                        "attempt": attempt,
+                    },
+                ):
+                    subtopic = (
+                        await self.gpt.select_article_subtopic(
+                            topic=topic_title,
+                            sources=sources,
+                            used_subtopics=used_for_gpt,
+                        )
                     )
+
+                subtopic = " ".join(
+                    str(subtopic or "").split()
                 )
 
-            subtopic = " ".join(
-                str(subtopic).split()
-            )
+                if (
+                    subtopic.casefold()
+                    in {
+                        "__no_relevant_subtopic__",
+                        "no_relevant_subtopic",
+                    }
+                ):
+                    return None
 
-            if not subtopic:
-                return None
+                if not subtopic:
+                    continue
 
-            if (
-                subtopic.casefold()
-                == topic_title.casefold()
-            ):
-                return None
+                if (
+                    subtopic.casefold()
+                    == topic_title.casefold()
+                ):
+                    used_for_gpt.append(
+                        subtopic
+                    )
+                    continue
 
-            log.info(
-                "Плановая подтема: "
-                "parent=%s subtopic=%s",
+                if (
+                    looks_like_news_first_subtopic(
+                        subtopic
+                    )
+                    and not topic_explicitly_requests_news(
+                        topic_title
+                    )
+                ):
+                    log.info(
+                        "Плановая news-first подтема "
+                        "отклонена: parent=%r "
+                        "subtopic=%r attempt=%s",
+                        topic_title,
+                        subtopic,
+                        attempt,
+                    )
+
+                    used_for_gpt.append(
+                        subtopic
+                    )
+
+                    continue
+
+                log.info(
+                    "Плановая подтема: "
+                    "parent=%s subtopic=%s "
+                    "attempt=%s",
+                    topic_title,
+                    subtopic,
+                    attempt,
+                )
+
+                return subtopic
+
+            log.warning(
+                "Не удалось подобрать практическую "
+                "подтему за 4 попытки: parent=%r",
                 topic_title,
-                subtopic,
             )
 
-            return subtopic
+            return None
 
         except Exception:
             log.exception(
@@ -1094,9 +1171,10 @@ class ArticleService:
             f"{focus_topic} "
             f"актуально на {today_text} "
             f"{now_local.year} "
-            "сегодня актуальные требования "
-            "будущие изменения "
-            "вступит в силу"
+            "действующие требования "
+            "актуальная практика "
+            "применение типичные ошибки "
+            "проверка документы рекомендации"
         )
 
         with usage_context(
@@ -1171,7 +1249,7 @@ class ArticleService:
             },
         ):
             title, full_body = await self.gpt.generate_article_from_sources(
-                topic=focus_topic,
+                topic=topic_title,
                 sources=sources,
                 subtopic=subtopic,
                 max_chars=3200,

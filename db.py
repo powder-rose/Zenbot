@@ -770,6 +770,44 @@ async def list_used_subtopics(
     ]
 
 
+
+async def list_recent_article_titles(
+    limit: int = 15,
+) -> list[str]:
+    """
+    Последние реальные заголовки канала.
+
+    Используются при выборе следующей подтемы,
+    чтобы публикации разных parent-topic
+    не повторяли один и тот же инфоповод.
+    """
+    async with aiosqlite.connect(
+        _path()
+    ) as conn:
+        cur = await conn.execute(
+            """
+            SELECT article_title
+            FROM publications
+            WHERE article_title IS NOT NULL
+              AND trim(article_title) != ''
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (
+                int(limit),
+            ),
+        )
+
+        rows = await cur.fetchall()
+
+    return [
+        str(row[0])
+        for row in rows
+        if row and row[0]
+    ]
+
+
+
 async def record_used_subtopic(
     topic_id: int | None,
     parent_topic: str,

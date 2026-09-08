@@ -28,6 +28,8 @@ from yandex_gpt import (
     ARTICLE_SYSTEM_PROMPT,
     SYNCBOT_SYSTEM_PROMPT,
     YandexGPTClient,
+    looks_like_news_first_subtopic,
+    topic_explicitly_requests_news,
 )
 
 log = logging.getLogger(__name__)
@@ -494,6 +496,30 @@ class TenantArticleService:
                         topic_title,
                     )
                     return None
+
+                if (
+                    looks_like_news_first_subtopic(
+                        subtopic
+                    )
+                    and not topic_explicitly_requests_news(
+                        topic_title
+                    )
+                ):
+                    log.info(
+                        "Tenant news-first subtopic rejected: "
+                        "user=%s parent=%r candidate=%r "
+                        "attempt=%s",
+                        user_id,
+                        topic_title,
+                        subtopic,
+                        attempt,
+                    )
+
+                    used_for_gpt.append(
+                        subtopic
+                    )
+
+                    continue
 
                 if not subtopic:
                     log.info(

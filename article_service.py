@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.types import (
     BufferedInputFile,
     InputMediaPhoto,
@@ -2043,21 +2044,99 @@ class ArticleService:
                 len(public_caption),
             )
 
-            public_message = (
-                await self.bot.send_photo(
-                    chat_id=(
-                        self.cfg.telegram_channel_id
-                    ),
-                    photo=BufferedInputFile(
-                        image_bytes,
-                        filename="article.jpg",
-                    ),
-                    caption=public_caption,
-                    parse_mode="HTML",
-                    disable_notification=True,
-                    request_timeout=180,
-                )
+            public_message = None
+
+            # -----------------------------------------
+            # SAFE TELEGRAM CONNECT RETRY
+            #
+            # Повторяем только ошибки, при которых
+            # соединение с Telegram точно НЕ было
+            # установлено:
+            #
+            # - DNS failure;
+            # - Cannot connect to host;
+            # - Connect call failed.
+            #
+            # Обычный timeout после начала HTTP-запроса
+            # автоматически НЕ повторяем, чтобы не
+            # создать дубль публикации.
+            # -----------------------------------------
+
+            telegram_connect_markers = (
+                "clientconnectorerror",
+                "cannot connect to host",
+                "connect call failed",
+                "temporary failure in name resolution",
+                "name or service not known",
+                "nodename nor servname provided",
             )
+
+            for send_attempt in range(
+                1,
+                4,
+            ):
+                try:
+                    public_message = (
+                        await self.bot.send_photo(
+                            chat_id=(
+                                self.cfg.telegram_channel_id
+                            ),
+                            photo=BufferedInputFile(
+                                image_bytes,
+                                filename="article.jpg",
+                            ),
+                            caption=public_caption,
+                            parse_mode="HTML",
+                            disable_notification=True,
+                            request_timeout=180,
+                        )
+                    )
+
+                    break
+
+                except TelegramNetworkError as exc:
+                    error_text = str(
+                        exc
+                    ).casefold()
+
+                    safe_connect_error = any(
+                        marker in error_text
+                        for marker in (
+                            telegram_connect_markers
+                        )
+                    )
+
+                    if (
+                        not safe_connect_error
+                        or send_attempt >= 3
+                    ):
+                        raise
+
+                    delay = (
+                        3
+                        if send_attempt == 1
+                        else 8
+                    )
+
+                    log.warning(
+                        "Telegram send_photo: "
+                        "ошибка подключения, "
+                        "безопасный retry %s/3 "
+                        "через %s сек: %s",
+                        send_attempt,
+                        delay,
+                        exc,
+                    )
+
+                    await asyncio.sleep(
+                        delay
+                    )
+
+            if public_message is None:
+                raise RuntimeError(
+                    "Telegram send_photo не вернул "
+                    "результат после retry"
+                )
 
             public_message_id = (
                 public_message.message_id

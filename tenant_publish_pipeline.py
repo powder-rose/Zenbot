@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from pathlib import Path
 from typing import Any
@@ -228,17 +229,291 @@ class TenantPublishPipeline:
         return caption
 
 
-    async def _send_seed(
+    def _build_public_short_caption_html(
+        self,
+        *,
+        title: str,
+        short_body: str,
+    ) -> str:
+        """
+        Финальный Telegram caption с сохранением
+        пользовательского rich-formatting.
+
+        Один и тот же photo-post остаётся пригодным
+        для Dzen import: Telegram передаёт в канал
+        обычный видимый текст + entities.
+        """
+
+        clean_title = " ".join(
+            str(title or "").split()
+        )
+
+        if not clean_title:
+            raise RuntimeError(
+                "Пустой заголовок SHORT"
+            )
+
+        parsed = parse_dzen_markup(
+            short_body
+        )
+
+        max_visible = 1024
+
+        available = (
+            max_visible
+            - len(clean_title)
+            - 2
+        )
+
+        if available <= 0:
+            raise RuntimeError(
+                "Заголовок слишком длинный "
+                "для Telegram caption"
+            )
+
+        selected: list[
+            tuple[int, str]
+        ] = []
+
+        remaining = available
+
+        for line_index, line in enumerate(
+            parsed.lines
+        ):
+            separator = (
+                1
+                if selected
+                else 0
+            )
+
+            if remaining < separator:
+                break
+
+            remaining -= separator
+
+            piece = line[
+                :max(0, remaining)
+            ]
+
+            was_truncated = (
+                len(piece)
+                < len(line)
+            )
+
+            if was_truncated and piece:
+                cut = piece.rfind(
+                    " "
+                )
+
+                if cut >= max(
+                    0,
+                    len(piece) - 120,
+                ):
+                    piece = (
+                        piece[:cut]
+                        .rstrip()
+                    )
+
+            selected.append(
+                (
+                    line_index,
+                    piece,
+                )
+            )
+
+            remaining -= len(
+                piece
+            )
+
+            if was_truncated:
+                break
+
+            if remaining <= 0:
+                break
+
+        spans_by_line: dict[
+            int,
+            list,
+        ] = {}
+
+        for span in parsed.spans:
+            spans_by_line.setdefault(
+                span.line,
+                [],
+            ).append(
+                span
+            )
+
+        order = (
+            "bold",
+            "italic",
+            "underline",
+            "strike",
+        )
+
+        open_tag = {
+            "bold": "<b>",
+            "italic": "<i>",
+            "underline": "<u>",
+            "strike": "<s>",
+        }
+
+        close_tag = {
+            "bold": "</b>",
+            "italic": "</i>",
+            "underline": "</u>",
+            "strike": "</s>",
+        }
+
+        def render_line(
+            line_index: int,
+            value: str,
+        ) -> str:
+            if not value:
+                return ""
+
+            styles = [
+                set()
+                for _ in value
+            ]
+
+            for span in spans_by_line.get(
+                line_index,
+                [],
+            ):
+                start = max(
+                    0,
+                    int(span.start),
+                )
+
+                end = min(
+                    len(value),
+                    int(span.end),
+                )
+
+                for pos in range(
+                    start,
+                    end,
+                ):
+                    styles[pos].add(
+                        span.style
+                    )
+
+            result = []
+            current = set()
+
+            for pos, char in enumerate(
+                value
+            ):
+                target = styles[pos]
+
+                if target != current:
+                    for style in reversed(
+                        order
+                    ):
+                        if style in current:
+                            result.append(
+                                close_tag[
+                                    style
+                                ]
+                            )
+
+                    for style in order:
+                        if style in target:
+                            result.append(
+                                open_tag[
+                                    style
+                                ]
+                            )
+
+                    current = set(
+                        target
+                    )
+
+                result.append(
+                    html.escape(
+                        char,
+                        quote=False,
+                    )
+                )
+
+            for style in reversed(
+                order
+            ):
+                if style in current:
+                    result.append(
+                        close_tag[
+                            style
+                        ]
+                    )
+
+            rendered = "".join(
+                result
+            )
+
+            if (
+                line_index
+                in parsed.blockquotes
+                and value.strip()
+            ):
+                rendered = (
+                    "<blockquote>"
+                    + rendered
+                    + "</blockquote>"
+                )
+
+            return rendered
+
+        body_html = "\n".join(
+            render_line(
+                line_index,
+                value,
+            )
+            for line_index, value
+            in selected
+        ).strip()
+
+        caption = (
+            "<b>"
+            + html.escape(
+                clean_title,
+                quote=False,
+            )
+            + "</b>"
+        )
+
+        if body_html:
+            caption += (
+                "\n\n"
+                + body_html
+            )
+
+        return caption
+
+
+    async def _send_public_short(
         self,
         *,
         chat_id: int,
         title: str,
-        seed_body: str,
+        short_body: str,
         image_bytes: bytes,
     ) -> int:
-        caption = self._build_seed_caption(
-            title=title,
-            full_body=seed_body,
+        """
+        Один и тот же Telegram photo-post выполняет
+        сразу две функции:
+
+        1. это финальный SHORT для подписчиков;
+        2. это transport-публикация для импорта в Dzen.
+
+        Пост после синхронизации НЕ удаляется.
+        """
+
+        caption = (
+            self._build_public_short_caption_html(
+                title=title,
+                short_body=short_body,
+            )
         )
 
         image = BufferedInputFile(
@@ -250,14 +525,16 @@ class TenantPublishPipeline:
             chat_id=chat_id,
             photo=image,
             caption=caption,
+            parse_mode="HTML",
             disable_notification=True,
-            request_timeout=90,
+            request_timeout=180,
         )
 
         log.info(
-            "Tenant Dzen seed sent: "
+            "Tenant public SHORT sent: "
             "channel=%s message=%s "
-            "caption_chars=%s",
+            "caption_chars=%s "
+            "dzen_transport=True",
             chat_id,
             message.message_id,
             len(caption),
@@ -391,15 +668,17 @@ class TenantPublishPipeline:
         chat_id: int,
         title: str,
         full_body: str,
-        short_body: str,
-        image_bytes: bytes,
         dzen: dict[str, str],
     ) -> dict[str, Any]:
         """
-        Dzen-ветка.
+        Dzen-ветка для уже опубликованного SHORT.
 
-        Метод сам управляет временным seed-постом.
-        Seed всегда пытаемся удалить в finally.
+        Telegram photo-post уже является финальной
+        публикацией пользователя. Dzen импортирует
+        его как исходник, после чего мы заменяем
+        body на полный LONG и применяем форматирование.
+
+        Telegram-пост никогда не удаляем.
         """
 
         result: dict[str, Any] = {
@@ -408,24 +687,11 @@ class TenantPublishPipeline:
             "body_replaced": False,
             "formatted": False,
             "seed_deleted": False,
+            "telegram_post_preserved": True,
             "error": None,
         }
 
-        seed_message_id: int | None = None
-
         try:
-            seed_message_id = (
-                await self._send_seed(
-                    chat_id=chat_id,
-                    title=title,
-                    seed_body=(
-                        short_body.strip()
-                        or full_body
-                    ),
-                    image_bytes=image_bytes,
-                )
-            )
-
             formatter = DzenRichFormatter(
                 headless=self.headless
             )
@@ -618,15 +884,6 @@ class TenantPublishPipeline:
                 title,
             )
 
-        finally:
-            if seed_message_id is not None:
-                result[
-                    "seed_deleted"
-                ] = await self._delete_seed(
-                    chat_id=chat_id,
-                    message_id=seed_message_id,
-                )
-
         return result
 
 
@@ -643,7 +900,16 @@ class TenantPublishPipeline:
         """
         Полный pipeline одного tenant-канала.
 
-        SHORT публикуется независимо от результата Dzen.
+        Если Dzen подключён:
+            1. сразу публикуем финальный Telegram
+               photo + SHORT;
+            2. этот же пост импортируется в Dzen;
+            3. в Dzen заменяем SHORT на LONG;
+            4. применяем rich-format;
+            5. Telegram-пост оставляем как есть.
+
+        Если Dzen не подключён:
+            сохраняем прежний Rich Message SHORT.
         """
 
         result: dict[str, Any] = {
@@ -657,6 +923,7 @@ class TenantPublishPipeline:
                 "body_replaced": False,
                 "formatted": False,
                 "seed_deleted": False,
+                "telegram_post_preserved": False,
                 "error": None,
             },
         }
@@ -665,7 +932,30 @@ class TenantPublishPipeline:
             user_id
         )
 
+        # ------------------------------------------
+        # DZEN CONNECTED
+        #
+        # Один Telegram post = финальный SHORT
+        # + transport для Dzen.
+        # ------------------------------------------
+
         if dzen is not None:
+            short_message_id = (
+                await self._send_public_short(
+                    chat_id=chat_id,
+                    title=title,
+                    short_body=(
+                        short_body.strip()
+                        or full_body
+                    ),
+                    image_bytes=image_bytes,
+                )
+            )
+
+            result[
+                "short_message_id"
+            ] = short_message_id
+
             result[
                 "dzen"
             ] = await self._publish_to_dzen(
@@ -673,31 +963,28 @@ class TenantPublishPipeline:
                 chat_id=chat_id,
                 title=title,
                 full_body=full_body,
-                short_body=short_body,
-                image_bytes=image_bytes,
                 dzen=dzen,
             )
 
         # ------------------------------------------
-        # FAIL-SAFE
+        # NO DZEN
         #
-        # Состояние Dzen не влияет на Telegram SHORT.
-        # Даже если Playwright / Dzen упал,
-        # пользователь всё равно получает публикацию.
+        # Оставляем прежний Rich Message.
         # ------------------------------------------
 
-        short_message_id = (
-            await self._send_short(
-                chat_id=chat_id,
-                title=title,
-                short_body=short_body,
-                image_bytes=image_bytes,
+        else:
+            short_message_id = (
+                await self._send_short(
+                    chat_id=chat_id,
+                    title=title,
+                    short_body=short_body,
+                    image_bytes=image_bytes,
+                )
             )
-        )
 
-        result[
-            "short_message_id"
-        ] = short_message_id
+            result[
+                "short_message_id"
+            ] = short_message_id
 
         log.info(
             "Tenant publish complete: "
@@ -705,10 +992,11 @@ class TenantPublishPipeline:
             "short_message=%s "
             "dzen_attempted=%s "
             "dzen_synced=%s "
-            "dzen_formatted=%s",
+            "dzen_formatted=%s "
+            "telegram_preserved=%s",
             user_id,
             chat_id,
-            short_message_id,
+            result["short_message_id"],
             result["dzen"].get(
                 "attempted"
             ),
@@ -717,6 +1005,9 @@ class TenantPublishPipeline:
             ),
             result["dzen"].get(
                 "formatted"
+            ),
+            result["dzen"].get(
+                "telegram_post_preserved"
             ),
         )
 

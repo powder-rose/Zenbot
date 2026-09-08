@@ -328,6 +328,73 @@ def resolve_prompt(
 
 
 
+def _prompt_requests_rich_markup(
+    prompt: str | None,
+) -> bool:
+    """
+    Пользователь явно использует поддерживаемый
+    контракт rich-formatting в своём prompt.
+    """
+
+    value = str(
+        prompt or ""
+    )
+
+    markers = (
+        "[[B]]",
+        "[[I]]",
+        "[[U]]",
+        "[[S]]",
+        "[[Q]]",
+        "**",
+        "__",
+        "~~",
+    )
+
+    return any(
+        marker in value
+        for marker in markers
+    )
+
+
+def _has_supported_rich_markup(
+    value: str | None,
+) -> bool:
+    """
+    Проверяем наличие реального оформления,
+    которое умеют Telegram/Dzen pipeline.
+    """
+
+    text = str(
+        value or ""
+    )
+
+    patterns = (
+        r"\[\[B\]\].+?\[\[/B\]\]",
+        r"\[\[I\]\].+?\[\[/I\]\]",
+        r"\[\[U\]\].+?\[\[/U\]\]",
+        r"\[\[S\]\].+?\[\[/S\]\]",
+        r"\[\[Q\]\].+?\[\[/Q\]\]",
+        r"<b>.+?</b>",
+        r"<i>.+?</i>",
+        r"<u>.+?</u>",
+        r"<s>.+?</s>",
+        r"\*\*.+?\*\*",
+        r"__.+?__",
+        r"~~.+?~~",
+        r"(?m)^\s*>\s*\S",
+    )
+
+    return any(
+        re.search(
+            pattern,
+            text,
+            flags=re.I | re.S,
+        )
+        for pattern in patterns
+    )
+
+
 def _extract_temporal_dates(text: str):
     """Явные даты из текста."""
     import re
@@ -403,6 +470,98 @@ def _extract_temporal_dates(text: str):
             pass
 
     return result
+
+
+def _has_stale_lead_event(
+    title: str,
+    body: str,
+    today,
+    *,
+    max_age_days: int = 90,
+) -> bool:
+    """
+    Ловит старое событие, вынесенное в заголовок
+    или начало статьи.
+
+    Важно:
+    ГОСТ Р 59641-2021 сам по себе НЕ считается
+    старым инфоповодом. Нужна связка:
+      старая дата/год + событийный глагол.
+    """
+    import re
+
+    event_pattern = re.compile(
+        (
+            r"\b(?:"
+            r"отмен[её]н(?:а|о|ы)?|"
+            r"утратил(?:а|о|и)?\s+силу|"
+            r"вступил(?:а|о|и)?\s+в\s+силу|"
+            r"введ[её]н(?:а|о|ы)?\s+в\s+действие|"
+            r"начал(?:а|о|и)?\s+действовать|"
+            r"измен[её]н(?:а|о|ы)?|"
+            r"принят(?:а|о|ы)?|"
+            r"утвержд[её]н(?:а|о|ы)?|"
+            r"обновл[её]н(?:а|о|ы)?|"
+            r"перестал(?:а|о|и)?\s+действовать"
+            r")\b"
+        ),
+        flags=re.I,
+    )
+
+    paragraphs = [
+        block.strip()
+        for block in re.split(
+            r"\n\s*\n",
+            str(body or ""),
+        )
+        if block.strip()
+    ]
+
+    # Проверяем заголовок и только первые два
+    # смысловых абзаца.
+    lead_parts = [
+        str(title or "").strip(),
+        *paragraphs[:2],
+    ]
+
+    for part in lead_parts:
+        if not part:
+            continue
+
+        if not event_pattern.search(part):
+            continue
+
+        dates = _extract_temporal_dates(
+            part
+        )
+
+        for item in dates:
+            age_days = (
+                today - item
+            ).days
+
+            if age_days > max_age_days:
+                return True
+
+        # Если указано только "в 2025 году",
+        # для прошлого года это однозначно старый
+        # инфоповод. Год внутри номера ГОСТ без
+        # событийного глагола сюда не попадёт.
+        years = [
+            int(value)
+            for value in re.findall(
+                r"\b20\d{2}\b",
+                part,
+            )
+        ]
+
+        if any(
+            year < today.year
+            for year in years
+        ):
+            return True
+
+    return False
 
 
 def _temporal_review_needed(
@@ -1028,6 +1187,72 @@ class YandexGPTClient:
                 # используем первоначальный результат.
                 pass
 
+        # ----------------------------------------
+        # STRICT CUSTOM FORMAT CHECK
+        #
+        # Если пользователь сам указал rich-маркеры
+        # в SHORT prompt, plain text не считается
+        # выполнением его prompt.
+        # ----------------------------------------
+
+        if (
+            custom_system_prompt
+            and _prompt_requests_rich_markup(
+                custom_system_prompt
+            )
+            and not _has_supported_rich_markup(
+                body
+            )
+        ):
+            formatting_prompt = (
+                "ЭТАП ОБЯЗАТЕЛЬНОГО ФОРМАТИРОВАНИЯ.\n\n"
+                "В системном промпте пользователя явно "
+                "задано rich-formatting, но текущий "
+                "черновик не содержит ни одного "
+                "поддерживаемого rich-элемента.\n\n"
+                "Переформатируй ТОЛЬКО оформление "
+                "текущего текста строго по системному "
+                "промпту. Используй именно тот синтаксис "
+                "маркеров, который задан в системном "
+                "промпте.\n"
+                "Не добавляй новых фактов, дат, законов, "
+                "требований или выводов.\n\n"
+                f"ЗАГОЛОВОК: {title}\n"
+                "ТЕКСТ:\n"
+                f"{body}\n\n"
+                "Верни только окончательный вариант "
+                "в формате ЗАГОЛОВОК: ... и ТЕКСТ: ..."
+            )
+
+            formatted_raw = await asyncio.to_thread(
+                self._complete_sync,
+                auth,
+                effective_system_prompt,
+                formatting_prompt,
+            )
+
+            formatted_title, formatted_body = (
+                self._parse(
+                    formatted_raw
+                )
+            )
+
+            if (
+                str(formatted_title or "").strip()
+                and str(formatted_body or "").strip()
+            ):
+                title = formatted_title
+                body = formatted_body
+
+            if not _has_supported_rich_markup(
+                body
+            ):
+                raise RuntimeError(
+                    "SHORT prompt требует "
+                    "форматирование, но YandexGPT "
+                    "не вернул rich-разметку"
+                )
+
         title = " ".join(
             title.split()
         )[:120].rstrip(
@@ -1407,9 +1632,19 @@ class YandexGPTClient:
         )
         auth = await self.auth_header()
 
+        custom_article_prompt = str(
+            system_prompt or ""
+        ).strip()
+
         effective_system_prompt = resolve_prompt(
             system_prompt,
             ARTICLE_SYSTEM_PROMPT,
+        )
+
+        has_custom_article_prompt = bool(
+            custom_article_prompt
+            and custom_article_prompt.strip()
+            != ARTICLE_SYSTEM_PROMPT.strip()
         )
 
         raw = await asyncio.to_thread(
@@ -1428,10 +1663,21 @@ class YandexGPTClient:
             ZoneInfo("Europe/Moscow")
         ).date()
 
-        if _temporal_review_needed(
-            title,
-            body,
-            today,
+        stale_lead_event = (
+            _has_stale_lead_event(
+                title,
+                body,
+                today,
+            )
+        )
+
+        if (
+            _temporal_review_needed(
+                title,
+                body,
+                today,
+            )
+            or stale_lead_event
         ):
             review_prompt = (
                 "ЭТАП ПРОВЕРКИ АКТУАЛЬНОСТИ.\n\n"
@@ -1442,9 +1688,45 @@ class YandexGPTClient:
                 "нельзя подавать как новые, свежие, недавние, "
                 "предстоящие или только вступающие в силу.\n\n"
 
-                "Документ прошлого года можно использовать как "
-                "действующую справочную основу, но нельзя называть "
-                "его новым только из-за найденной старой новости.\n\n"
+                "Старое событие старше 90 дней нельзя "
+                "использовать как главный инфоповод, "
+                "даже если оно описано без слов «новый» "
+                "или «недавний».\n"
+                "Не выноси такое событие в заголовок и "
+                "не начинай с него статью.\n"
+                "Это относится, например, к старой отмене "
+                "документа, старому вступлению нормы в силу, "
+                "старому изменению закона или правил.\n\n"
+
+                "Если тема пользователя широкая и не содержит "
+                "явного запроса рассказать о конкретном старом "
+                "событии, перестрой материал вокруг того, "
+                "что практически актуально СЕЙЧАС: "
+                "действующих требований, порядка действий, "
+                "документов, эксплуатации, проверок, ошибок "
+                "и рекомендаций.\n\n"
+
+                "Старое событие можно кратко упомянуть "
+                "дальше по тексту только как исторический "
+                "контекст и с корректной датой.\n\n"
+
+                "Документ или изменение прошлых лет можно использовать "
+                "как справочный или нормативный контекст, но нельзя делать "
+                "его главным инфоповодом актуальной публикации.\n\n"
+
+                "Если событие, отмена документа, изменение закона, "
+                "вступление нормы в силу или иной инфоповод произошёл "
+                "более 3 месяцев назад, не начинай с него заголовок "
+                "или первый абзац, если пользователь прямо не просил "
+                "рассказать именно об этом событии.\n\n"
+
+                "Для широкой предметной темы без явного запроса на новости "
+                "предпочитай актуальный практический материал: действующие "
+                "требования, порядок действий, документы, ошибки, проверки, "
+                "эксплуатацию и рекомендации на сегодняшний день.\n\n"
+
+                "Старое событие разрешено кратко упомянуть внутри статьи "
+                "только как исторический контекст и с корректной датой.\n\n"
 
                 "Если черновик основан на устаревшей новости, "
                 "перестрой материал в актуальный практический "
@@ -1476,15 +1758,153 @@ class YandexGPTClient:
                 reviewed_raw
             )
 
-            if _has_stale_news_claim(
-                title,
-                body,
-                today,
+            if (
+                _has_stale_news_claim(
+                    title,
+                    body,
+                    today,
+                )
+                or _has_stale_lead_event(
+                    title,
+                    body,
+                    today,
+                )
             ):
                 raise RuntimeError(
                     "Публикация отменена: "
                     "обнаружена устаревшая "
                     "новостная подача"
                 )
+
+        # ----------------------------------------
+        # FINAL CUSTOM LONG REVIEW
+        #
+        # Выполняется ПОСЛЕ freshness correction,
+        # чтобы проверка актуальности не могла
+        # случайно стереть структуру/оформление,
+        # заданные пользовательским prompt.
+        # ----------------------------------------
+
+        if has_custom_article_prompt:
+            final_review_prompt = (
+                "ЭТАП ФИНАЛЬНОЙ ПРОВЕРКИ "
+                "ПОЛЬЗОВАТЕЛЬСКОГО ПРОМПТА.\n\n"
+                "Системный промпт пользователя имеет "
+                "абсолютный приоритет по стилю, структуре "
+                "и форматированию.\n\n"
+                "Молча проверь КАЖДОЕ его требование: "
+                "структуру, обязательные фразы, порядок "
+                "блоков, rich-маркеры, жирное выделение, "
+                "курсив, подчёркивание, зачёркивание, "
+                "цитаты, списки, переносы строк, эмодзи "
+                "и ограничения объёма.\n\n"
+                "Исправь только нарушения prompt. "
+                "Факты статьи не меняй и новых фактов "
+                "не добавляй.\n\n"
+                f"ЗАГОЛОВОК: {title}\n"
+                "ТЕКСТ:\n"
+                f"{body}\n\n"
+                "Верни только окончательную статью "
+                "в формате ЗАГОЛОВОК: ... и ТЕКСТ: ..."
+            )
+
+            reviewed_raw = await asyncio.to_thread(
+                self._complete_sync,
+                auth,
+                effective_system_prompt,
+                final_review_prompt,
+            )
+
+            reviewed_title, reviewed_body = (
+                self._parse(
+                    reviewed_raw
+                )
+            )
+
+            if (
+                str(reviewed_title or "").strip()
+                and str(reviewed_body or "").strip()
+            ):
+                title = reviewed_title
+                body = reviewed_body
+
+            # После stylistic review снова держим
+            # temporal fail-safe.
+            if (
+                _has_stale_news_claim(
+                    title,
+                    body,
+                    today,
+                )
+                or _has_stale_lead_event(
+                    title,
+                    body,
+                    today,
+                )
+            ):
+                raise RuntimeError(
+                    "Публикация отменена: "
+                    "обнаружена устаревшая "
+                    "новостная подача"
+                )
+
+            if (
+                _prompt_requests_rich_markup(
+                    custom_article_prompt
+                )
+                and not _has_supported_rich_markup(
+                    body
+                )
+            ):
+                formatting_prompt = (
+                    "ЭТАП ОБЯЗАТЕЛЬНОГО "
+                    "RICH-ФОРМАТИРОВАНИЯ.\n\n"
+                    "Пользовательский системный prompt "
+                    "явно требует rich-разметку, но "
+                    "черновик пришёл обычным текстом.\n\n"
+                    "Не переписывай факты. "
+                    "Добавь только требуемое системным "
+                    "prompt форматирование и используй "
+                    "именно заданные в нём маркеры.\n\n"
+                    f"ЗАГОЛОВОК: {title}\n"
+                    "ТЕКСТ:\n"
+                    f"{body}\n\n"
+                    "Верни только окончательную статью."
+                )
+
+                formatted_raw = (
+                    await asyncio.to_thread(
+                        self._complete_sync,
+                        auth,
+                        effective_system_prompt,
+                        formatting_prompt,
+                    )
+                )
+
+                formatted_title, formatted_body = (
+                    self._parse(
+                        formatted_raw
+                    )
+                )
+
+                if (
+                    str(
+                        formatted_title or ""
+                    ).strip()
+                    and str(
+                        formatted_body or ""
+                    ).strip()
+                ):
+                    title = formatted_title
+                    body = formatted_body
+
+                if not _has_supported_rich_markup(
+                    body
+                ):
+                    raise RuntimeError(
+                        "LONG prompt требует "
+                        "форматирование, но YandexGPT "
+                        "не вернул rich-разметку"
+                    )
 
         return title, body

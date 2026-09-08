@@ -461,16 +461,48 @@ class TenantArticleService:
             subtopic or topic
         ).strip()
 
+        # ----------------------------------------
+        # АКТУАЛЬНЫЙ ПОИСК
+        #
+        # Нельзя искать только по широкой теме вроде
+        # "Огнетушитель": поисковая выдача часто
+        # поднимает старые новости, которые затем
+        # справедливо отклоняются temporal-проверкой.
+        #
+        # Сразу привязываем поиск к текущей дате и
+        # действующей практической информации.
+        # ----------------------------------------
+
+        from zoneinfo import ZoneInfo
+
+        now_local = datetime.now(
+            ZoneInfo(self.cfg.timezone)
+        )
+
+        today_text = now_local.strftime(
+            "%d.%m.%Y"
+        )
+
+        article_search_query = (
+            f"{focus_topic} "
+            f"актуально на {today_text} "
+            f"{now_local.year} "
+            "действующие требования "
+            "актуальная практика "
+            "правила применение проверка"
+        )
+
         with usage_context(
             "search_article",
             user_id=user_id,
             metadata={
                 "topic": topic,
                 "subtopic": subtopic,
+                "query": article_search_query,
             },
         ):
             sources = await self.search.search(
-                focus_topic,
+                article_search_query,
                 max_results=8,
             )
         article_prompt = (
@@ -499,21 +531,98 @@ class TenantArticleService:
             await tenant_db.get_setting(user_id, "prompt_image_template", "")
         ).strip() or DEFAULT_IMAGE_PROMPT_TEMPLATE
 
-        with usage_context(
-            "article_full",
-            user_id=user_id,
-            metadata={
-                "topic": topic,
-                "subtopic": subtopic,
-            },
+        async def generate_long(
+            source_rows,
+            *,
+            attempt: str,
         ):
-            title, body = await self.gpt.generate_article_from_sources(
-                topic=topic,
-                sources=sources,
-                subtopic=subtopic,
-                max_chars=3200,
-                system_prompt=article_prompt,
+            with usage_context(
+                "article_full",
+                user_id=user_id,
+                metadata={
+                    "topic": topic,
+                    "subtopic": subtopic,
+                    "freshness_attempt": attempt,
+                },
+            ):
+                return await self.gpt.generate_article_from_sources(
+                    topic=topic,
+                    sources=source_rows,
+                    subtopic=subtopic,
+                    max_chars=3200,
+                    system_prompt=article_prompt,
+                )
+
+        try:
+            title, body = await generate_long(
+                sources,
+                attempt="primary",
             )
+
+        except RuntimeError as exc:
+            error_text = str(exc)
+
+            if (
+                "устаревшая новостная подача"
+                not in error_text
+            ):
+                raise
+
+            # ------------------------------------
+            # EVERGREEN FALLBACK
+            #
+            # Если актуальность не удалось
+            # исправить внутри GPT-проверки,
+            # не заставляем пользователя заново
+            # запускать ту же тему.
+            #
+            # Ищем практический материал без
+            # привязки к старому инфоповоду.
+            # Пользовательский LONG prompt при
+            # этом НЕ подменяется и НЕ смешивается
+            # со встроенным fallback.
+            # ------------------------------------
+
+            log.warning(
+                "Tenant stale-news retry: "
+                "user=%s topic=%r",
+                user_id,
+                focus_topic,
+            )
+
+            fallback_query = (
+                f"{focus_topic} "
+                f"действующие требования на {today_text} "
+                f"{now_local.year} "
+                "практическое применение "
+                "эксплуатация проверка порядок "
+                "действующие правила"
+            )
+
+            with usage_context(
+                "search_article_fresh_retry",
+                user_id=user_id,
+                metadata={
+                    "topic": topic,
+                    "subtopic": subtopic,
+                    "query": fallback_query,
+                },
+            ):
+                fallback_sources = (
+                    await self.search.search(
+                        fallback_query,
+                        max_results=10,
+                    )
+                )
+
+            if not fallback_sources:
+                raise
+
+            title, body = await generate_long(
+                fallback_sources,
+                attempt="evergreen_retry",
+            )
+
         title = clean_article_text(title)
 
         # LONG body сохраняет оформление,

@@ -370,6 +370,37 @@ log = logging.getLogger(
 )
 
 
+class DzenSecurityChallengeError(RuntimeError):
+    """
+    Dzen / Yandex потребовал ручную проверку.
+
+    Мы намеренно НЕ пытаемся автоматически
+    обходить CAPTCHA, SMS, 2FA или другие
+    security challenge.
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        stage: str,
+        url: str,
+        evidence: str,
+    ) -> None:
+        self.kind = str(kind)
+        self.stage = str(stage)
+        self.url = str(url)
+        self.evidence = str(evidence)
+
+        super().__init__(
+            "Dzen security challenge detected: "
+            f"kind={self.kind}; "
+            f"stage={self.stage}; "
+            f"evidence={self.evidence}; "
+            f"url={self.url}"
+        )
+
+
 _DZEN_TOOLBAR_LABELS = {
     "bold": "Bold",
     "italic": "Italic",
@@ -413,6 +444,270 @@ class DzenRichFormatter:
             headless
         )
 
+    async def _detect_security_challenge(
+        self,
+        page: Page,
+    ) -> dict[str, str] | None:
+        """
+        Ищет сильные признаки CAPTCHA,
+        security challenge или потери авторизации.
+
+        Метод только диагностирует состояние.
+        Никаких попыток обхода проверки нет.
+        """
+
+        current_url = str(
+            page.url or ""
+        ).strip()
+
+        parsed_url = urlparse(
+            current_url
+        )
+
+        host = str(
+            parsed_url.hostname or ""
+        ).casefold()
+
+        path = str(
+            parsed_url.path or ""
+        ).casefold()
+
+        # --------------------------------------
+        # 1. URL — самый надёжный признак
+        # --------------------------------------
+
+        if (
+            "captcha" in host
+            or "captcha" in path
+            or "showcaptcha" in path
+        ):
+            return {
+                "kind": "captcha",
+                "evidence": "captcha URL",
+                "url": current_url,
+            }
+
+        if (
+            host.startswith(
+                "passport."
+            )
+            or host in {
+                "passport.yandex.ru",
+                "passport.yandex.com",
+            }
+        ):
+            return {
+                "kind": "auth_required",
+                "evidence": (
+                    "redirected to Yandex Passport"
+                ),
+                "url": current_url,
+            }
+
+        # --------------------------------------
+        # 2. DOM-признаки SmartCaptcha
+        # --------------------------------------
+
+        selectors = (
+            (
+                "smart-captcha class",
+                '[class*="SmartCaptcha"]',
+            ),
+            (
+                "smart-captcha lowercase class",
+                '[class*="smart-captcha"]',
+            ),
+            (
+                "captcha iframe",
+                'iframe[src*="captcha"]',
+            ),
+            (
+                "smartcaptcha iframe",
+                'iframe[src*="smartcaptcha"]',
+            ),
+            (
+                "captcha test id",
+                '[data-testid*="captcha"]',
+            ),
+            (
+                "captcha id",
+                '[id*="captcha"]',
+            ),
+        )
+
+        for label, selector in selectors:
+            try:
+                locator = page.locator(
+                    selector
+                )
+
+                count = min(
+                    await locator.count(),
+                    5,
+                )
+
+                for index in range(
+                    count
+                ):
+                    item = locator.nth(
+                        index
+                    )
+
+                    try:
+                        if await item.is_visible():
+                            return {
+                                "kind": "captcha",
+                                "evidence": (
+                                    f"visible DOM: {label}"
+                                ),
+                                "url": current_url,
+                            }
+
+                    except Exception:
+                        continue
+
+            except Exception:
+                continue
+
+        # --------------------------------------
+        # 3. Текстовые признаки
+        #
+        # Проверяем их только когда Draft.js
+        # редактора нет. Это уменьшает риск
+        # ложного срабатывания, если сама статья
+        # посвящена CAPTCHA.
+        # --------------------------------------
+
+        try:
+            editors = page.locator(
+                '[contenteditable="true"]'
+                '.public-DraftEditor-content'
+            )
+
+            editor_count = (
+                await editors.count()
+            )
+
+        except Exception:
+            editor_count = 0
+
+        if editor_count == 0:
+            try:
+                body_text = (
+                    await page.locator(
+                        "body"
+                    ).inner_text(
+                        timeout=3000
+                    )
+                )
+
+                normalized = " ".join(
+                    str(body_text or "")
+                    .casefold()
+                    .split()
+                )
+
+            except Exception:
+                normalized = ""
+
+            # Security-страницы обычно небольшие.
+            # На большой обычной странице Studio
+            # текстовыми эвристиками не пользуемся.
+            if (
+                normalized
+                and len(normalized) <= 6000
+            ):
+                phrases = (
+                    (
+                        "captcha",
+                        "подтвердите, что вы не робот",
+                    ),
+                    (
+                        "captcha",
+                        "я не робот",
+                    ),
+                    (
+                        "captcha",
+                        "введите символы с картинки",
+                    ),
+                    (
+                        "captcha",
+                        "verify you are human",
+                    ),
+                    (
+                        "captcha",
+                        "confirm you are not a robot",
+                    ),
+                    (
+                        "security_challenge",
+                        "проверка безопасности",
+                    ),
+                    (
+                        "security_challenge",
+                        "security check",
+                    ),
+                )
+
+                for kind, phrase in phrases:
+                    if phrase in normalized:
+                        return {
+                            "kind": kind,
+                            "evidence": (
+                                f"text phrase: {phrase!r}"
+                            ),
+                            "url": current_url,
+                        }
+
+        return None
+
+
+    async def _assert_no_security_challenge(
+        self,
+        page: Page,
+        *,
+        stage: str,
+    ) -> None:
+        detected = (
+            await self._detect_security_challenge(
+                page
+            )
+        )
+
+        if detected is None:
+            return
+
+        kind = detected.get(
+            "kind",
+            "unknown",
+        )
+
+        evidence = detected.get(
+            "evidence",
+            "unknown",
+        )
+
+        url = detected.get(
+            "url",
+            str(page.url or ""),
+        )
+
+        log.error(
+            "Dzen security challenge: "
+            "kind=%s stage=%s evidence=%s url=%s",
+            kind,
+            stage,
+            evidence,
+            url,
+        )
+
+        raise DzenSecurityChallengeError(
+            kind=kind,
+            stage=stage,
+            url=url,
+            evidence=evidence,
+        )
+
+
     async def _goto_publications(
         self,
         page: Page,
@@ -426,6 +721,11 @@ class DzenRichFormatter:
 
         await page.wait_for_timeout(
             2500
+        )
+
+        await self._assert_no_security_challenge(
+            page,
+            stage="studio_open",
         )
 
         if (
@@ -489,6 +789,11 @@ class DzenRichFormatter:
                 5000
             )
 
+            await self._assert_no_security_challenge(
+                page,
+                stage="publications_open",
+            )
+
             return
 
         raise RuntimeError(
@@ -534,6 +839,11 @@ class DzenRichFormatter:
             1,
             max_attempts + 1,
         ):
+            await self._assert_no_security_challenge(
+                page,
+                stage="find_article",
+            )
+
             links = page.locator(
                 'a[href*="/a/"]'
             )
@@ -616,6 +926,11 @@ class DzenRichFormatter:
 
                 await page.wait_for_timeout(
                     1500
+                )
+
+                await self._assert_no_security_challenge(
+                    page,
+                    stage="find_article_reload",
                 )
 
         raise RuntimeError(
@@ -701,8 +1016,19 @@ class DzenRichFormatter:
             timeout_ms: int = 20000,
         ):
             elapsed = 0
+            next_security_check = 0
 
             while elapsed < timeout_ms:
+                if elapsed >= next_security_check:
+                    await self._assert_no_security_challenge(
+                        page,
+                        stage="editor_wait",
+                    )
+
+                    next_security_check = (
+                        elapsed + 2000
+                    )
+
                 editors = page.locator(
                     '[contenteditable="true"]'
                     '.public-DraftEditor-content'
@@ -740,6 +1066,11 @@ class DzenRichFormatter:
         )
 
         await close_help_popup()
+
+        await self._assert_no_security_challenge(
+            page,
+            stage="editor_open",
+        )
 
         body = await wait_for_body(
             20000
@@ -783,6 +1114,11 @@ class DzenRichFormatter:
         )
 
         await close_help_popup()
+
+        await self._assert_no_security_challenge(
+            page,
+            stage="editor_reload",
+        )
 
         body = await wait_for_body(
             20000
@@ -1904,6 +2240,11 @@ class DzenRichFormatter:
         # ШАГ 1 — открываем финальный этап публикации
         # ------------------------------------------
 
+        await self._assert_no_security_challenge(
+            page,
+            stage="before_publish",
+        )
+
         publish = await find_visible_button(
             "Опубликовать"
         )
@@ -1916,6 +2257,15 @@ class DzenRichFormatter:
 
         await publish.click(
             force=True
+        )
+
+        await page.wait_for_timeout(
+            300
+        )
+
+        await self._assert_no_security_challenge(
+            page,
+            stage="after_publish",
         )
 
         # ------------------------------------------
@@ -1957,6 +2307,11 @@ class DzenRichFormatter:
                 "не появилась"
             )
 
+        await self._assert_no_security_challenge(
+            page,
+            stage="before_save",
+        )
+
         await save.click(
             force=True
         )
@@ -1968,10 +2323,16 @@ class DzenRichFormatter:
 
         last_status = ""
 
-        for _ in range(30):
+        for attempt in range(30):
             await page.wait_for_timeout(
                 250
             )
+
+            if attempt % 4 == 0:
+                await self._assert_no_security_challenge(
+                    page,
+                    stage="save_confirmation",
+                )
 
             last_status = await get_status()
 

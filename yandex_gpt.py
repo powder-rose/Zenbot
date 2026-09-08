@@ -1989,59 +1989,23 @@ __NO_RELEVANT_SUBTOPIC__
                 )
 
         # ----------------------------------------
-        # FINAL CUSTOM LONG REVIEW
+        # CUSTOM LONG VALIDATION
         #
-        # Выполняется ПОСЛЕ freshness correction,
-        # чтобы проверка актуальности не могла
-        # случайно стереть структуру/оформление,
-        # заданные пользовательским prompt.
+        # Пользовательский prompt уже был передан
+        # как system prompt при ОСНОВНОЙ генерации.
+        #
+        # Поэтому не делаем второй безусловный
+        # GPT-review каждой статьи.
+        #
+        # Дополнительный GPT-вызов разрешён только
+        # как точечный repair объективно
+        # обнаруженной проблемы.
         # ----------------------------------------
 
         if has_custom_article_prompt:
-            final_review_prompt = (
-                "ЭТАП ФИНАЛЬНОЙ ПРОВЕРКИ "
-                "ПОЛЬЗОВАТЕЛЬСКОГО ПРОМПТА.\n\n"
-                "Системный промпт пользователя имеет "
-                "абсолютный приоритет по стилю, структуре "
-                "и форматированию.\n\n"
-                "Молча проверь КАЖДОЕ его требование: "
-                "структуру, обязательные фразы, порядок "
-                "блоков, rich-маркеры, жирное выделение, "
-                "курсив, подчёркивание, зачёркивание, "
-                "цитаты, списки, переносы строк, эмодзи "
-                "и ограничения объёма.\n\n"
-                "Исправь только нарушения prompt. "
-                "Факты статьи не меняй и новых фактов "
-                "не добавляй.\n\n"
-                f"ЗАГОЛОВОК: {title}\n"
-                "ТЕКСТ:\n"
-                f"{body}\n\n"
-                "Верни только окончательную статью "
-                "в формате ЗАГОЛОВОК: ... и ТЕКСТ: ..."
-            )
 
-            reviewed_raw = await asyncio.to_thread(
-                self._complete_sync,
-                auth,
-                effective_system_prompt,
-                final_review_prompt,
-            )
-
-            reviewed_title, reviewed_body = (
-                self._parse(
-                    reviewed_raw
-                )
-            )
-
-            if (
-                str(reviewed_title or "").strip()
-                and str(reviewed_body or "").strip()
-            ):
-                title = reviewed_title
-                body = reviewed_body
-
-            # После stylistic review снова держим
-            # temporal fail-safe.
+            # Финальный temporal fail-safe работает
+            # локально и денег не расходует.
             if (
                 _has_stale_news_claim(
                     title,
@@ -2060,14 +2024,27 @@ __NO_RELEVANT_SUBTOPIC__
                     "новостная подача"
                 )
 
-            if (
+            rich_markup_required = (
                 _prompt_requests_rich_markup(
                     custom_article_prompt
                 )
+            )
+
+            rich_markup_missing = (
+                rich_markup_required
                 and not _has_supported_rich_markup(
                     body
                 )
-            ):
+            )
+
+            if rich_markup_missing:
+
+                log.info(
+                    "LONG custom prompt: "
+                    "rich-разметка отсутствует; "
+                    "запускаю точечный formatting repair"
+                )
+
                 formatting_prompt = (
                     "ЭТАП ОБЯЗАТЕЛЬНОГО "
                     "RICH-ФОРМАТИРОВАНИЯ.\n\n"
@@ -2118,5 +2095,34 @@ __NO_RELEVANT_SUBTOPIC__
                         "форматирование, но YandexGPT "
                         "не вернул rich-разметку"
                     )
+
+                # Repair не должен заново вносить
+                # устаревшую новостную подачу.
+                if (
+                    _has_stale_news_claim(
+                        title,
+                        body,
+                        today,
+                    )
+                    or _has_stale_lead_event(
+                        title,
+                        body,
+                        today,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Публикация отменена: "
+                        "обнаружена устаревшая "
+                        "новостная подача после "
+                        "formatting repair"
+                    )
+
+            else:
+                log.info(
+                    "LONG custom prompt: "
+                    "дополнительный GPT-review "
+                    "не требуется"
+                )
+
 
         return title, body

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from yandex_gpt import SYNCBOT_SYSTEM_PROMPT
 
-import asyncio
 
 import html
 import json
@@ -64,7 +63,6 @@ router = Router(name="paid-multiuse")
 _bot: Bot | None = None
 _cfg: Config | None = None
 _service: TenantArticleService | None = None
-_dzen_auth_tasks: set[asyncio.Task[Any]] = set()
 
 
 class PaidStates(StatesGroup):
@@ -1537,7 +1535,7 @@ async def tenant_dzen_login_received(
         "Пароль вводить в Telegram не потребуется."
     )
 
-    task = asyncio.create_task(
+    spawn_background_task(
         authorize_tenant_dzen_by_qr(
             bot=bot,
             user_id=message.from_user.id,
@@ -1545,13 +1543,8 @@ async def tenant_dzen_login_received(
             comments_url=comments_url,
             profile_dir=profile_dir,
             timeout_seconds=180,
-        )
-    )
-
-    _dzen_auth_tasks.add(task)
-
-    task.add_done_callback(
-        _dzen_auth_tasks.discard
+        ),
+        name=f"tenant-dzen-auth-{message.from_user.id}",
     )
 
 

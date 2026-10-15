@@ -1095,13 +1095,17 @@ class TenantArticleService:
             discover_subtopic
             and topic_id is not None
         ):
-            selected_subtopic = (
-                await self._select_auto_subtopic(
-                    user_id,
-                    topic_id,
-                    topic_title,
+            try:
+                selected_subtopic = (
+                    await self._select_auto_subtopic(
+                        user_id,
+                        topic_id,
+                        topic_title,
+                    )
                 )
-            )
+            except (asyncio.CancelledError, Exception):
+                await tenant_db.release_topic(user_id, topic_id)
+                raise
 
         try:
             title, body, short_body, image_bytes = (
@@ -1111,6 +1115,12 @@ class TenantArticleService:
                     subtopic=selected_subtopic,
                 )
             )
+
+        except asyncio.CancelledError:
+            if topic_id is not None:
+                await tenant_db.release_topic(user_id, topic_id)
+            raise
+
         except ContentBlockedError as exc:
             if topic_id is not None:
                 await tenant_db.mark_topic_used(

@@ -2487,16 +2487,20 @@ class ArticleService:
                 )
 
                 if discover_subtopic_now:
-                    selected_subtopic = (
-                        await self._select_auto_subtopic(
-                            topic_id,
-                            topic_title,
-                            extra_used_titles=(
-                                rejected_generation_titles
-                            ),
-                            trigger=trigger,
+                    try:
+                        selected_subtopic = (
+                            await self._select_auto_subtopic(
+                                topic_id,
+                                topic_title,
+                                extra_used_titles=(
+                                    rejected_generation_titles
+                                ),
+                                trigger=trigger,
+                            )
                         )
-                    )
+                    except (asyncio.CancelledError, Exception):
+                        await db.release_topic(topic_id)
+                        raise
                 else:
                     selected_subtopic = None
 
@@ -2514,6 +2518,10 @@ class ArticleService:
                         subtopic=selected_subtopic,
                         trigger=trigger,
                     )
+
+                except asyncio.CancelledError:
+                    await db.release_topic(topic_id)
+                    raise
 
                 except ContentBlockedError as exc:
                     await db.mark_topic_used(
@@ -2657,6 +2665,10 @@ class ArticleService:
                         full_body,
                         trigger=trigger,
                     )
+
+                except asyncio.CancelledError:
+                    await db.release_topic(topic_id)
+                    raise
 
                 except Exception as exc:
                     await db.release_topic(

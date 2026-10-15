@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Any
+from typing import Iterable, Any, Literal
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -352,6 +352,91 @@ async def record_payment(
             ),
         )
         await conn.commit()
+
+
+async def apply_stars_payment(
+    *,
+    user_id: int,
+    payload: str,
+    currency: str,
+    total_amount: int,
+    telegram_payment_charge_id: str,
+    provider_payment_charge_id: str | None,
+    expires_at: datetime,
+    is_recurring: bool,
+    is_first_recurring: bool,
+) -> Literal["duplicate", "recorded", "activated"]:
+    """Record a Stars payment and extend access in one transaction.
+
+    Duplicate charges do not change access. A new charge with an earlier or
+    equal expiry is recorded without overwriting a longer subscription.
+    """
+    await _ensure_user_row(user_id)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at = expires_at.astimezone(timezone.utc)
+    expiry = expires_at.isoformat(timespec="seconds")
+    now = _now()
+
+    async with _connect(_path()) as conn:
+        # Serialize the duplicate check and expiry comparison across writers.
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            payment = await conn.execute(
+                """
+                INSERT INTO payments(
+                    user_id,payload,currency,total_amount,telegram_payment_charge_id,
+                    provider_payment_charge_id,expires_at,is_recurring,
+                    is_first_recurring,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(telegram_payment_charge_id) DO NOTHING
+                """,
+                (
+                    user_id, payload, currency, total_amount,
+                    telegram_payment_charge_id, provider_payment_charge_id,
+                    expiry, int(bool(is_recurring)), int(bool(is_first_recurring)), now,
+                ),
+            )
+            if payment.rowcount == 0:
+                await conn.rollback()
+                return "duplicate"
+
+            cursor = await conn.execute(
+                "SELECT expires_at FROM subscriptions WHERE user_id=?", (user_id,)
+            )
+            current = await cursor.fetchone()
+            current_expiry = _parse_dt(current[0]) if current is not None else None
+            if current_expiry is not None and expires_at <= current_expiry:
+                await conn.commit()
+                return "recorded"
+
+            await conn.execute(
+                """
+                INSERT INTO subscriptions(
+                    user_id,status,starts_at,expires_at,source,stars_amount,
+                    telegram_payment_charge_id,is_recurring,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    status='active',
+                    starts_at=COALESCE(subscriptions.starts_at, excluded.starts_at),
+                    expires_at=excluded.expires_at,
+                    source=excluded.source,
+                    stars_amount=excluded.stars_amount,
+                    telegram_payment_charge_id=excluded.telegram_payment_charge_id,
+                    is_recurring=excluded.is_recurring,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    user_id, "active", now, expiry, "telegram_stars", total_amount,
+                    telegram_payment_charge_id, int(bool(is_recurring)), now,
+                ),
+            )
+            await conn.commit()
+            return "activated"
+        except BaseException:
+            # Roll back errors and cancellation, then preserve their signal.
+            await conn.rollback()
+            raise
 
 
 async def ensure_defaults(user_id: int, publish_times: Iterable[str], topics: Iterable[str]) -> None:

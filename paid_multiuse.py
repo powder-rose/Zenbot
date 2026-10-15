@@ -867,7 +867,7 @@ async def successful_payment(message: Message):
     is_recurring = bool(getattr(payment, "is_recurring", False))
     is_first = bool(getattr(payment, "is_first_recurring", False))
 
-    await tenant_db.record_payment(
+    result = await tenant_db.apply_stars_payment(
         user_id=message.from_user.id,
         payload=payment.invoice_payload,
         currency=payment.currency,
@@ -878,14 +878,13 @@ async def successful_payment(message: Message):
         is_recurring=is_recurring,
         is_first_recurring=is_first,
     )
-    await tenant_db.activate_subscription(
-        message.from_user.id,
-        expires_at=expires,
-        source="telegram_stars",
-        stars_amount=payment.total_amount,
-        telegram_payment_charge_id=payment.telegram_payment_charge_id,
-        is_recurring=is_recurring,
-    )
+    if result != "activated":
+        log.info(
+            "Stars payment did not change subscription: user=%s result=%s",
+            message.from_user.id,
+            result,
+        )
+        return
     await tenant_db.ensure_defaults(
         message.from_user.id,
         cfg.default_publish_times,

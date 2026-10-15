@@ -1,0 +1,9 @@
+# Keep development and CI text files consistent on Windows and Linux.
+/.gitattributes text eol=lf
+/pytest.ini text eol=lf
+/requirements-dev.txt text eol=lf
+/ruff.toml text eol=lf
+/scripts/*.py text eol=lf
+/tests/*.py text eol=lf
+/.github/workflows/*.yml text eol=lf
+/.github/workflows/*.yaml text eol=lf

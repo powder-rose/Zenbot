@@ -1,0 +1,81 @@
+name: Zenbot Quality Gate
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-gate-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gate:
+    name: Quality Gate (${{ matrix.os }}, Python 3.12)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHON_DOTENV_DISABLED: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+    steps:
+      - name: Check out repository and history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install application and development dependencies
+        run: python -m pip --isolated install -r requirements-dev.txt
+
+      - name: Run Quality Gate
+        shell: python
+        env:
+          GATE_EVENT: ${{ github.event_name }}
+          GATE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          import os
+          import re
+          import subprocess
+          import sys
+
+          base = os.environ['GATE_BASE_REF']
+          if re.fullmatch(r'[0-9a-f]{40}', base) is None:
+              raise SystemExit('STOP: event does not contain a valid Git base SHA.')
+
+          exists = subprocess.run(
+              ['git', 'cat-file', '-e', f'{base}^{{commit}}'],
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL,
+              check=False,
+          ).returncode == 0
+          if os.environ['GATE_EVENT'] == 'push' and not exists:
+              # A new branch has an all-zero "before" SHA. After a force-push,
+              # the previous commit may also be unavailable in the checkout.
+              base = subprocess.check_output(
+                  ['git', 'merge-base', 'HEAD', 'origin/master'], text=True
+              ).strip()
+
+          print(f'Checking committed changes against {base}', flush=True)
+          subprocess.run(
+              [sys.executable, 'scripts/quality_gate.py', '--base-ref', base],
+              check=True,
+          )

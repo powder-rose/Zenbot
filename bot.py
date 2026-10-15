@@ -46,7 +46,9 @@ from scheduler import AutoPublisher
 from tenant_scheduler import TenantScheduler
 from tenant_service import TenantArticleService
 from telegram_safe import (
+    ShutdownMiddleware,
     safe_callback_answer,
+    shutdown_background_tasks,
     spawn_background_task,
 )
 from dzen_popular_comments import DzenPopularCommentWorker
@@ -74,6 +76,8 @@ logging.basicConfig(
 log = logging.getLogger("zen-bot")
 
 dp = Dispatcher(storage=MemoryStorage())
+shutdown_middleware = ShutdownMiddleware()
+dp.update.outer_middleware(shutdown_middleware)
 dp.include_router(paid_router)
 cfg = load_config()
 
@@ -2262,6 +2266,30 @@ async def cb_ai_usage_period(
         )
 
 
+async def _close_safely(label: str, close) -> None:
+    try:
+        await close()
+    except Exception:
+        log.exception("Ошибка остановки: %s", label)
+
+
+async def _stop_polling_task(polling_task: asyncio.Task) -> None:
+    if polling_task.done():
+        return
+    stop_task = asyncio.create_task(dp.stop_polling())
+    try:
+        done, _ = await asyncio.wait(
+            {polling_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if stop_task in done and not polling_task.done():
+            await stop_task
+    finally:
+        for task in (stop_task, polling_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stop_task, polling_task, return_exceptions=True)
+
+
 async def main():
     global service, scheduler, tenant_service, tenant_scheduler, popular_comment_worker, comment_responder_worker, tenant_dzen_manager
 
@@ -2289,104 +2317,119 @@ async def main():
 
     bot = Bot(token=cfg.bot_token)
 
-    cloudpayments_webhook = CloudPaymentsWebhookServer(
-        bot=bot,
-    )
-    await cloudpayments_webhook.start()
+    cloudpayments_webhook = None
+    service = scheduler = tenant_service = tenant_scheduler = None
+    popular_comment_worker = comment_responder_worker = tenant_dzen_manager = None
+    tasks: list[asyncio.Task] = []
+    polling_task: asyncio.Task | None = None
 
-
-    service = ArticleService(
-        bot=bot,
-        cfg=cfg,
-        gpt_client=gpt_client,
-        search_client=search_client,
-        art_client=art_client,
-    )
-    scheduler = AutoPublisher(service, cfg)
-
-    popular_comment_worker = DzenPopularCommentWorker(
-        article_service=service,
-        gpt_client=gpt_client,
-        cfg=cfg,
-    )
-
-    comment_responder_worker = DzenCommentResponderWorker(
-        gpt_client=gpt_client,
-        cfg=cfg,
-    )
-
-
-    tenant_service = TenantArticleService(
-        bot=bot,
-        cfg=cfg,
-        gpt_client=gpt_client,
-        search_client=search_client,
-        art_client=art_client,
-    )
-
-    tenant_dzen_manager = TenantDzenManager(
-        gpt_client=gpt_client,
-        cfg=cfg,
-        article_service=tenant_service,
-    )
-    tenant_scheduler = TenantScheduler(tenant_service, cfg)
-    configure_paid_multiuse(
-        bot=bot,
-        cfg=cfg,
-        service=tenant_service,
-    )
-
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Открыть бота"),
-        BotCommand(command="help", description="Помощь по работе с ботом"),
-        BotCommand(command="admin", description="Панель администратора"),
-        BotCommand(command="cabinet", description="Мой кабинет"),
-        BotCommand(command="buy", description="Оплатить подписку"),
-        BotCommand(command="subscription", description="Моя подписка"),
-        BotCommand(command="dzencomment", description="Управление статьями по комментариям Дзена"),
-        BotCommand(command="dzenreply", description="Автоответы на комментарии Дзена"),
-    ])
-
-    scheduler_task = asyncio.create_task(scheduler.run())
-    tenant_scheduler_task = asyncio.create_task(tenant_scheduler.run())
-
-    # Legacy Dzen workers больше не запускаются фоном.
-    # Они остаются доступны для ручных admin-команд.
-    # Автоматический Dzen обслуживает TenantDzenManager.
-    tenant_dzen_manager_task = asyncio.create_task(
-        tenant_dzen_manager.run()
-    )
     try:
-        await dp.start_polling(bot)
+        cloudpayments_webhook = CloudPaymentsWebhookServer(
+            bot=bot,
+        )
+        await cloudpayments_webhook.start()
+
+
+        service = ArticleService(
+            bot=bot,
+            cfg=cfg,
+            gpt_client=gpt_client,
+            search_client=search_client,
+            art_client=art_client,
+        )
+        scheduler = AutoPublisher(service, cfg)
+
+        popular_comment_worker = DzenPopularCommentWorker(
+            article_service=service,
+            gpt_client=gpt_client,
+            cfg=cfg,
+        )
+
+        comment_responder_worker = DzenCommentResponderWorker(
+            gpt_client=gpt_client,
+            cfg=cfg,
+        )
+
+
+        tenant_service = TenantArticleService(
+            bot=bot,
+            cfg=cfg,
+            gpt_client=gpt_client,
+            search_client=search_client,
+            art_client=art_client,
+        )
+
+        tenant_dzen_manager = TenantDzenManager(
+            gpt_client=gpt_client,
+            cfg=cfg,
+            article_service=tenant_service,
+        )
+        tenant_scheduler = TenantScheduler(tenant_service, cfg)
+        configure_paid_multiuse(
+            bot=bot,
+            cfg=cfg,
+            service=tenant_service,
+        )
+
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Открыть бота"),
+            BotCommand(command="help", description="Помощь по работе с ботом"),
+            BotCommand(command="admin", description="Панель администратора"),
+            BotCommand(command="cabinet", description="Мой кабинет"),
+            BotCommand(command="buy", description="Оплатить подписку"),
+            BotCommand(command="subscription", description="Моя подписка"),
+            BotCommand(command="dzencomment", description="Управление статьями по комментариям Дзена"),
+            BotCommand(command="dzenreply", description="Автоответы на комментарии Дзена"),
+        ])
+
+        tasks.append(asyncio.create_task(scheduler.run(), name="scheduler"))
+        tasks.append(asyncio.create_task(tenant_scheduler.run(), name="tenant-scheduler"))
+        tasks.append(asyncio.create_task(tenant_dzen_manager.run(), name="tenant-dzen-manager"))
+        # This application owns the session until every dependent task is stopped.
+        polling_task = asyncio.create_task(
+            dp.start_polling(bot, close_bot_session=False), name="telegram-polling"
+        )
+        # Let the dispatcher stop its own children even if main() is cancelled.
+        await asyncio.shield(polling_task)
     finally:
-        scheduler.stop()
-        tenant_scheduler.stop()
-        popular_comment_worker.stop()
-        comment_responder_worker.stop()
-        tenant_dzen_manager.stop()
-        scheduler_task.cancel()
-        tenant_scheduler_task.cancel()
-        tenant_dzen_manager_task.cancel()
-
-        for task in (
-            scheduler_task,
-            tenant_scheduler_task,
-            tenant_dzen_manager_task,
+        shutdown_middleware.stop()
+        for component in (
+            scheduler, tenant_scheduler, popular_comment_worker,
+            comment_responder_worker, tenant_dzen_manager,
         ):
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            if component is not None:
+                try:
+                    component.stop()
+                except Exception:
+                    log.exception("Ошибка сигнала остановки: %s", type(component).__name__)
 
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        if polling_task is not None:
+            await _close_safely(
+                "Telegram polling", lambda: _stop_polling_task(polling_task)
+            )
+
+        # Stop incoming payments and await their handlers while the session is open.
+        if cloudpayments_webhook is not None:
+            await _close_safely("CloudPayments webhook", cloudpayments_webhook.stop)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results):
+            if isinstance(result, Exception):
+                log.error(
+                    "Ошибка фоновой службы при остановке: %s",
+                    task.get_name(),
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
+        await _close_safely("Telegram handlers", shutdown_middleware.close)
+        await _close_safely("Background jobs", shutdown_background_tasks)
         if service is not None:
-            try:
-                await service.close()
-            except Exception:
-                log.exception("Ошибка закрытия Telegram Web publisher")
-
-        await cloudpayments_webhook.stop()
-
-        await bot.session.close()
+            await _close_safely("Article service", service.close)
+        await _close_safely("Bot API session", bot.session.close)
 
 if __name__ == "__main__":
     asyncio.run(main())

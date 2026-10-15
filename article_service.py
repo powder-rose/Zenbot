@@ -1400,7 +1400,25 @@ class ArticleService:
         )
 
     async def close(self) -> None:
-        await self.telegram_web.close()
+        tasks = tuple(self.background_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for task, result in zip(tasks, results):
+                if isinstance(result, Exception):
+                    log.error(
+                        "Background publication task failed during shutdown: %s",
+                        task.get_name(),
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+        finally:
+            self.background_tasks.difference_update(
+                task for task in tasks if task.done()
+            )
+            await self.telegram_web.close()
 
 
     async def _select_auto_subtopic(

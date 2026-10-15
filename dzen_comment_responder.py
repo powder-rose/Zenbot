@@ -385,17 +385,19 @@ class DzenCommentResponderWorker:
     async def _wait_for_stop_or_wake(self) -> None:
         stop_task = asyncio.create_task(self._stop.wait())
         wake_task = asyncio.create_task(self._wake.wait())
-        done, pending = await asyncio.wait(
-            {stop_task, wake_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-        for task in done:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        tasks = (stop_task, wake_task)
+
+        try:
+            await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_once(self, *, force: bool = False) -> dict[str, Any]:
         if not self.enabled and not force:

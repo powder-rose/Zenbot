@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Any
@@ -27,6 +29,14 @@ def _path() -> Path:
     return DB_PATH
 
 
+@asynccontextmanager
+async def _connect(path: Path) -> AsyncIterator[aiosqlite.Connection]:
+    """Enable declared relationships on each tenant connection before queries."""
+    async with aiosqlite.connect(path) as conn:
+        await conn.execute("PRAGMA foreign_keys=ON")
+        yield conn
+
+
 def _topic_key(title: str) -> str:
     return " ".join(title.split()).casefold()
 
@@ -47,7 +57,7 @@ async def init_db(path: Path) -> None:
     global DB_PATH
     DB_PATH = path
     path.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(path) as conn:
+    async with _connect(path) as conn:
         await conn.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -189,7 +199,7 @@ async def init_db(path: Path) -> None:
 
 async def _ensure_user_row(user_id: int) -> None:
     now = _now()
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """INSERT OR IGNORE INTO app_users
                (user_id, created_at, updated_at) VALUES (?, ?, ?)""",
@@ -203,7 +213,7 @@ async def touch_user(user: Any) -> None:
         return
     user_id = int(user.id)
     now = _now()
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             INSERT INTO app_users(user_id, username, first_name, last_name, language_code, created_at, updated_at)
@@ -229,7 +239,7 @@ async def touch_user(user: Any) -> None:
 
 
 async def subscription_info(user_id: int):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (user_id,))
         return await cur.fetchone()
@@ -257,7 +267,7 @@ async def activate_subscription(
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     expiry = expires_at.astimezone(timezone.utc).isoformat(timespec="seconds")
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             INSERT INTO subscriptions(
@@ -297,7 +307,7 @@ async def grant_subscription(user_id: int, days: int = 30) -> datetime:
 
 async def revoke_subscription(user_id: int) -> None:
     await _ensure_user_row(user_id)
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             INSERT INTO subscriptions(user_id,status,updated_at)
@@ -327,7 +337,7 @@ async def record_payment(
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         expiry = expires_at.astimezone(timezone.utc).isoformat(timespec="seconds")
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             INSERT OR IGNORE INTO payments(
@@ -347,7 +357,7 @@ async def record_payment(
 async def ensure_defaults(user_id: int, publish_times: Iterable[str], topics: Iterable[str]) -> None:
     await _ensure_user_row(user_id)
     now = _now()
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             "INSERT OR IGNORE INTO tenant_settings(user_id,key,value) VALUES(?,?,?)",
             (user_id, "auto_publish_enabled", "1"),
@@ -429,7 +439,7 @@ async def migrate_default_schedules(
 
     migrated = 0
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
 
@@ -505,7 +515,7 @@ async def migrate_default_schedules(
 
 
 async def get_setting(user_id: int, key: str, default: str = "") -> str:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             "SELECT value FROM tenant_settings WHERE user_id=? AND key=?", (user_id, key)
         )
@@ -515,7 +525,7 @@ async def get_setting(user_id: int, key: str, default: str = "") -> str:
 
 async def set_setting(user_id: int, key: str, value: str) -> None:
     await _ensure_user_row(user_id)
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             INSERT INTO tenant_settings(user_id,key,value) VALUES(?,?,?)
@@ -537,7 +547,7 @@ async def set_auto_publish_enabled(user_id: int, enabled: bool) -> None:
 async def connect_channel(user_id: int, *, chat_id: int, title: str, username: str | None) -> str:
     await _ensure_user_row(user_id)
     now = _now()
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute("SELECT user_id FROM tenant_channels WHERE chat_id=?", (chat_id,))
         row = await cur.fetchone()
@@ -559,7 +569,7 @@ async def connect_channel(user_id: int, *, chat_id: int, title: str, username: s
 
 
 async def list_channels(user_id: int):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             "SELECT * FROM tenant_channels WHERE user_id=? AND active=1 ORDER BY id", (user_id,)
@@ -568,7 +578,7 @@ async def list_channels(user_id: int):
 
 
 async def channel_count(user_id: int) -> int:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             "SELECT COUNT(*) FROM tenant_channels WHERE user_id=? AND active=1", (user_id,)
         )
@@ -576,7 +586,7 @@ async def channel_count(user_id: int) -> int:
 
 
 async def remove_channel(user_id: int, channel_id: int) -> bool:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             "UPDATE tenant_channels SET active=0,updated_at=? WHERE user_id=? AND id=? AND active=1",
             (_now(), user_id, channel_id),
@@ -588,7 +598,7 @@ async def remove_channel(user_id: int, channel_id: int) -> bool:
 async def add_topics(user_id: int, titles: Iterable[str]) -> int:
     await _ensure_user_row(user_id)
     count = 0
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         for raw in titles:
             title = " ".join(str(raw).split())
             if not title:
@@ -620,14 +630,14 @@ async def list_topics(user_id: int, mode: str = "unused", limit: int = 50):
         LIMIT ?
     """
     params.append(limit)
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(sql, params)
         return await cur.fetchall()
 
 
 async def get_topic(user_id: int, topic_id: int):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             "SELECT * FROM tenant_topics WHERE user_id=? AND id=?", (user_id, topic_id)
@@ -640,7 +650,7 @@ async def update_topic(user_id: int, topic_id: int, new_title: str) -> bool:
     if not title:
         return False
     try:
-        async with aiosqlite.connect(_path()) as conn:
+        async with _connect(_path()) as conn:
             cur = await conn.execute(
                 "UPDATE tenant_topics SET title=?,title_key=? WHERE user_id=? AND id=?",
                 (title, _topic_key(title), user_id, topic_id),
@@ -652,7 +662,7 @@ async def update_topic(user_id: int, topic_id: int, new_title: str) -> bool:
 
 
 async def deactivate_topic(user_id: int, topic_id: int) -> bool:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             "UPDATE tenant_topics SET active=0,reserved=0 WHERE user_id=? AND id=?",
             (user_id, topic_id),
@@ -663,7 +673,7 @@ async def deactivate_topic(user_id: int, topic_id: int) -> bool:
 
 
 async def _ensure_priority_columns() -> None:
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         cur = await conn.execute(
@@ -706,7 +716,7 @@ async def add_priority_topics(
     count = 0
     seen = set()
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
 
@@ -782,7 +792,7 @@ async def list_priority_topics(
 ):
     await _ensure_priority_columns()
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         conn.row_factory = aiosqlite.Row
@@ -814,7 +824,7 @@ async def clear_topic_priority(
 ) -> bool:
     await _ensure_priority_columns()
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         cur = await conn.execute(
@@ -853,7 +863,7 @@ async def reserve_random_topic(
     user_id = int(user_id)
 
     async with _DB_LOCK:
-        async with aiosqlite.connect(
+        async with _connect(
             _path()
         ) as conn:
             conn.row_factory = aiosqlite.Row
@@ -1025,7 +1035,7 @@ async def reserve_random_topic(
             return dict(row)
 
 async def release_topic(user_id: int, topic_id: int) -> None:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             "UPDATE tenant_topics SET reserved=0 WHERE user_id=? AND id=?", (user_id, topic_id)
         )
@@ -1039,7 +1049,7 @@ async def mark_topic_used(
 ) -> None:
     await _ensure_priority_columns()
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         await conn.execute(
@@ -1063,7 +1073,7 @@ async def mark_topic_used(
         await conn.commit()
 
 async def list_schedule(user_id: int):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             "SELECT * FROM tenant_schedule WHERE user_id=? AND enabled=1 ORDER BY publish_time", (user_id,)
@@ -1077,7 +1087,7 @@ async def add_schedule_time(user_id: int, value: str) -> bool:
         return False
     await _ensure_user_row(user_id)
     try:
-        async with aiosqlite.connect(_path()) as conn:
+        async with _connect(_path()) as conn:
             cur = await conn.execute(
                 "INSERT OR IGNORE INTO tenant_schedule(user_id,publish_time,enabled) VALUES(?,?,1)",
                 (user_id, value),
@@ -1089,7 +1099,7 @@ async def add_schedule_time(user_id: int, value: str) -> bool:
 
 
 async def delete_schedule_time(user_id: int, schedule_id: int) -> bool:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             "DELETE FROM tenant_schedule WHERE user_id=? AND id=?", (user_id, schedule_id)
         )
@@ -1102,7 +1112,7 @@ async def claim_due_users(publish_time: str, slot_key: str) -> list[int]:
     now_iso = _now()
     claimed: list[int] = []
     async with _DB_LOCK:
-        async with aiosqlite.connect(_path()) as conn:
+        async with _connect(_path()) as conn:
             conn.row_factory = aiosqlite.Row
             await conn.execute("BEGIN IMMEDIATE")
             cur = await conn.execute(
@@ -1155,7 +1165,7 @@ async def ensure_tenant_dzen_account(
         f"/app/data/tenant_dzen/u{int(user_id)}/state.json"
     )
 
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
 
         await conn.execute(
@@ -1212,7 +1222,7 @@ async def ensure_tenant_dzen_account(
 
 
 async def tenant_dzen_account(user_id: int):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
 
         cur = await conn.execute(
@@ -1233,7 +1243,7 @@ async def set_tenant_dzen_comments_url(
 ) -> None:
     await ensure_tenant_dzen_account(user_id)
 
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             UPDATE tenant_dzen_accounts
@@ -1257,7 +1267,7 @@ async def set_tenant_dzen_enabled(
 ) -> None:
     await ensure_tenant_dzen_account(user_id)
 
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             """
             UPDATE tenant_dzen_accounts
@@ -1276,7 +1286,7 @@ async def set_tenant_dzen_enabled(
 
 
 async def list_enabled_tenant_dzen_accounts():
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
 
         cur = await conn.execute(
@@ -1321,7 +1331,7 @@ async def successful_dzen_replies_today(
         timezone.utc
     ).isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             """
             SELECT COUNT(*)
@@ -1348,7 +1358,7 @@ async def record_tenant_dzen_reply(
 ) -> bool:
     await _ensure_user_row(user_id)
 
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             """
             INSERT OR IGNORE INTO tenant_dzen_replies(
@@ -1438,7 +1448,7 @@ async def successful_publications_today(
         WHERE {' AND '.join(conditions)}
     """
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         cur = await conn.execute(
@@ -1452,7 +1462,7 @@ async def successful_publications_today(
 
 
 async def _ensure_subtopic_history() -> None:
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         await conn.execute(
@@ -1499,7 +1509,7 @@ async def list_recent_article_titles(
     Используются для защиты от публикации
     похожих статей подряд.
     """
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
 
@@ -1542,7 +1552,7 @@ async def list_used_subtopics(
         parent_topic
     )
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         cur = await conn.execute(
@@ -1590,7 +1600,7 @@ async def record_used_subtopic(
     if not value:
         return
 
-    async with aiosqlite.connect(
+    async with _connect(
         _path()
     ) as conn:
         await conn.execute(
@@ -1633,7 +1643,7 @@ async def create_publication(
     image_path: str | None,
     trigger_type: str,
 ) -> int:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         cur = await conn.execute(
             """
             INSERT INTO tenant_publications(
@@ -1654,7 +1664,7 @@ async def finish_publication(
     channels_published: int = 0,
     error: str | None = None,
 ) -> None:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         await conn.execute(
             "UPDATE tenant_publications SET status=?,channels_published=?,error=? WHERE id=?",
             (status, channels_published, error, publication_id),
@@ -1663,7 +1673,7 @@ async def finish_publication(
 
 
 async def stats(user_id: int) -> dict[str, Any]:
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         total = int((await (await conn.execute(
             "SELECT COUNT(*) FROM tenant_publications WHERE user_id=?", (user_id,)
@@ -1693,7 +1703,7 @@ async def stats(user_id: int) -> dict[str, Any]:
 
 async def platform_stats() -> dict[str, int]:
     now = _now()
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         users = int((await (await conn.execute("SELECT COUNT(*) FROM app_users")).fetchone())[0])
         active = int((await (await conn.execute(
             "SELECT COUNT(*) FROM subscriptions WHERE status='active' AND expires_at>?", (now,)
@@ -1715,7 +1725,7 @@ async def platform_stats() -> dict[str, int]:
 
 
 async def list_users(limit: int = 30):
-    async with aiosqlite.connect(_path()) as conn:
+    async with _connect(_path()) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute(
             """

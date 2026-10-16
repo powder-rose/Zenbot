@@ -6,6 +6,7 @@ from yandex_gpt import ContentBlockedError
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +34,11 @@ from yandex_gpt import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class PublicationCheckpointError(RuntimeError):
+    """Telegram confirmed a message, but saving the confirmation failed."""
+
 
 TENANT_DAILY_ARTICLE_LIMIT = 5
 TENANT_DAILY_POPULAR_ARTICLE_LIMIT = 1
@@ -873,6 +879,8 @@ class TenantArticleService:
         full_body: str,
         short_body: str,
         image_bytes: bytes,
+        *,
+        on_telegram_sent: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Публикация одного tenant-канала
@@ -886,6 +894,7 @@ class TenantArticleService:
             full_body=full_body,
             short_body=short_body,
             image_bytes=image_bytes,
+            on_telegram_sent=on_telegram_sent,
         )
 
 
@@ -896,6 +905,8 @@ class TenantArticleService:
         full_body: str,
         short_body: str,
         image_bytes: bytes,
+        *,
+        publication_id: int,
     ) -> tuple[int, list[str]]:
         """
         Публикует статью во все активные
@@ -915,6 +926,42 @@ class TenantArticleService:
         published = 0
         errors: list[str] = []
 
+        async def record_telegram_sent(chat_id: int, message_id: int) -> None:
+            nonlocal published
+            published += 1
+            checkpoint = asyncio.create_task(
+                tenant_db.finish_publication(
+                    publication_id,
+                    status="published",
+                    channels_published=published,
+                    error="; ".join(errors)[:2000] if errors else None,
+                ),
+                name=f"tenant-publication-checkpoint-{publication_id}",
+            )
+            cancelled = False
+            try:
+                # Finish the confirmed write before propagating shutdown.
+                # The parent owns and awaits this task until completion.
+                while not checkpoint.done():
+                    try:
+                        await asyncio.shield(checkpoint)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                checkpoint.result()
+            except Exception as exc:
+                log.exception(
+                    "Tenant Telegram confirmed but checkpoint failed: "
+                    "publication=%s user=%s channel=%s message=%s",
+                    publication_id, user_id, chat_id, message_id,
+                )
+                if cancelled:
+                    raise asyncio.CancelledError from exc
+                raise PublicationCheckpointError(
+                    f"Failed to save publication checkpoint: {exc}"
+                ) from exc
+            if cancelled:
+                raise asyncio.CancelledError
+
         for channel in channels:
             chat_id = int(
                 channel["chat_id"]
@@ -928,6 +975,7 @@ class TenantArticleService:
                     full_body,
                     short_body,
                     image_bytes,
+                    on_telegram_sent=record_telegram_sent,
                 )
 
                 short_message_id = result.get(
@@ -939,8 +987,6 @@ class TenantArticleService:
                         "Tenant pipeline "
                         "не вернул short_message_id"
                     )
-
-                published += 1
 
                 dzen_result = (
                     result.get(
@@ -987,6 +1033,9 @@ class TenantArticleService:
                             ),
                         )
 
+            except PublicationCheckpointError:
+                # Do not send more posts after losing a confirmed DB write.
+                raise
             except Exception as exc:
                 log.exception(
                     "Ошибка публикации tenant "
@@ -1220,6 +1269,7 @@ class TenantArticleService:
             body,
             short_body,
             image_bytes,
+            publication_id=publication_id,
         )
         if published > 0:
             await tenant_db.finish_publication(

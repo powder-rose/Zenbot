@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -896,6 +897,7 @@ class TenantPublishPipeline:
         full_body: str,
         short_body: str,
         image_bytes: bytes,
+        on_telegram_sent: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         """
         Полный pipeline одного tenant-канала.
@@ -956,6 +958,10 @@ class TenantPublishPipeline:
                 "short_message_id"
             ] = short_message_id
 
+            # Persist the confirmed Telegram post before waiting for Dzen.
+            if on_telegram_sent is not None:
+                await on_telegram_sent(chat_id, short_message_id)
+
             result[
                 "dzen"
             ] = await self._publish_to_dzen(
@@ -985,6 +991,9 @@ class TenantPublishPipeline:
             result[
                 "short_message_id"
             ] = short_message_id
+
+            if on_telegram_sent is not None:
+                await on_telegram_sent(chat_id, short_message_id)
 
         log.info(
             "Tenant publish complete: "

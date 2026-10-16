@@ -40,6 +40,16 @@ class PublicationCheckpointError(RuntimeError):
     """Telegram confirmed a message, but saving the confirmation failed."""
 
 
+class _SimilarArticleTitleError(Exception):
+    """Reject a generated LONG title before paying for SHORT and an image."""
+
+    def __init__(self, title: str, similar_to: str, similarity: float) -> None:
+        super().__init__("Generated article title is too similar to a recent article")
+        self.title = title
+        self.similar_to = similar_to
+        self.similarity = similarity
+
+
 TENANT_DAILY_ARTICLE_LIMIT = 5
 TENANT_DAILY_POPULAR_ARTICLE_LIMIT = 1
 POPULAR_COMMENT_TRIGGER = "popular_comment"
@@ -815,6 +825,17 @@ class TenantArticleService:
         # указанное пользовательским промптом.
         body = clean_short_article_text(body)
 
+        # Проверяем итоговый LONG-заголовок до платных SHORT и картинки.
+        # Проверка действует и после повторной генерации устаревшей статьи.
+        recent_titles = await tenant_db.list_recent_article_titles(user_id, limit=15)
+        similar_title, title_similarity = _find_similar_article_title(
+            title,
+            recent_titles,
+            threshold=0.58,
+        )
+        if similar_title is not None:
+            raise _SimilarArticleTitleError(title, similar_title, title_similarity)
+
         # SHORT создаётся строго из уже готовой LONG-статьи.
         # Пользовательский prompt_short_system имеет абсолютный
         # приоритет и не смешивается со стандартным fallback.
@@ -1200,6 +1221,25 @@ class TenantArticleService:
                 await tenant_db.release_topic(user_id, topic_id)
             raise
 
+        except _SimilarArticleTitleError as exc:
+            log.warning(
+                "Tenant final title rejected: "
+                "user=%s score=%.3f candidate=%r previous=%r",
+                user_id,
+                exc.similarity,
+                exc.title,
+                exc.similar_to,
+            )
+            if topic_id is not None:
+                await tenant_db.release_topic(user_id, topic_id)
+            return {
+                "status": "similar_article_skipped",
+                "topic": topic_title,
+                "article_title": exc.title,
+                "similar_to": exc.similar_to,
+                "similarity": round(exc.similarity, 3),
+            }
+
         except ContentBlockedError as exc:
             if topic_id is not None:
                 await tenant_db.mark_topic_used(
@@ -1225,57 +1265,6 @@ class TenantArticleService:
                 await tenant_db.release_topic(user_id, topic_id)
             log.exception("Ошибка генерации tenant user=%s topic=%s", user_id, topic_title)
             return {"status": "generation_error", "topic": topic_title, "error": str(exc)}
-
-        # ----------------------------------------
-        # Финальная защита от похожих статей.
-        #
-        # Даже если подтема прошла проверку,
-        # GPT может сформулировать итоговый заголовок
-        # слишком похоже на недавнюю публикацию.
-        # ----------------------------------------
-
-        recent_titles = (
-            await tenant_db.list_recent_article_titles(
-                user_id,
-                limit=15,
-            )
-        )
-
-        similar_title, title_similarity = (
-            _find_similar_article_title(
-                title,
-                recent_titles,
-                threshold=0.58,
-            )
-        )
-
-        if similar_title is not None:
-            log.warning(
-                "Tenant final title rejected: "
-                "user=%s score=%.3f "
-                "candidate=%r previous=%r",
-                user_id,
-                title_similarity,
-                title,
-                similar_title,
-            )
-
-            if topic_id is not None:
-                await tenant_db.release_topic(
-                    user_id,
-                    topic_id,
-                )
-
-            return {
-                "status": "similar_article_skipped",
-                "topic": topic_title,
-                "article_title": title,
-                "similar_to": similar_title,
-                "similarity": round(
-                    title_similarity,
-                    3,
-                ),
-            }
 
         image_path: Path = self.image_dir / f"u{user_id}_{_stamp()}.jpg"
         image_path.write_bytes(image_bytes)

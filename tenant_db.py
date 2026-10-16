@@ -1234,6 +1234,28 @@ async def claim_due_users(publish_time: str, slot_key: str) -> list[int]:
     return claimed
 
 
+async def release_unstarted_auto_slots(user_ids: Iterable[int], slot_key: str) -> None:
+    """Release this batch's markers only for users whose publication never started."""
+    users = sorted({int(user_id) for user_id in user_ids})
+    if not users:
+        return
+    async with _DB_LOCK:
+        async with _connect(_path()) as conn:
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                await conn.executemany(
+                    """
+                    UPDATE tenant_settings SET value=''
+                    WHERE user_id=? AND key='last_auto_slot' AND value=?
+                    """,
+                    [(user_id, slot_key) for user_id in users],
+                )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+
 async def ensure_tenant_dzen_account(
     user_id: int,
     comments_url: str = "",

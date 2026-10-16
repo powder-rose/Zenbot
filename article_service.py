@@ -2024,6 +2024,7 @@ class ArticleService:
             "publication_id": publication_id,
             "telegram": "pending",
         }
+        public_message_id: int | None = None
 
         try:
             if not image_bytes:
@@ -2167,13 +2168,24 @@ class ArticleService:
                 public_message_id,
             )
 
-            await db.set_telegram_result(
-                publication_id,
-                "published",
-                message_id=str(
-                    public_message_id
+            checkpoint = asyncio.create_task(
+                db.set_telegram_result(
+                    publication_id,
+                    "published",
+                    message_id=str(public_message_id),
                 ),
+                name=f"admin-publication-checkpoint-{publication_id}",
             )
+            cancelled = False
+            # Own this write until completion, including during shutdown.
+            while not checkpoint.done():
+                try:
+                    await asyncio.shield(checkpoint)
+                except asyncio.CancelledError:
+                    cancelled = True
+            checkpoint.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
             async def replace_after_dzen_sync() -> None:
                 dzen_ready = False
@@ -2366,6 +2378,22 @@ class ArticleService:
             ] = "photo_caption_html"
 
         except Exception as exc:
+            if public_message_id is not None:
+                # A storage or follow-up failure cannot undo a sent post.
+                # Keep any committed success and surface the failure separately.
+                log.exception(
+                    "Telegram confirmed but subsequent processing failed: "
+                    "publication=%s channel=%s message=%s",
+                    publication_id,
+                    self.cfg.telegram_channel_id,
+                    public_message_id,
+                )
+                raise RuntimeError(
+                    f"Пост {public_message_id} уже отправлен в Telegram "
+                    f"(публикация {publication_id}), "
+                    f"но дальнейшая обработка завершилась ошибкой: {exc}"
+                ) from exc
+
             log.exception(
                 "Ошибка публикации Dzen seed "
                 "через Bot API"

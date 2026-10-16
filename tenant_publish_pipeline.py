@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
 
 import tenant_db
@@ -18,6 +19,9 @@ from dzen_rich_formatter import (
 
 
 log = logging.getLogger(__name__)
+
+
+TelegramProgressCallback = Callable[[int, tuple[int, ...], bool], Awaitable[None]]
 
 
 class TenantPublishPipeline:
@@ -585,10 +589,13 @@ class TenantPublishPipeline:
         title: str,
         short_body: str,
         image_bytes: bytes,
+        on_telegram_progress: TelegramProgressCallback | None = None,
     ) -> int:
         """
-        Сохраняем существующее поведение tenant_service:
-        сначала Rich Message, затем безопасный fallback.
+        Запасная отправка допустима до запроса или после явного отказа
+        Telegram принять Rich Message. Неопределённый результат отправки
+        и требование паузы передаём вызывающему коду без новой отправки.
+        Progress callback receives confirmed IDs and a complete-send flag.
         """
 
         try:
@@ -597,24 +604,39 @@ class TenantPublishPipeline:
                 short_body,
                 image_bytes,
             )
-
-            message = await self.bot.send_rich_message(
-                chat_id=chat_id,
-                rich_message=rich,
-            )
-
-            return int(
-                message.message_id
-            )
-
         except Exception as rich_exc:
+            # No request was made, so a formatting failure allows fallback.
             log.warning(
-                "Tenant SHORT Rich Message "
-                "недоступен channel=%s: %s. "
-                "Использую fallback.",
+                "Tenant SHORT Rich Message: подготовка не удалась "
+                "channel=%s: %s. Использую fallback до отправки.",
                 chat_id,
                 rich_exc,
+                exc_info=True,
             )
+        else:
+            send_rich = getattr(self.bot, "send_rich_message", None)
+            if send_rich is None:
+                log.warning(
+                    "Tenant SHORT Rich Message: метод отсутствует в SDK "
+                    "channel=%s. Использую fallback до отправки.",
+                    chat_id,
+                )
+            else:
+                try:
+                    message = await send_rich(
+                        chat_id=chat_id,
+                        rich_message=rich,
+                    )
+                except TelegramBadRequest as rich_exc:
+                    # An explicit rejection differs from a lost response.
+                    log.warning(
+                        "Tenant SHORT Rich Message: Telegram отклонил запрос "
+                        "channel=%s: %s. Использую fallback.",
+                        chat_id,
+                        rich_exc,
+                    )
+                else:
+                    return int(message.message_id)
 
         image = BufferedInputFile(
             image_bytes,
@@ -633,6 +655,10 @@ class TenantPublishPipeline:
         text = str(
             short_body or ""
         ).strip()
+        photo_id = int(photo.message_id)
+        confirmed = [photo_id]
+        if on_telegram_progress is not None:
+            await on_telegram_progress(chat_id, tuple(confirmed), not text)
 
         while text:
             chunk = text[:4000]
@@ -648,7 +674,7 @@ class TenantPublishPipeline:
                 if cut > 2500:
                     chunk = chunk[:cut]
 
-            await self.bot.send_message(
+            message = await self.bot.send_message(
                 chat_id=chat_id,
                 text=chunk,
             )
@@ -656,10 +682,13 @@ class TenantPublishPipeline:
             text = text[
                 len(chunk):
             ].lstrip()
+            if on_telegram_progress is not None:
+                # Only IDs from actual replies are confirmation evidence.
+                # Complete the DB write before issuing another request.
+                confirmed.append(int(message.message_id))
+                await on_telegram_progress(chat_id, tuple(confirmed), not text)
 
-        return int(
-            photo.message_id
-        )
+        return photo_id
 
 
     async def _publish_to_dzen(
@@ -898,6 +927,7 @@ class TenantPublishPipeline:
         short_body: str,
         image_bytes: bytes,
         on_telegram_sent: Callable[[int, int], Awaitable[None]] | None = None,
+        on_telegram_progress: TelegramProgressCallback | None = None,
     ) -> dict[str, Any]:
         """
         Полный pipeline одного tenant-канала.
@@ -985,6 +1015,7 @@ class TenantPublishPipeline:
                     title=title,
                     short_body=short_body,
                     image_bytes=image_bytes,
+                    on_telegram_progress=on_telegram_progress,
                 )
             )
 

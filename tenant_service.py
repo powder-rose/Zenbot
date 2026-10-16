@@ -15,7 +15,7 @@ from typing import Any
 from aiogram import Bot
 
 import tenant_db
-from tenant_publish_pipeline import TenantPublishPipeline
+from tenant_publish_pipeline import TelegramProgressCallback, TenantPublishPipeline
 from article_service import (
     DEFAULT_IMAGE_PROMPT_TEMPLATE,
     build_image_prompt,
@@ -881,6 +881,7 @@ class TenantArticleService:
         image_bytes: bytes,
         *,
         on_telegram_sent: Callable[[int, int], Awaitable[None]] | None = None,
+        on_telegram_progress: TelegramProgressCallback | None = None,
     ) -> dict[str, Any]:
         """
         Публикация одного tenant-канала
@@ -895,6 +896,7 @@ class TenantArticleService:
             short_body=short_body,
             image_bytes=image_bytes,
             on_telegram_sent=on_telegram_sent,
+            on_telegram_progress=on_telegram_progress,
         )
 
 
@@ -925,23 +927,44 @@ class TenantArticleService:
 
         published = 0
         errors: list[str] = []
+        partial_messages: dict[int, tuple[int, ...]] = {}
+        completed_channels: set[int] = set()
 
-        async def record_telegram_sent(chat_id: int, message_id: int) -> None:
+        def publication_errors() -> list[str]:
+            # Put confirmation evidence before exception text so it has
+            # priority in the existing bounded diagnostic field.
+            return [
+                f"Частично подтверждённая отправка Telegram, канал {channel_id}: "
+                f"подтверждённые сообщения {', '.join(map(str, message_ids))}"
+                for channel_id, message_ids in partial_messages.items()
+            ] + errors
+
+        async def record_telegram_progress(
+            chat_id: int, message_ids: tuple[int, ...], complete: bool
+        ) -> None:
             nonlocal published
-            published += 1
+            if chat_id in completed_channels:
+                return
+            if complete:
+                completed_channels.add(chat_id)
+                partial_messages.pop(chat_id, None)
+                published += 1
+            else:
+                partial_messages[chat_id] = message_ids
+            details = publication_errors()
             checkpoint = asyncio.create_task(
                 tenant_db.finish_publication(
                     publication_id,
-                    status="published",
+                    status="published" if published else "pending",
                     channels_published=published,
-                    error="; ".join(errors)[:2000] if errors else None,
+                    error="; ".join(details)[:2000] if details else None,
                 ),
                 name=f"tenant-publication-checkpoint-{publication_id}",
             )
             cancelled = False
             try:
-                # Finish the confirmed write before propagating shutdown.
-                # The parent owns and awaits this task until completion.
+                # Persist each confirmed fragment, including on shutdown.
+                # The parent owns and awaits the task; it cannot outlive it.
                 while not checkpoint.done():
                     try:
                         await asyncio.shield(checkpoint)
@@ -951,8 +974,8 @@ class TenantArticleService:
             except Exception as exc:
                 log.exception(
                     "Tenant Telegram confirmed but checkpoint failed: "
-                    "publication=%s user=%s channel=%s message=%s",
-                    publication_id, user_id, chat_id, message_id,
+                    "publication=%s user=%s channel=%s messages=%s complete=%s",
+                    publication_id, user_id, chat_id, message_ids, complete,
                 )
                 if cancelled:
                     raise asyncio.CancelledError from exc
@@ -961,6 +984,12 @@ class TenantArticleService:
                 ) from exc
             if cancelled:
                 raise asyncio.CancelledError
+
+        async def record_telegram_sent(chat_id: int, message_id: int) -> None:
+            # Rich Message and Dzen sends are complete in one request.
+            # A completed fallback also invokes this callback; do not count
+            # it twice after its final fragment has already been persisted.
+            await record_telegram_progress(chat_id, (message_id,), True)
 
         for channel in channels:
             chat_id = int(
@@ -976,6 +1005,7 @@ class TenantArticleService:
                     short_body,
                     image_bytes,
                     on_telegram_sent=record_telegram_sent,
+                    on_telegram_progress=record_telegram_progress,
                 )
 
                 short_message_id = result.get(
@@ -1050,7 +1080,7 @@ class TenantArticleService:
 
         return (
             published,
-            errors,
+            publication_errors(),
         )
 
 

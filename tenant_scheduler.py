@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import tenant_db
@@ -94,12 +95,32 @@ class TenantScheduler:
     async def run(self) -> None:
         tz = ZoneInfo(self.cfg.timezone)
         log.info("Tenant scheduler запущен, timezone=%s", self.cfg.timezone)
+        pending: deque[datetime] = deque()
+        next_minute: datetime | None = None
+        minute = timedelta(minutes=1)
         while not self._stop.is_set():
             try:
-                now = datetime.now(tz)
-                publish_time = now.strftime("%H:%M")
-                slot_key = now.strftime("%Y-%m-%d|%H:%M")
-                await self._publish_due_users(publish_time, slot_key)
+                now = (
+                    datetime.now(tz)
+                    .astimezone(UTC)
+                    .replace(second=0, microsecond=0)
+                )
+                if next_minute is None:
+                    next_minute = now
+                while next_minute <= now:
+                    pending.append(next_minute.astimezone(tz))
+                    next_minute += minute
+                if not pending and next_minute == now + minute:
+                    pending.append(now.astimezone(tz))
+                if pending:
+                    slot_time = pending[0]
+                    attempted = await self._publish_due_users(
+                        slot_time.strftime("%H:%M"),
+                        slot_time.strftime("%Y-%m-%d|%H:%M"),
+                    )
+                    pending.popleft()
+                    if attempted or pending:
+                        continue
             except asyncio.CancelledError:
                 raise
             except Exception:
